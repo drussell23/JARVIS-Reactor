@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel", "pybind11>=2.11.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reactor-core"
+version = "1.0.0"
+description = "AI/ML Training Engine with Python Bindings to MLForge C++ Core"
+authors = [
+    {name = "Derek Russell", email = "derek@example.com"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "peft>=0.5.0",  # For LoRA
+    "accelerate>=0.20.0",
+    "datasets>=2.12.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+    "pyyaml>=6.0",
+    "safetensors>=0.3.1",
+]
+
+[project.optional-dependencies]
+local = [
+    # M1 Mac optimizations
+    "torch-metal",
+    "bitsandbytes>=0.41.0",  # Quantization
+]
+
+gcp = [
+    # GCP-specific dependencies
+    "google-cloud-storage>=2.10.0",
+    "google-cloud-compute>=1.14.0",
+    "wandb>=0.15.0",  # Experiment tracking
+]
+
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.7.0",
+    "isort>=5.12.0",
+    "mypy>=1.4.0",
+    "ruff>=0.0.280",
+]
+
+all = [
+    "reactor-core[local,gcp,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/drussell23/reactor-core"
+Repository = "https://github.com/drussell23/reactor-core"
+Documentation = "https://github.com/drussell23/reactor-core#readme"
+"Bug Tracker" = "https://github.com/drussell23/reactor-core/issues"
+
+[tool.setuptools]
+packages = ["reactor_core"]
+
+[tool.setuptools.package-data]
+reactor_core = ["py.typed", "*.so", "*.dylib", "*.pyd"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
