@@ -25,6 +25,24 @@ Reactor Core
 
 ## Installation
 
+### Quick Install (Python only, no C++ bindings)
+```bash
+pip install reactor-core
+```
+
+### Build from Source (with MLForge C++ bindings)
+```bash
+# Clone with submodules
+git clone --recursive https://github.com/drussell23/reactor-core.git
+cd reactor-core
+
+# Install dependencies (requires CMake and pybind11)
+pip install pybind11 cmake
+
+# Build and install
+pip install -e .
+```
+
 ### For Local Development (M1 Mac)
 ```bash
 pip install reactor-core[local]
