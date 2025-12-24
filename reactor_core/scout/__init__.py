@@ -87,6 +87,15 @@ from reactor_core.scout.safe_scout_orchestrator import (
     ScoutStage,
 )
 
+# Topic Discovery
+from reactor_core.scout.topic_discovery import (
+    TopicDiscovery,
+    DiscoveredTopic,
+    DiscoveryConfig,
+    DiscoverySource,
+    auto_discover_topics,
+)
+
 __all__ = [
     # Topic Queue
     "TopicQueue",
@@ -139,4 +148,10 @@ __all__ = [
     "ScoutConfig",
     "ScoutProgress",
     "ScoutStage",
+    # Topic Discovery
+    "TopicDiscovery",
+    "DiscoveredTopic",
+    "DiscoveryConfig",
+    "DiscoverySource",
+    "auto_discover_topics",
 ]

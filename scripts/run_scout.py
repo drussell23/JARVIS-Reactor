@@ -482,15 +482,15 @@ async def run_scout(args: argparse.Namespace) -> int:
                     # Extract content
                     content = extractor.extract(result.html_content or "", url)
 
-                    if not content.main_content:
+                    if not content.text_content:
                         progress.advance(page_task)
                         continue
 
                     # Synthesize if enabled
-                    if synthesizer and content.main_content:
+                    if synthesizer and content.text_content:
                         try:
                             syn_result = await synthesizer.synthesize(
-                                content=content.main_content,
+                                content=content.text_content,
                                 title=content.title or topic.name,
                                 code_blocks=content.code_blocks,
                                 max_pairs=args.max_pairs,
