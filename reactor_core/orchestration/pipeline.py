@@ -2,10 +2,11 @@
 Night Shift Pipeline orchestration.
 
 Provides:
-- End-to-end training pipeline
+- End-to-end training pipeline with Safe Scout integration
+- Dual data sources: Web documentation + JARVIS experience logs
 - Stage management and recovery
 - Checkpoint-based resumption
-- Progress tracking
+- Progress tracking with async event streaming
 """
 
 from __future__ import annotations
@@ -16,10 +17,10 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,8 @@ logger = logging.getLogger(__name__)
 class PipelineStage(Enum):
     """Pipeline execution stages."""
     IDLE = "idle"
-    INGESTING = "ingesting"
+    SCOUTING = "scouting"          # NEW: Web documentation ingestion
+    INGESTING = "ingesting"         # JARVIS experience ingestion
     FORMATTING = "formatting"
     DISTILLING = "distilling"
     TRAINING = "training"
@@ -38,6 +40,14 @@ class PipelineStage(Enum):
     FAILED = "failed"
 
 
+class DataSource(Enum):
+    """Sources of training data."""
+    SCOUT = "scout"              # Web documentation
+    JARVIS_EXPERIENCE = "jarvis_experience"  # JARVIS logs
+    JARVIS_CORRECTIONS = "jarvis_corrections"  # User corrections
+    SYNTHETIC = "synthetic"      # Teacher-generated
+
+
 @dataclass
 class PipelineState:
     """Current state of the pipeline."""
@@ -46,6 +56,17 @@ class PipelineState:
     started_at: datetime
     last_updated: datetime = field(default_factory=datetime.now)
     last_completed_stage: Optional[PipelineStage] = None
+
+    # Data source tracking
+    enabled_sources: Set[DataSource] = field(default_factory=lambda: {
+        DataSource.SCOUT, DataSource.JARVIS_EXPERIENCE
+    })
+
+    # Scout stage counters
+    scout_topics_processed: int = 0
+    scout_pages_fetched: int = 0
+    scout_pages_blocked: int = 0
+    scout_examples_synthesized: int = 0
 
     # Progress counters
     ingestion_count: int = 0
@@ -68,6 +89,7 @@ class PipelineState:
     # Error tracking
     error: Optional[str] = None
     error_stage: Optional[PipelineStage] = None
+    stage_errors: Dict[str, List[str]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +101,11 @@ class PipelineState:
                 self.last_completed_stage.value
                 if self.last_completed_stage else None
             ),
+            "enabled_sources": [s.value for s in self.enabled_sources],
+            "scout_topics_processed": self.scout_topics_processed,
+            "scout_pages_fetched": self.scout_pages_fetched,
+            "scout_pages_blocked": self.scout_pages_blocked,
+            "scout_examples_synthesized": self.scout_examples_synthesized,
             "ingestion_count": self.ingestion_count,
             "formatted_count": self.formatted_count,
             "distilled_count": self.distilled_count,
@@ -91,10 +118,14 @@ class PipelineState:
             "quantized_path": self.quantized_path,
             "error": self.error,
             "error_stage": self.error_stage.value if self.error_stage else None,
+            "stage_errors": self.stage_errors,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PipelineState":
+        enabled_sources = {
+            DataSource(s) for s in data.get("enabled_sources", ["scout", "jarvis_experience"])
+        }
         return cls(
             run_id=data["run_id"],
             stage=PipelineStage(data["stage"]),
@@ -104,6 +135,11 @@ class PipelineState:
                 PipelineStage(data["last_completed_stage"])
                 if data.get("last_completed_stage") else None
             ),
+            enabled_sources=enabled_sources,
+            scout_topics_processed=data.get("scout_topics_processed", 0),
+            scout_pages_fetched=data.get("scout_pages_fetched", 0),
+            scout_pages_blocked=data.get("scout_pages_blocked", 0),
+            scout_examples_synthesized=data.get("scout_examples_synthesized", 0),
             ingestion_count=data.get("ingestion_count", 0),
             formatted_count=data.get("formatted_count", 0),
             distilled_count=data.get("distilled_count", 0),
@@ -119,6 +155,7 @@ class PipelineState:
                 PipelineStage(data["error_stage"])
                 if data.get("error_stage") else None
             ),
+            stage_errors=data.get("stage_errors", {}),
         )
 
     def update_stage(self, stage: PipelineStage) -> None:
@@ -205,13 +242,67 @@ class PipelineConfig:
     skip_stages: List[PipelineStage] = field(default_factory=list)
     stop_after: Optional[PipelineStage] = None
 
-    # Ingestion
+    # Data sources
+    enabled_sources: Set[DataSource] = field(
+        default_factory=lambda: {DataSource.SCOUT, DataSource.JARVIS_EXPERIENCE}
+    )
+
+    # Scout configuration
+    scout_max_topics: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_SCOUT_MAX_TOPICS", "50"))
+    )
+    scout_max_pages_per_topic: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_SCOUT_MAX_PAGES", "10"))
+    )
+    scout_concurrency: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_SCOUT_CONCURRENCY", "5"))
+    )
+    scout_use_docker: bool = field(
+        default_factory=lambda: os.getenv("NIGHTSHIFT_SCOUT_DOCKER", "true").lower() == "true"
+    )
+    scout_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_SCOUT_TIMEOUT", "30"))
+    )
+    scout_synthesis_model: str = field(
+        default_factory=lambda: os.getenv(
+            "NIGHTSHIFT_SCOUT_MODEL", "gemini-1.5-flash"
+        )
+    )
+    scout_trusted_domains: Optional[List[str]] = None
+    scout_blocked_domains: Optional[List[str]] = None
+
+    # JARVIS ingestion
+    jarvis_repo_path: Path = field(
+        default_factory=lambda: Path(os.getenv(
+            "JARVIS_REPO_PATH",
+            Path.home() / "Documents" / "repos" / "JARVIS-AI-Agent"
+        ))
+    )
+    jarvis_lookback_hours: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_LOOKBACK_HOURS", "168"))
+    )
     log_sources: List[Path] = field(default_factory=list)
     min_examples: int = 100
+
+    # JARVIS Prime integration
+    prime_enabled: bool = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_ENABLED", "false").lower() == "true"
+    )
+    prime_host: str = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_HOST", "localhost")
+    )
+    prime_port: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
+    )
 
     # Distillation
     enable_distillation: bool = True
     distillation_budget: float = 10.0
+    distillation_model: str = field(
+        default_factory=lambda: os.getenv(
+            "NIGHTSHIFT_DISTILL_MODEL", "gpt-4o"
+        )
+    )
 
     # Training
     base_model: str = field(
@@ -221,6 +312,12 @@ class PipelineConfig:
         )
     )
     num_epochs: int = 3
+    lora_rank: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_LORA_RANK", "64"))
+    )
+    lora_alpha: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_LORA_ALPHA", "128"))
+    )
 
     # Evaluation
     eval_threshold: float = 0.7
@@ -233,6 +330,7 @@ class PipelineConfig:
     # Recovery
     state_file: Optional[Path] = None
     resume_on_error: bool = True
+    max_retries_per_stage: int = 3
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -241,17 +339,43 @@ class PipelineConfig:
             "output_dir": str(self.output_dir) if self.output_dir else None,
             "skip_stages": [s.value for s in self.skip_stages],
             "stop_after": self.stop_after.value if self.stop_after else None,
+            "enabled_sources": [s.value for s in self.enabled_sources],
+            # Scout config
+            "scout_max_topics": self.scout_max_topics,
+            "scout_max_pages_per_topic": self.scout_max_pages_per_topic,
+            "scout_concurrency": self.scout_concurrency,
+            "scout_use_docker": self.scout_use_docker,
+            "scout_timeout_seconds": self.scout_timeout_seconds,
+            "scout_synthesis_model": self.scout_synthesis_model,
+            "scout_trusted_domains": self.scout_trusted_domains,
+            "scout_blocked_domains": self.scout_blocked_domains,
+            # JARVIS config
+            "jarvis_repo_path": str(self.jarvis_repo_path),
+            "jarvis_lookback_hours": self.jarvis_lookback_hours,
             "log_sources": [str(p) for p in self.log_sources],
             "min_examples": self.min_examples,
+            # Prime config
+            "prime_enabled": self.prime_enabled,
+            "prime_host": self.prime_host,
+            "prime_port": self.prime_port,
+            # Distillation config
             "enable_distillation": self.enable_distillation,
             "distillation_budget": self.distillation_budget,
+            "distillation_model": self.distillation_model,
+            # Training config
             "base_model": self.base_model,
             "num_epochs": self.num_epochs,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            # Eval config
             "eval_threshold": self.eval_threshold,
             "require_gatekeeper": self.require_gatekeeper,
+            # Quantization config
             "quantization_method": self.quantization_method,
             "skip_quantization": self.skip_quantization,
+            # Recovery config
             "resume_on_error": self.resume_on_error,
+            "max_retries_per_stage": self.max_retries_per_stage,
         }
 
 
@@ -386,17 +510,265 @@ class NightShiftPipeline:
 
             raise
 
-    async def _run_ingestion(self) -> int:
-        """Run ingestion stage."""
-        logger.info("Starting ingestion stage...")
+    async def _run_scouting(self) -> Dict[str, int]:
+        """
+        Run Safe Scout web documentation ingestion.
 
-        # Import ingestion modules
+        Returns:
+            Dict with scout statistics
+        """
+        if DataSource.SCOUT not in self.config.enabled_sources:
+            logger.info("Scout source disabled, skipping...")
+            return {"topics": 0, "pages": 0, "examples": 0}
+
+        logger.info("Starting Scout stage - web documentation ingestion...")
+
+        # Import scout modules
+        from reactor_core.scout import (
+            TopicQueue,
+            TopicQueueConfig,
+            URLValidator,
+            URLValidatorConfig,
+            ComplianceFilter,
+            SandboxExecutor,
+            SandboxConfig,
+            ExecutionMode,
+            ContentExtractor,
+            KnowledgeSynthesizer,
+        )
+        from reactor_core.distillation import GeminiClient, create_teacher_client
+
+        # Initialize scout components
+        queue_config = TopicQueueConfig(
+            db_path=self.config.work_dir / "scout_queue.db",
+            max_concurrent_topics=self.config.scout_concurrency,
+        )
+        topic_queue = TopicQueue(queue_config)
+
+        validator_config = URLValidatorConfig(
+            check_robots_txt=True,
+            check_safe_browsing=False,  # Requires API key
+            request_timeout=10.0,
+        )
+        # Apply custom trusted/blocked domains if provided
+        if self.config.scout_trusted_domains:
+            validator_config.additional_trusted = self.config.scout_trusted_domains
+        if self.config.scout_blocked_domains:
+            validator_config.additional_blocked = self.config.scout_blocked_domains
+
+        validator = URLValidator(validator_config)
+        compliance = ComplianceFilter()
+
+        # Determine execution mode
+        exec_mode = (
+            ExecutionMode.DOCKER if self.config.scout_use_docker
+            else ExecutionMode.SUBPROCESS
+        )
+        sandbox_config = SandboxConfig(
+            mode=exec_mode,
+            timeout_seconds=self.config.scout_timeout_seconds,
+            max_concurrent=self.config.scout_concurrency,
+        )
+        sandbox = SandboxExecutor(sandbox_config)
+
+        extractor = ContentExtractor()
+
+        # Initialize teacher for synthesis
+        teacher = create_teacher_client(self.config.scout_synthesis_model)
+        synthesizer = KnowledgeSynthesizer(teacher)
+
+        # Statistics
+        stats = {
+            "topics_processed": 0,
+            "pages_fetched": 0,
+            "pages_blocked": 0,
+            "pages_failed": 0,
+            "examples_synthesized": 0,
+            "errors": [],
+        }
+
+        # Process topics from queue
+        topics = await topic_queue.get_pending_topics(
+            limit=self.config.scout_max_topics
+        )
+        logger.info(f"Found {len(topics)} pending topics to process")
+
+        for topic in topics:
+            try:
+                await topic_queue.mark_processing(topic.topic_id)
+                stats["topics_processed"] += 1
+
+                # Get URLs from topic
+                urls = topic.urls[:self.config.scout_max_pages_per_topic]
+
+                # Validate URLs in parallel
+                validation_results = await validator.validate_batch(urls)
+
+                for url, validation in zip(urls, validation_results):
+                    if not validation.is_safe:
+                        stats["pages_blocked"] += 1
+                        logger.debug(f"Blocked URL: {url} - {validation.block_reason}")
+                        continue
+
+                    try:
+                        # Fetch content via sandbox
+                        sandbox_result = await sandbox.execute(url)
+
+                        if not sandbox_result.success:
+                            stats["pages_failed"] += 1
+                            continue
+
+                        stats["pages_fetched"] += 1
+
+                        # Check compliance
+                        compliance_result = compliance.check_compliance(
+                            sandbox_result.html_content or "",
+                            url
+                        )
+
+                        if not compliance_result.is_compliant:
+                            stats["pages_blocked"] += 1
+                            logger.debug(
+                                f"Compliance block: {url} - {compliance_result.violations}"
+                            )
+                            continue
+
+                        # Extract content
+                        extracted = extractor.extract(
+                            sandbox_result.html_content or "",
+                            url
+                        )
+
+                        if not extracted.text_content:
+                            continue
+
+                        # Synthesize Q&A pairs
+                        synthesis_result = await synthesizer.synthesize(
+                            content=extracted.text_content,
+                            title=extracted.title or topic.name,
+                            code_blocks=extracted.code_blocks,
+                            max_pairs=5,
+                        )
+
+                        stats["examples_synthesized"] += len(synthesis_result.pairs)
+
+                        # Store synthesized pairs
+                        output_dir = self.config.work_dir / "scout_data"
+                        output_dir.mkdir(exist_ok=True)
+
+                        for pair in synthesis_result.pairs:
+                            pair_file = output_dir / f"{pair.pair_id}.json"
+                            with open(pair_file, "w") as f:
+                                json.dump(pair.to_dict(), f, indent=2)
+
+                    except Exception as e:
+                        stats["pages_failed"] += 1
+                        stats["errors"].append(f"{url}: {str(e)}")
+                        logger.warning(f"Error processing URL {url}: {e}")
+
+                await topic_queue.mark_completed(topic.topic_id)
+
+            except Exception as e:
+                await topic_queue.mark_failed(topic.topic_id, str(e))
+                stats["errors"].append(f"Topic {topic.name}: {str(e)}")
+                logger.error(f"Error processing topic {topic.name}: {e}")
+
+        # Update pipeline state
+        if self._state:
+            self._state.scout_topics_processed = stats["topics_processed"]
+            self._state.scout_pages_fetched = stats["pages_fetched"]
+            self._state.scout_pages_blocked = stats["pages_blocked"]
+            self._state.scout_examples_synthesized = stats["examples_synthesized"]
+
+        # Cleanup
+        await sandbox.cleanup()
+        await topic_queue.close()
+
+        logger.info(
+            f"Scout complete: {stats['topics_processed']} topics, "
+            f"{stats['pages_fetched']} pages, "
+            f"{stats['examples_synthesized']} examples"
+        )
+
+        return stats
+
+    async def _run_ingestion(self) -> int:
+        """
+        Run JARVIS experience ingestion stage.
+
+        Ingests logs from JARVIS-AI-Agent and optionally JARVIS Prime.
+        """
+        if DataSource.JARVIS_EXPERIENCE not in self.config.enabled_sources:
+            logger.info("JARVIS experience source disabled, skipping...")
+            return 0
+
+        logger.info("Starting JARVIS ingestion stage...")
+
+        # Import modules
+        from reactor_core.integration import (
+            JARVISConnector,
+            JARVISConnectorConfig,
+        )
         from reactor_core.ingestion import BatchIngestionProcessor
 
-        # Process log sources
-        processor = BatchIngestionProcessor()
         total = 0
 
+        # JARVIS-AI-Agent logs
+        if self.config.jarvis_repo_path.exists():
+            connector_config = JARVISConnectorConfig(
+                jarvis_repo_path=self.config.jarvis_repo_path,
+                lookback_hours=self.config.jarvis_lookback_hours,
+            )
+            connector = JARVISConnector(connector_config)
+
+            # Get events
+            events = await connector.get_events(limit=5000)
+            logger.info(f"Found {len(events)} JARVIS events")
+
+            # Get corrections specifically
+            if DataSource.JARVIS_CORRECTIONS in self.config.enabled_sources:
+                corrections = await connector.get_corrections()
+                logger.info(f"Found {len(corrections)} correction events")
+
+            total += len(events)
+
+            # Store events for formatting
+            events_dir = self.config.work_dir / "jarvis_events"
+            events_dir.mkdir(exist_ok=True)
+
+            for event in events:
+                event_file = events_dir / f"{event.event_id}.json"
+                with open(event_file, "w") as f:
+                    json.dump(event.to_dict(), f, indent=2)
+
+        else:
+            logger.warning(
+                f"JARVIS repo not found at {self.config.jarvis_repo_path}"
+            )
+
+        # JARVIS Prime integration (if enabled)
+        if self.config.prime_enabled:
+            try:
+                from reactor_core.integration import PrimeConnector
+
+                prime = PrimeConnector(
+                    host=self.config.prime_host,
+                    port=self.config.prime_port,
+                )
+
+                prime_events = await prime.get_recent_interactions(
+                    hours=self.config.jarvis_lookback_hours
+                )
+                logger.info(f"Found {len(prime_events)} JARVIS Prime events")
+                total += len(prime_events)
+
+            except ImportError:
+                logger.warning("PrimeConnector not available")
+            except Exception as e:
+                logger.error(f"Error connecting to JARVIS Prime: {e}")
+
+        # Process additional log sources
+        processor = BatchIngestionProcessor()
         for source in self.config.log_sources:
             if source.exists():
                 count = await processor.process_directory(source)
@@ -544,6 +916,7 @@ class NightShiftPipeline:
                 start_stage = self._state.error_stage or PipelineStage.IDLE
 
             stages = [
+                (PipelineStage.SCOUTING, self._run_scouting),
                 (PipelineStage.INGESTING, self._run_ingestion),
                 (PipelineStage.FORMATTING, self._run_formatting),
                 (PipelineStage.DISTILLING, self._run_distillation),
@@ -626,4 +999,5 @@ __all__ = [
     "PipelineStage",
     "PipelineState",
     "PipelineResult",
+    "DataSource",
 ]

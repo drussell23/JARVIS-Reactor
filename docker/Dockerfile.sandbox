@@ -1,0 +1,55 @@
+# Safe Scout Sandbox - Isolated Browser Environment
+#
+# This Dockerfile creates a secure, sandboxed environment for web scraping
+# using Playwright. It's designed to:
+# - Isolate untrusted web content
+# - Limit resource usage
+# - Prevent network abuse
+# - Run with minimal privileges
+
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+
+LABEL maintainer="JARVIS Night Shift Team"
+LABEL description="Safe Scout sandboxed browser for web documentation ingestion"
+LABEL version="1.0.0"
+
+# Security: Create non-root user
+RUN groupadd -r scout && useradd -r -g scout -d /home/scout -s /sbin/nologin scout
+
+# Set working directory
+WORKDIR /app
+
+# Install minimal dependencies
+RUN pip install --no-cache-dir \
+    playwright>=1.40.0 \
+    beautifulsoup4>=4.12.0 \
+    lxml>=5.0 \
+    html2text>=2020.1.16
+
+# Copy the sandbox script
+COPY sandbox_script.py /app/sandbox_script.py
+
+# Security hardening
+RUN chmod 555 /app/sandbox_script.py
+
+# Create directories for output
+RUN mkdir -p /app/output /app/tmp && \
+    chown -R scout:scout /app/output /app/tmp && \
+    chmod 755 /app/output /app/tmp
+
+# Switch to non-root user
+USER scout
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV HOME=/home/scout
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import playwright; print('ok')" || exit 1
+
+# Default command - fetch a URL
+# Usage: docker run scout-sandbox <url> [output_file]
+ENTRYPOINT ["python3", "/app/sandbox_script.py"]
+CMD ["--help"]

@@ -79,6 +79,14 @@ from reactor_core.scout.knowledge_synthesizer import (
     SynthesisQuality,
 )
 
+# Safe Scout Orchestrator
+from reactor_core.scout.safe_scout_orchestrator import (
+    SafeScoutOrchestrator,
+    ScoutConfig,
+    ScoutProgress,
+    ScoutStage,
+)
+
 __all__ = [
     # Topic Queue
     "TopicQueue",
@@ -126,4 +134,9 @@ __all__ = [
     "SynthesisResult",
     "SynthesisStrategy",
     "SynthesisQuality",
+    # Orchestrator
+    "SafeScoutOrchestrator",
+    "ScoutConfig",
+    "ScoutProgress",
+    "ScoutStage",
 ]

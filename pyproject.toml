@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reactor-core"
-version = "2.0.0"
-description = "Night Shift Training Engine - Autonomous Continuous Learning Pipeline for JARVIS AGI"
+version = "2.2.0"
+description = "Night Shift Training Engine - Autonomous Continuous Learning Pipeline for JARVIS AGI with Safe Scout"
 authors = [
     {name = "Derek Russell", email = "derek@example.com"}
 ]
@@ -43,6 +43,7 @@ dependencies = [
     # Night Shift - Async & Concurrency
     "aiofiles>=23.0",           # Async file I/O
     "aiohttp>=3.9.0",           # Async HTTP client
+    "aiodns>=3.0",              # Async DNS resolution
 
     # Night Shift - Utilities
     "psutil>=5.9.0",            # System monitoring
@@ -50,10 +51,18 @@ dependencies = [
     "structlog>=23.0",          # Structured logging
     "croniter>=2.0",            # Cron scheduling
     "humanize>=4.0",            # Human-readable formatting
+    "watchdog>=3.0",            # File system monitoring
 
     # Night Shift - Data Processing
     "pyarrow>=14.0",            # Parquet support
     "sentence-transformers>=2.2.0",  # Embedding dedup
+
+    # Safe Scout - Web Ingestion
+    "beautifulsoup4>=4.12.0",   # HTML parsing
+    "lxml>=5.0",                # HTML/XML parser
+    "html2text>=2020.1.16",     # HTML to markdown conversion
+    "httpx>=0.25.0",            # Modern HTTP client
+    "robotexclusionrulesparser>=1.7.1",  # robots.txt parsing
 ]
 
 [project.optional-dependencies]
@@ -79,7 +88,15 @@ distillation = [
     # Teacher model APIs
     "openai>=1.0.0",
     "anthropic>=0.7.0",
+    "google-generativeai>=0.3.0",  # Gemini API
     "tiktoken>=0.5.0",          # Token counting
+]
+
+scout = [
+    # Safe Scout web ingestion
+    "playwright>=1.40.0",       # Browser automation (sandbox)
+    "docker>=7.0.0",            # Docker SDK for sandbox
+    "pysafebrowsing>=0.1.1",    # Google Safe Browsing API
 ]
 
 evaluation = [
@@ -100,7 +117,7 @@ dev = [
 ]
 
 all = [
-    "reactor-core[local,gcp,quantization,distillation,evaluation,dev]",
+    "reactor-core[local,gcp,quantization,distillation,scout,evaluation,dev]",
 ]
 
 [project.scripts]
@@ -108,6 +125,8 @@ nightshift = "reactor_core.cli:main"
 nightshift-ingest = "reactor_core.cli:ingest"
 nightshift-train = "reactor_core.cli:train"
 nightshift-eval = "reactor_core.cli:evaluate"
+nightshift-scout = "reactor_core.cli:scout"
+nightshift-pipeline = "reactor_core.cli:run_pipeline"
 
 [project.urls]
 Homepage = "https://github.com/drussell23/reactor-core"

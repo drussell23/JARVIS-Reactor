@@ -1,0 +1,62 @@
+# Night Shift Training Engine - Main Pipeline Container
+#
+# This Dockerfile builds the main Night Shift pipeline orchestrator
+# with all training and inference dependencies.
+
+FROM python:3.11-slim-bookworm as base
+
+LABEL maintainer="JARVIS Night Shift Team"
+LABEL description="Night Shift Training Engine - Autonomous Continuous Learning Pipeline"
+LABEL version="2.2.0"
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN groupadd -r nightshift && useradd -r -g nightshift -d /home/nightshift -s /sbin/nologin nightshift
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for caching
+COPY pyproject.toml .
+COPY README.md .
+
+# Install Python dependencies
+RUN pip install --upgrade pip && \
+    pip install build && \
+    pip install ".[distillation,scout]"
+
+# Copy application code
+COPY reactor_core/ reactor_core/
+COPY scripts/ scripts/
+
+# Create directories
+RUN mkdir -p /app/data /app/models /app/logs && \
+    chown -R nightshift:nightshift /app
+
+# Switch to non-root user
+USER nightshift
+
+# Set default environment
+ENV NIGHTSHIFT_WORK_DIR=/app/data \
+    NIGHTSHIFT_MODEL_DIR=/app/models \
+    NIGHTSHIFT_LOG_DIR=/app/logs
+
+# Expose healthcheck port (optional)
+EXPOSE 8080
+
+# Default command - run pipeline
+ENTRYPOINT ["python3", "-m", "reactor_core.cli"]
+CMD ["run"]

@@ -14,6 +14,7 @@ from reactor_core.orchestration.pipeline import (
     PipelineStage,
     PipelineState,
     PipelineResult,
+    DataSource,
 )
 
 from reactor_core.orchestration.scheduler import (
@@ -37,6 +38,7 @@ __all__ = [
     "PipelineStage",
     "PipelineState",
     "PipelineResult",
+    "DataSource",
     # Scheduler
     "PipelineScheduler",
     "ScheduleConfig",

@@ -1,0 +1,159 @@
+# Night Shift Training Engine - Docker Compose Configuration
+#
+# This docker-compose file provides the full infrastructure for running
+# the Night Shift training pipeline with Safe Scout.
+#
+# Services:
+# - scout-sandbox: Isolated Playwright browser for web scraping
+# - redis: Caching and job queue (optional)
+# - nightshift: Main pipeline orchestrator
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose up scout-sandbox  # Start only sandbox
+#   docker-compose logs -f nightshift  # Follow pipeline logs
+#   docker-compose down           # Stop all services
+
+version: '3.8'
+
+services:
+  # Safe Scout Sandbox - Isolated browser for web content fetching
+  scout-sandbox:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.sandbox
+    container_name: scout-sandbox
+    restart: unless-stopped
+    # Security: Run with minimal privileges
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    # Network isolation - can only access internet, not internal services
+    networks:
+      - scout-network
+    # Read-only filesystem except for /tmp and /app/output
+    read_only: true
+    tmpfs:
+      - /tmp:size=100M,mode=1777
+      - /app/output:size=500M,mode=755
+    volumes:
+      # Output volume for fetched content
+      - scout-output:/app/output
+    environment:
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import playwright; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Redis - Optional caching and job queue
+  redis:
+    image: redis:7-alpine
+    container_name: nightshift-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - internal
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Night Shift Pipeline Orchestrator
+  nightshift:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.nightshift
+    container_name: nightshift
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+      - scout-network
+    volumes:
+      # Persistent storage for pipeline state and outputs
+      - nightshift-data:/app/data
+      - nightshift-models:/app/models
+      - scout-output:/app/scout_output:ro
+      # Mount JARVIS repo for log ingestion (optional)
+      - ${JARVIS_REPO_PATH:-/dev/null}:/jarvis:ro
+    environment:
+      # Core configuration
+      - NIGHTSHIFT_WORK_DIR=/app/data
+      - NIGHTSHIFT_MODEL_DIR=/app/models
+      # Redis connection
+      - REDIS_URL=redis://redis:6379
+      # Scout configuration
+      - NIGHTSHIFT_SCOUT_MAX_TOPICS=${NIGHTSHIFT_SCOUT_MAX_TOPICS:-50}
+      - NIGHTSHIFT_SCOUT_MAX_PAGES=${NIGHTSHIFT_SCOUT_MAX_PAGES:-10}
+      - NIGHTSHIFT_SCOUT_CONCURRENCY=${NIGHTSHIFT_SCOUT_CONCURRENCY:-5}
+      - NIGHTSHIFT_SCOUT_MODEL=${NIGHTSHIFT_SCOUT_MODEL:-gemini-1.5-flash}
+      # JARVIS integration
+      - JARVIS_REPO_PATH=/jarvis
+      - NIGHTSHIFT_LOOKBACK_HOURS=${NIGHTSHIFT_LOOKBACK_HOURS:-168}
+      # API keys (passed from host)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      # Training configuration
+      - NIGHTSHIFT_BASE_MODEL=${NIGHTSHIFT_BASE_MODEL:-meta-llama/Llama-3.2-3B}
+      - NIGHTSHIFT_LORA_RANK=${NIGHTSHIFT_LORA_RANK:-64}
+      - NIGHTSHIFT_LORA_ALPHA=${NIGHTSHIFT_LORA_ALPHA:-128}
+      # GPU support (if available)
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    # Enable GPU if available
+    # Uncomment for NVIDIA GPU support:
+    # runtime: nvidia
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import reactor_core; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  # Internal network for service communication
+  internal:
+    driver: bridge
+    internal: true
+  # Scout network with internet access
+  scout-network:
+    driver: bridge
+
+volumes:
+  # Scout output volume
+  scout-output:
+    driver: local
+  # Redis persistence
+  redis-data:
+    driver: local
+  # Night Shift data and models
+  nightshift-data:
+    driver: local
+  nightshift-models:
+    driver: local
