@@ -533,6 +533,12 @@ async def get_status():
     return StatusResponse(**job_manager.get_status())
 
 
+@app.get("/api/broadcaster/status")
+async def get_broadcaster_status():
+    """Get JARVIS broadcaster status (Feedback Loop)."""
+    return jarvis_broadcaster.get_stats()
+
+
 @app.get("/api/pipeline/state", response_model=Optional[PipelineStateResponse])
 async def get_pipeline_state():
     """Get current pipeline execution state."""
