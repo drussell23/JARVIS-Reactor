@@ -31,6 +31,22 @@ from reactor_core.orchestration.notifications import (
     WebhookNotifier,
 )
 
+# PROJECT TRINITY: Central Orchestrator
+from reactor_core.orchestration.trinity_orchestrator import (
+    TrinityOrchestrator,
+    ComponentType,
+    ComponentHealth,
+    ComponentState,
+    AggregatedState,
+    get_orchestrator,
+    initialize_orchestrator,
+    shutdown_orchestrator,
+    dispatch_to_jarvis,
+    dispatch_to_jprime,
+    update_jarvis_heartbeat,
+    update_jprime_heartbeat,
+)
+
 __all__ = [
     # Pipeline
     "NightShiftPipeline",
@@ -49,4 +65,17 @@ __all__ = [
     "NotificationType",
     "SlackNotifier",
     "WebhookNotifier",
+    # PROJECT TRINITY: Orchestrator
+    "TrinityOrchestrator",
+    "ComponentType",
+    "ComponentHealth",
+    "ComponentState",
+    "AggregatedState",
+    "get_orchestrator",
+    "initialize_orchestrator",
+    "shutdown_orchestrator",
+    "dispatch_to_jarvis",
+    "dispatch_to_jprime",
+    "update_jarvis_heartbeat",
+    "update_jprime_heartbeat",
 ]
