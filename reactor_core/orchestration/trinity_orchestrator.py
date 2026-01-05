@@ -285,6 +285,7 @@ class TrinityOrchestrator:
         self._health_check_task: Optional[asyncio.Task] = None
         self._command_processor_task: Optional[asyncio.Task] = None
         self._state_reconciler_task: Optional[asyncio.Task] = None
+        self._self_heartbeat_task: Optional[asyncio.Task] = None  # v72.0
 
         # Event handlers
         self._state_change_handlers: List[Callable] = []
@@ -318,6 +319,8 @@ class TrinityOrchestrator:
             self._health_check_task = asyncio.create_task(self._health_check_loop())
             self._command_processor_task = asyncio.create_task(self._command_processor_loop())
             self._state_reconciler_task = asyncio.create_task(self._state_reconciliation_loop())
+            # v72.0: Start self-heartbeat task
+            self._self_heartbeat_task = asyncio.create_task(self._self_heartbeat_loop())
 
             self._running = True
             logger.info("[Trinity] Orchestrator started")
@@ -336,6 +339,7 @@ class TrinityOrchestrator:
             self._health_check_task,
             self._command_processor_task,
             self._state_reconciler_task,
+            self._self_heartbeat_task,  # v72.0
         ]:
             if task:
                 task.cancel()
@@ -595,6 +599,50 @@ class TrinityOrchestrator:
             except Exception as e:
                 logger.error(f"[Trinity] Health check error: {e}")
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+    async def _self_heartbeat_loop(self) -> None:
+        """
+        v72.0: Broadcast Reactor-Core's own heartbeat to Trinity.
+
+        This writes the orchestrator's state to ~/.jarvis/trinity/components/reactor_core.json
+        so that JARVIS Body can detect when Reactor-Core is online.
+        """
+        import os
+        import uuid
+
+        instance_id = f"reactor-core-{os.getpid()}-{int(self._start_time)}"
+
+        while self._running:
+            try:
+                # Build state
+                state = {
+                    "component_type": "reactor_core",
+                    "instance_id": instance_id,
+                    "timestamp": time.time(),
+                    "uptime_seconds": time.time() - self._start_time,
+                    "metrics": {
+                        "running": self._running,
+                        "commands_dispatched": self._stats["commands_dispatched"],
+                        "commands_succeeded": self._stats["commands_succeeded"],
+                        "commands_failed": self._stats["commands_failed"],
+                        "pending_commands": len(self._pending_commands),
+                    },
+                }
+
+                # Write to components directory
+                state_file = COMPONENTS_DIR / "reactor_core.json"
+                with open(state_file, "w") as f:
+                    json.dump(state, f, indent=2)
+
+                logger.debug(f"[Trinity] Reactor-Core heartbeat written (uptime: {state['uptime_seconds']:.1f}s)")
+
+                await asyncio.sleep(5.0)  # Heartbeat every 5 seconds
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[Trinity] Self-heartbeat error: {e}")
+                await asyncio.sleep(5.0)
 
     async def _command_processor_loop(self) -> None:
         """Process queued commands."""
