@@ -49,6 +49,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -56,9 +57,141 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# v73.0: ATOMIC FILE I/O - Diamond-Hard Protocol
+# =============================================================================
+
+class AtomicTrinityIO:
+    """
+    v73.0: Ensures zero-corruption file operations via Atomic Renames.
+
+    The Problem:
+        Standard file writing (`open('w').write()`) takes non-zero time (e.g., 5ms).
+        If another process tries to read the file during those 5ms, it reads incomplete JSON
+        and crashes with JSONDecodeError.
+
+    The Solution:
+        Write to a temporary file first, then perform an OS-level atomic rename
+        (`os.replace`) to the final filename. This guarantees the file is either
+        *missing* or *perfect*, never partial.
+    """
+
+    @staticmethod
+    def write_json_atomic(filepath: Union[str, Path], data: Dict[str, Any]) -> bool:
+        """
+        Write JSON data atomically to prevent partial reads.
+
+        Args:
+            filepath: Target file path
+            data: JSON-serializable dictionary
+
+        Returns:
+            True if write succeeded, False otherwise
+        """
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        tmp_fd = None
+        tmp_name = None
+
+        try:
+            # 1. Create temp file in same directory (required for atomic rename)
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                dir=filepath.parent,
+                prefix=f".{filepath.stem}.",
+                suffix=".tmp"
+            )
+
+            # 2. Write data to temp file
+            with os.fdopen(tmp_fd, 'w') as tmp_file:
+                tmp_fd = None  # os.fdopen takes ownership
+                json.dump(data, tmp_file, indent=2)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())  # Force write to physical disk
+
+            # 3. Atomic swap (OS guarantees this is instantaneous)
+            os.replace(tmp_name, filepath)
+            return True
+
+        except Exception as e:
+            logger.debug(f"[AtomicIO] Write failed: {e}")
+            # Cleanup temp file on failure
+            if tmp_name and os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            return False
+
+        finally:
+            # Ensure fd is closed if not transferred to fdopen
+            if tmp_fd is not None:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def read_json_safe(
+        filepath: Union[str, Path],
+        default: Optional[Dict[str, Any]] = None,
+        max_retries: int = 3,
+        retry_delay: float = 0.05
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Read JSON with automatic retry on corruption.
+
+        Args:
+            filepath: File to read
+            default: Value to return if file doesn't exist
+            max_retries: Maximum read attempts
+            retry_delay: Delay between retries in seconds
+
+        Returns:
+            Parsed JSON or default value
+        """
+        filepath = Path(filepath)
+
+        for attempt in range(max_retries):
+            try:
+                if not filepath.exists():
+                    return default
+
+                with open(filepath, 'r') as f:
+                    return json.load(f)
+
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"[AtomicIO] JSON decode retry {attempt + 1}: {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(f"[AtomicIO] JSON decode failed after {max_retries} retries: {e}")
+                    return default
+
+            except Exception as e:
+                logger.debug(f"[AtomicIO] Read failed: {e}")
+                return default
+
+        return default
+
+
+# Convenience functions
+def write_json_atomic(filepath: Union[str, Path], data: Dict[str, Any]) -> bool:
+    """Write JSON atomically. See AtomicTrinityIO.write_json_atomic."""
+    return AtomicTrinityIO.write_json_atomic(filepath, data)
+
+
+def read_json_safe(
+    filepath: Union[str, Path],
+    default: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """Read JSON safely. See AtomicTrinityIO.read_json_safe."""
+    return AtomicTrinityIO.read_json_safe(filepath, default)
 
 
 # =============================================================================
@@ -603,13 +736,11 @@ class TrinityOrchestrator:
     async def _self_heartbeat_loop(self) -> None:
         """
         v72.0: Broadcast Reactor-Core's own heartbeat to Trinity.
+        v73.0: Now uses atomic writes to prevent partial read corruption.
 
         This writes the orchestrator's state to ~/.jarvis/trinity/components/reactor_core.json
         so that JARVIS Body can detect when Reactor-Core is online.
         """
-        import os
-        import uuid
-
         instance_id = f"reactor-core-{os.getpid()}-{int(self._start_time)}"
 
         while self._running:
@@ -629,10 +760,10 @@ class TrinityOrchestrator:
                     },
                 }
 
-                # Write to components directory
+                # v73.0: Write to components directory using atomic writes
                 state_file = COMPONENTS_DIR / "reactor_core.json"
-                with open(state_file, "w") as f:
-                    json.dump(state, f, indent=2)
+                if not write_json_atomic(state_file, state):
+                    logger.debug("[Trinity] Reactor-Core heartbeat atomic write failed")
 
                 logger.debug(f"[Trinity] Reactor-Core heartbeat written (uptime: {state['uptime_seconds']:.1f}s)")
 
@@ -692,7 +823,11 @@ class TrinityOrchestrator:
                 logger.error(f"[Trinity] Command processor error: {e}")
 
     async def _execute_command(self, pending: PendingCommand) -> bool:
-        """Execute a single command."""
+        """
+        Execute a single command.
+
+        v73.0: Now uses atomic writes to prevent partial read corruption.
+        """
         target = pending.target
         if not target:
             return False
@@ -718,15 +853,17 @@ class TrinityOrchestrator:
                 "ttl_seconds": pending.timeout,
             }
 
-            # Write to component-specific directory
+            # v73.0: Write to component-specific directory using atomic writes
             commands_dir = TRINITY_DIR / "commands"
             commands_dir.mkdir(parents=True, exist_ok=True)
 
             filename = f"{int(time.time() * 1000)}_{pending.id}.json"
             filepath = commands_dir / filename
 
-            with open(filepath, "w") as f:
-                json.dump(command_data, f, indent=2)
+            if not write_json_atomic(filepath, command_data):
+                logger.warning(f"[Trinity] Atomic write failed for command {pending.id[:8]}")
+                state.record_failure()
+                return False
 
             logger.debug(f"[Trinity] Wrote command {pending.id[:8]} to {filepath.name}")
 
@@ -814,12 +951,16 @@ class TrinityOrchestrator:
     # =========================================================================
 
     async def _load_state(self) -> None:
-        """Load persisted orchestrator state."""
-        try:
-            if ORCHESTRATOR_STATE_FILE.exists():
-                with open(ORCHESTRATOR_STATE_FILE) as f:
-                    data = json.load(f)
+        """
+        Load persisted orchestrator state.
 
+        v73.0: Now uses safe JSON reading with retry on corruption.
+        """
+        try:
+            # v73.0: Use safe read with retry
+            data = read_json_safe(ORCHESTRATOR_STATE_FILE, default=None)
+
+            if data:
                 # Restore component states
                 for comp_data in data.get("components", []):
                     comp_type = ComponentType(comp_data["component_type"])
@@ -831,7 +972,11 @@ class TrinityOrchestrator:
             logger.warning(f"[Trinity] Could not load state: {e}")
 
     async def _save_state(self) -> None:
-        """Save orchestrator state."""
+        """
+        Save orchestrator state.
+
+        v73.0: Now uses atomic writes to prevent corruption.
+        """
         try:
             data = {
                 "timestamp": time.time(),
@@ -839,8 +984,10 @@ class TrinityOrchestrator:
                 "stats": self._stats,
             }
 
-            with open(ORCHESTRATOR_STATE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+            # v73.0: Use atomic write
+            if not write_json_atomic(ORCHESTRATOR_STATE_FILE, data):
+                logger.warning("[Trinity] Atomic write failed for orchestrator state")
+                return
 
             logger.debug("[Trinity] Saved orchestrator state")
 
