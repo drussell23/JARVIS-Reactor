@@ -56,6 +56,22 @@ from reactor_core.integration.computer_use_connector import (
     ActionType,
 )
 
+# PROJECT TRINITY: JARVIS Body Connector
+from reactor_core.integration.trinity_connector import (
+    TrinityConnector,
+    TrinityCommand,
+    TrinityIntent,
+    TrinitySource,
+    JARVISStatus,
+    HeartbeatState,
+    get_trinity_connector,
+    connect_to_jarvis,
+    send_surveillance_command,
+    send_bring_back_command,
+    get_jarvis_status,
+    get_jarvis_heartbeat,
+)
+
 __all__ = [
     # JARVIS-AI-Agent
     "JARVISConnector",
@@ -93,4 +109,17 @@ __all__ = [
     "ComputerUseEvent",
     "ComputerUseEventType",
     "ActionType",
+    # PROJECT TRINITY: JARVIS Body Connector
+    "TrinityConnector",
+    "TrinityCommand",
+    "TrinityIntent",
+    "TrinitySource",
+    "JARVISStatus",
+    "HeartbeatState",
+    "get_trinity_connector",
+    "connect_to_jarvis",
+    "send_surveillance_command",
+    "send_bring_back_command",
+    "get_jarvis_status",
+    "get_jarvis_heartbeat",
 ]

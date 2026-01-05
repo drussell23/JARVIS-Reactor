@@ -105,6 +105,36 @@ class EventType(Enum):
     REPO_DEPENDENCY_DETECTED = "repo_dependency_detected"  # New dependency detected
     REPO_CONTEXT_ENRICHED = "repo_context_enriched"     # Context was enriched with repo info
 
+    # PROJECT TRINITY events - Unified Cognitive Architecture
+    # Surveillance commands (JARVIS Ghost Monitor Protocol)
+    TRINITY_START_SURVEILLANCE = "trinity_start_surveillance"
+    TRINITY_STOP_SURVEILLANCE = "trinity_stop_surveillance"
+    TRINITY_SURVEILLANCE_TRIGGERED = "trinity_surveillance_triggered"
+
+    # Window management (Ghost Display operations)
+    TRINITY_EXILE_WINDOW = "trinity_exile_window"
+    TRINITY_BRING_BACK_WINDOW = "trinity_bring_back_window"
+    TRINITY_TELEPORT_WINDOW = "trinity_teleport_window"
+
+    # Cryostasis (Process freeze/thaw)
+    TRINITY_FREEZE_APP = "trinity_freeze_app"
+    TRINITY_THAW_APP = "trinity_thaw_app"
+
+    # Phantom Hardware (Ghost Display management)
+    TRINITY_CREATE_GHOST_DISPLAY = "trinity_create_ghost_display"
+    TRINITY_DESTROY_GHOST_DISPLAY = "trinity_destroy_ghost_display"
+
+    # Trinity system events
+    TRINITY_HEARTBEAT = "trinity_heartbeat"
+    TRINITY_COMMAND_ACK = "trinity_command_ack"
+    TRINITY_COMMAND_NACK = "trinity_command_nack"
+    TRINITY_STATUS_UPDATE = "trinity_status_update"
+
+    # Cognitive commands from J-Prime
+    TRINITY_EXECUTE_PLAN = "trinity_execute_plan"
+    TRINITY_ABORT_PLAN = "trinity_abort_plan"
+    TRINITY_PLAN_COMPLETE = "trinity_plan_complete"
+
 
 @dataclass
 class CrossRepoEvent:
