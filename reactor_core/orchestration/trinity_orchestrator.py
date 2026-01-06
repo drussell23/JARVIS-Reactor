@@ -433,6 +433,10 @@ class TrinityOrchestrator:
             "circuit_breaker_trips": 0,
         }
 
+        # v75.0: Dead Letter Queue for failed/expired commands
+        self._dead_letter_queue: deque = deque(maxlen=500)
+        self._command_timeout_task: Optional[asyncio.Task] = None
+
         logger.info("[Trinity] Orchestrator initialized")
 
     async def start(self) -> bool:
@@ -454,6 +458,8 @@ class TrinityOrchestrator:
             self._state_reconciler_task = asyncio.create_task(self._state_reconciliation_loop())
             # v72.0: Start self-heartbeat task
             self._self_heartbeat_task = asyncio.create_task(self._self_heartbeat_loop())
+            # v75.0: Start command timeout monitoring task
+            self._command_timeout_task = asyncio.create_task(self._command_timeout_loop())
 
             self._running = True
             logger.info("[Trinity] Orchestrator started")
@@ -473,6 +479,7 @@ class TrinityOrchestrator:
             self._command_processor_task,
             self._state_reconciler_task,
             self._self_heartbeat_task,  # v72.0
+            self._command_timeout_task,  # v75.0
         ]:
             if task:
                 task.cancel()
@@ -788,8 +795,9 @@ class TrinityOrchestrator:
                 except asyncio.TimeoutError:
                     continue
 
-                # Skip expired commands
+                # Skip expired commands - v75.0: Add to dead letter queue
                 if pending.is_expired():
+                    self._add_to_dlq(pending, "timeout_expired")
                     if pending.id in self._pending_commands:
                         del self._pending_commands[pending.id]
                     self._stats["commands_timeout"] += 1
@@ -821,6 +829,120 @@ class TrinityOrchestrator:
                 break
             except Exception as e:
                 logger.error(f"[Trinity] Command processor error: {e}")
+
+    async def _command_timeout_loop(self) -> None:
+        """
+        v75.0: Monitor pending commands for timeouts.
+
+        This loop runs every 5 seconds and checks for commands that have
+        been pending too long. Expired commands are moved to the dead letter queue.
+        """
+        while self._running:
+            try:
+                now = time.time()
+                expired_ids = []
+
+                # Check all pending commands
+                for cmd_id, pending in list(self._pending_commands.items()):
+                    if pending.is_expired():
+                        expired_ids.append(cmd_id)
+                        self._add_to_dlq(pending, "timeout_in_queue")
+
+                # Remove expired from pending
+                for cmd_id in expired_ids:
+                    if cmd_id in self._pending_commands:
+                        del self._pending_commands[cmd_id]
+                        self._stats["commands_timeout"] += 1
+
+                if expired_ids:
+                    logger.warning(
+                        f"[Trinity] {len(expired_ids)} commands expired and moved to DLQ"
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"[Trinity] Command timeout check error: {e}")
+
+            await asyncio.sleep(5.0)
+
+    def _add_to_dlq(
+        self,
+        pending: "PendingCommand",
+        reason: str,
+    ) -> None:
+        """
+        v75.0: Add a failed/expired command to the dead letter queue.
+
+        Commands in the DLQ can be:
+        - Inspected for debugging
+        - Retried manually
+        - Used for monitoring/alerting
+        """
+        dlq_entry = {
+            "command_id": pending.id,
+            "intent": pending.intent,
+            "payload": pending.payload,
+            "target": pending.target.value if pending.target else None,
+            "priority": pending.priority,
+            "created_at": pending.created_at,
+            "timeout": pending.timeout,
+            "failed_at": time.time(),
+            "reason": reason,
+            "age_seconds": time.time() - pending.created_at,
+        }
+
+        self._dead_letter_queue.append(dlq_entry)
+
+        logger.debug(
+            f"[Trinity] Command {pending.id} moved to DLQ: {reason}"
+        )
+
+    def get_dead_letter_queue(self) -> List[Dict[str, Any]]:
+        """v75.0: Get dead letter queue contents."""
+        return list(self._dead_letter_queue)
+
+    def clear_dead_letter_queue(self) -> int:
+        """v75.0: Clear dead letter queue, returns count of cleared items."""
+        count = len(self._dead_letter_queue)
+        self._dead_letter_queue.clear()
+        return count
+
+    def retry_from_dlq(self, command_id: str) -> bool:
+        """v75.0: Retry a command from the dead letter queue."""
+        for i, entry in enumerate(self._dead_letter_queue):
+            if entry["command_id"] == command_id:
+                # Remove from DLQ
+                del self._dead_letter_queue[i]
+
+                # Re-dispatch
+                target = None
+                if entry["target"]:
+                    try:
+                        target = ComponentType(entry["target"])
+                    except ValueError:
+                        return False
+
+                # Create new pending command
+                new_pending = PendingCommand(
+                    id=f"{command_id}-retry-{int(time.time())}",
+                    intent=entry["intent"],
+                    payload=entry["payload"],
+                    target=target,
+                    priority=entry["priority"],
+                    timeout=entry.get("timeout", 30.0),
+                )
+
+                # Add to pending and queue
+                self._pending_commands[new_pending.id] = new_pending
+                self._command_queue.put_nowait(
+                    (new_pending.priority, new_pending.created_at, new_pending)
+                )
+
+                logger.info(f"[Trinity] Retrying command {command_id} from DLQ")
+                return True
+
+        return False
 
     async def _execute_command(self, pending: PendingCommand) -> bool:
         """
