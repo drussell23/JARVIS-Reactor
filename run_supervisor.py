@@ -63,7 +63,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Add reactor_core to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -84,6 +84,18 @@ from reactor_core.integration.event_bridge import (
 )
 
 logger = logging.getLogger(__name__)
+
+# v77.0 API Integration
+try:
+    from reactor_core.api.telemetry import get_telemetry, TelemetryCollector
+    from reactor_core.api.scheduler import get_scheduler, init_scheduler, ScheduleTemplates
+    from reactor_core.api.model_registry import get_registry, ModelRegistry
+    from reactor_core.api.health_aggregator import get_health_aggregator, init_health_aggregator
+    from reactor_core.serving.model_server import get_model_server, ModelServer, ModelServerConfig
+    HAS_V77_API = True
+except ImportError as e:
+    logger.warning(f"v77.0 API modules not available: {e}")
+    HAS_V77_API = False
 
 
 # =============================================================================
@@ -737,8 +749,19 @@ class AGISupervisor:
         # Event bridge
         self._event_bridge: Optional[EventBridge] = None
 
+        # v77.0 API Services
+        self._telemetry: Optional[TelemetryCollector] = None
+        self._scheduler = None
+        self._model_registry: Optional[ModelRegistry] = None
+        self._health_aggregator = None
+        self._model_server: Optional[ModelServer] = None
+
         # Background tasks
         self._tasks: List[asyncio.Task] = []
+
+        # Health checker and self-healer
+        self._health_checker = ComponentHealthChecker()
+        self._self_healer = SelfHealer()
 
         # Statistics
         self._start_time = 0.0
@@ -747,6 +770,8 @@ class AGISupervisor:
             "experiences_collected": 0,
             "trainings_triggered": 0,
             "restarts": 0,
+            "models_served": 0,
+            "api_requests": 0,
         }
 
         # Initialize logging
@@ -850,6 +875,39 @@ class AGISupervisor:
         for task in self._tasks:
             task.cancel()
 
+        # Wait for tasks to complete
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        # Stop v77.0 services in reverse dependency order
+        if self._model_server:
+            try:
+                await self._model_server.stop()
+                logger.info("  [OK] Model Server stopped")
+            except Exception as e:
+                logger.warning(f"  Model Server stop failed: {e}")
+
+        if self._scheduler:
+            try:
+                await self._scheduler.stop()
+                logger.info("  [OK] Scheduler stopped")
+            except Exception as e:
+                logger.warning(f"  Scheduler stop failed: {e}")
+
+        if self._health_aggregator:
+            try:
+                await self._health_aggregator.stop()
+                logger.info("  [OK] Health Aggregator stopped")
+            except Exception as e:
+                logger.warning(f"  Health Aggregator stop failed: {e}")
+
+        if self._telemetry:
+            try:
+                await self._telemetry.stop()
+                logger.info("  [OK] Telemetry Collector stopped")
+            except Exception as e:
+                logger.warning(f"  Telemetry Collector stop failed: {e}")
+
         # Stop components in reverse order
         for name in reversed(list(self._components.keys())):
             await self._stop_component(name)
@@ -899,7 +957,148 @@ class AGISupervisor:
         logger.info(f"  Reactor Core at {self.config.reactor_core_path}")
 
     async def _start_reactor_core_services(self) -> None:
-        """Start Reactor Core internal services."""
+        """Start Reactor Core internal services with v77.0 integration."""
+        # === v77.0 TELEMETRY COLLECTOR ===
+        if HAS_V77_API:
+            try:
+                self._telemetry = get_telemetry()
+                await self._telemetry.start()
+                logger.info("  [OK] Telemetry Collector started")
+            except Exception as e:
+                logger.warning(f"  Telemetry Collector failed: {e}")
+
+        # === v77.0 MODEL REGISTRY ===
+        if HAS_V77_API:
+            try:
+                self._model_registry = get_registry()
+                # Auto-discover models in common directories
+                model_dirs = [
+                    Path.home() / ".jarvis" / "models",
+                    Path.home() / ".cache" / "huggingface",
+                    self.config.reactor_core_path / "models" if self.config.reactor_core_path else None,
+                ]
+                for model_dir in model_dirs:
+                    if model_dir and model_dir.exists():
+                        await self._model_registry.scan_directory(model_dir)
+                logger.info(f"  [OK] Model Registry initialized ({self._model_registry.model_count} models)")
+            except Exception as e:
+                logger.warning(f"  Model Registry failed: {e}")
+
+        # === v77.0 HEALTH AGGREGATOR ===
+        if HAS_V77_API:
+            try:
+                self._health_aggregator = await init_health_aggregator()
+                # Register Trinity components for monitoring
+                await self._health_aggregator.register_component("reactor_core", {
+                    "type": "service",
+                    "endpoint": f"http://localhost:{self.config.api_port}/health",
+                    "interval": self.config.health_check_interval,
+                })
+                await self._health_aggregator.register_component("model_server", {
+                    "type": "service",
+                    "endpoint": f"http://localhost:{self.config.serving_port}/health",
+                    "interval": self.config.health_check_interval,
+                })
+                if self.config.enable_jprime:
+                    await self._health_aggregator.register_component("jprime", {
+                        "type": "service",
+                        "endpoint": f"http://localhost:{self.config.jprime_port}/health",
+                        "interval": self.config.health_check_interval,
+                    })
+                await self._health_aggregator.start()
+                logger.info("  [OK] Health Aggregator started (Trinity monitoring)")
+            except Exception as e:
+                logger.warning(f"  Health Aggregator failed: {e}")
+
+        # === v77.0 SCHEDULER ===
+        if HAS_V77_API:
+            try:
+                # Initialize scheduler with real training callback
+                async def training_callback(job_id: str) -> None:
+                    """Callback executed when scheduler triggers training."""
+                    logger.info(f"Scheduler triggered training job: {job_id}")
+                    self._stats["trainings_triggered"] += 1
+                    if self._telemetry:
+                        await self._telemetry.record_event("training_scheduled", {"job_id": job_id})
+                    # Trigger actual training via unified pipeline
+                    try:
+                        from reactor_core.training.unified_pipeline import get_unified_trainer
+                        trainer = await get_unified_trainer()
+                        await trainer.train_async()
+                    except Exception as e:
+                        logger.error(f"Scheduled training failed: {e}")
+
+                self._scheduler = await init_scheduler(training_callback=training_callback)
+
+                # Add default training schedules
+                await self._scheduler.add_job(
+                    job_id="daily_incremental",
+                    schedule=ScheduleTemplates.daily_at("02:00"),
+                    callback=training_callback,
+                    metadata={"type": "incremental", "description": "Daily incremental training"}
+                )
+                await self._scheduler.add_job(
+                    job_id="weekly_full",
+                    schedule=ScheduleTemplates.weekly_on("sunday", "03:00"),
+                    callback=training_callback,
+                    metadata={"type": "full", "description": "Weekly full training"}
+                )
+                await self._scheduler.start()
+                logger.info("  [OK] Scheduler started (daily/weekly training)")
+            except Exception as e:
+                logger.warning(f"  Scheduler failed: {e}")
+
+        # === v77.0 MODEL SERVER WITH HOT-RELOAD ===
+        if HAS_V77_API and self.config.enable_serving:
+            try:
+                model_server_config = ModelServerConfig(
+                    max_loaded_models=5,
+                    memory_limit_gb=16.0,
+                    enable_hot_reload=True,
+                    watch_directories=[
+                        Path.home() / ".jarvis" / "models",
+                        self.config.reactor_core_path / "models" if self.config.reactor_core_path else Path.home() / "models",
+                    ],
+                    default_backend="auto",  # Auto-detect based on model format
+                )
+                self._model_server = get_model_server(config=model_server_config)
+
+                # Register hot-reload callback to notify J-Prime
+                @self._model_server.on_model_reload
+                async def notify_prime_on_reload(model_id: str, model_info: dict) -> None:
+                    """Notify J-Prime when models are hot-reloaded."""
+                    logger.info(f"Model {model_id} reloaded, notifying J-Prime...")
+                    if self._telemetry:
+                        await self._telemetry.record_event("model_hot_reload", {
+                            "model_id": model_id,
+                            "info": model_info,
+                        })
+                    # Notify J-Prime via event bridge
+                    if self._event_bridge:
+                        await self._event_bridge.emit(EventType.MODEL_UPDATED, {
+                            "model_id": model_id,
+                            "info": model_info,
+                            "action": "hot_reload",
+                            "timestamp": datetime.now().isoformat(),
+                        })
+                    # Direct HTTP notification to J-Prime
+                    if self._components.get("jprime") and self._components["jprime"].status == ComponentStatus.RUNNING:
+                        try:
+                            import aiohttp
+                            async with aiohttp.ClientSession() as session:
+                                await session.post(
+                                    f"http://localhost:{self.config.jprime_port}/api/v1/models/reload",
+                                    json={"model_id": model_id, "info": model_info},
+                                    timeout=aiohttp.ClientTimeout(total=5),
+                                )
+                        except Exception as e:
+                            logger.debug(f"J-Prime notification failed (non-critical): {e}")
+
+                await self._model_server.start()
+                logger.info(f"  [OK] Model Server with Hot-Reload started")
+            except Exception as e:
+                logger.warning(f"  Model Server failed: {e}")
+
         # API Server
         if self.config.enable_api:
             try:
@@ -911,13 +1110,13 @@ class AGISupervisor:
             except Exception as e:
                 logger.warning(f"  API Server failed: {e}")
 
-        # Model Serving
-        if self.config.enable_serving:
+        # Legacy Inference Engine (fallback)
+        if self.config.enable_serving and not self._model_server:
             try:
                 from reactor_core.serving import InferenceEngine
                 engine = InferenceEngine()
                 await engine.start()
-                logger.info(f"  [OK] Inference Engine started")
+                logger.info(f"  [OK] Inference Engine started (legacy mode)")
             except ImportError:
                 logger.warning("  Inference Engine module not available")
             except Exception as e:
@@ -925,7 +1124,7 @@ class AGISupervisor:
 
         # Training Pipeline (background)
         if self.config.enable_training:
-            logger.info("  [OK] Training Pipeline ready (on-demand)")
+            logger.info("  [OK] Training Pipeline ready (on-demand + scheduled)")
 
         # Scout (optional)
         if self.config.enable_scout:
@@ -1130,7 +1329,10 @@ class AGISupervisor:
                 await asyncio.sleep(5.0)
 
     async def _experience_collection_loop(self) -> None:
-        """Collect experiences from JARVIS for continuous learning."""
+        """Collect experiences from JARVIS for continuous learning with v77.0 integration."""
+        processed_files: Set[str] = set()
+        experience_buffer: List[dict] = []
+
         while self._running:
             try:
                 # Check for new experiences in Trinity events
@@ -1138,6 +1340,10 @@ class AGISupervisor:
 
                 if events_dir.exists():
                     for event_file in events_dir.glob("*.json"):
+                        file_key = str(event_file)
+                        if file_key in processed_files:
+                            continue
+
                         try:
                             with open(event_file) as f:
                                 event_data = json.load(f)
@@ -1145,20 +1351,59 @@ class AGISupervisor:
                             event_type = event_data.get("event_type", "")
 
                             # Collect interaction events
-                            if event_type in ("interaction_end", "correction", "feedback"):
+                            if event_type in ("interaction_end", "correction", "feedback", "learning_signal"):
                                 self._stats["experiences_collected"] += 1
+                                experience_buffer.append(event_data)
+
+                                # Record to telemetry
+                                if self._telemetry:
+                                    await self._telemetry.record_event(
+                                        "experience_collected",
+                                        {
+                                            "type": event_type,
+                                            "total_count": self._stats["experiences_collected"],
+                                        }
+                                    )
 
                                 # Check if we should trigger training
                                 if (
                                     self._stats["experiences_collected"] > 0 and
                                     self._stats["experiences_collected"] % self.config.auto_training_threshold == 0
                                 ):
-                                    logger.info(f"Auto-training triggered after {self._stats['experiences_collected']} experiences")
+                                    logger.info(f"Experience threshold reached ({self._stats['experiences_collected']}), triggering training...")
                                     self._stats["trainings_triggered"] += 1
-                                    # Would trigger training here
+
+                                    if self._telemetry:
+                                        await self._telemetry.record_event(
+                                            "training_triggered",
+                                            {
+                                                "reason": "experience_threshold",
+                                                "experience_count": self._stats["experiences_collected"],
+                                            }
+                                        )
+
+                                    # Trigger real training via unified pipeline
+                                    try:
+                                        from reactor_core.training.unified_pipeline import get_unified_trainer
+                                        trainer = await get_unified_trainer()
+                                        # Pass collected experiences to trainer
+                                        await trainer.add_experiences(experience_buffer)
+                                        asyncio.create_task(trainer.train_async())
+                                        experience_buffer.clear()
+                                        logger.info("Training job queued with collected experiences")
+                                    except ImportError:
+                                        logger.warning("Unified trainer not available for auto-training")
+                                    except Exception as e:
+                                        logger.error(f"Auto-training failed: {e}")
+
+                            processed_files.add(file_key)
 
                         except Exception as e:
                             logger.debug(f"Error processing event file: {e}")
+
+                # Periodic telemetry flush
+                if self._telemetry and self._stats["experiences_collected"] > 0:
+                    await self._telemetry.flush()
 
                 await asyncio.sleep(5.0)
 
@@ -1215,14 +1460,35 @@ class AGISupervisor:
             logger.info(f"  {status_icon} {component.name}{pid_info}")
 
         logger.info("-" * 50)
+
+        # v77.0 Services Status
+        if HAS_V77_API:
+            logger.info("")
+            logger.info("v77.0 SERVICES:")
+            logger.info("-" * 50)
+            logger.info(f"  [{'OK' if self._telemetry else '--'}] Telemetry Collector")
+            logger.info(f"  [{'OK' if self._model_registry else '--'}] Model Registry ({self._model_registry.model_count if self._model_registry else 0} models)")
+            logger.info(f"  [{'OK' if self._health_aggregator else '--'}] Health Aggregator")
+            logger.info(f"  [{'OK' if self._scheduler else '--'}] Training Scheduler")
+            logger.info(f"  [{'OK' if self._model_server else '--'}] Model Server (Hot-Reload)")
+            logger.info("-" * 50)
+
         logger.info("")
         logger.info("ENDPOINTS:")
         if self.config.enable_api:
             logger.info(f"  API Server:      http://localhost:{self.config.api_port}")
+            logger.info(f"  API Docs:        http://localhost:{self.config.api_port}/docs")
+            logger.info(f"  Health Check:    http://localhost:{self.config.api_port}/health")
         if self.config.enable_serving:
             logger.info(f"  Model Serving:   http://localhost:{self.config.serving_port}")
         if self._components.get("jprime") and self._components["jprime"].status == ComponentStatus.RUNNING:
             logger.info(f"  J-Prime:         http://localhost:{self.config.jprime_port}")
+        logger.info("")
+        logger.info("FEATURES:")
+        logger.info("  - Real-time model hot-reload with Prime notification")
+        logger.info("  - Scheduled training (daily 2am, weekly Sunday 3am)")
+        logger.info("  - Cross-component health monitoring")
+        logger.info("  - Telemetry collection and event tracking")
         logger.info("")
         logger.info("Press Ctrl+C to shutdown")
         logger.info("")
@@ -1230,16 +1496,52 @@ class AGISupervisor:
     def _print_final_stats(self) -> None:
         """Print final statistics."""
         uptime = time.time() - self._start_time if self._start_time > 0 else 0
+        hours, remainder = divmod(int(uptime), 3600)
+        minutes, seconds = divmod(remainder, 60)
 
         logger.info("")
-        logger.info("FINAL STATISTICS:")
-        logger.info("-" * 50)
-        logger.info(f"  Uptime:              {uptime:.1f} seconds")
+        logger.info("=" * 60)
+        logger.info("                    FINAL STATISTICS")
+        logger.info("=" * 60)
+        logger.info(f"  Uptime:              {hours}h {minutes}m {seconds}s")
         logger.info(f"  Events Processed:    {self._stats['events_processed']}")
         logger.info(f"  Experiences:         {self._stats['experiences_collected']}")
         logger.info(f"  Trainings Triggered: {self._stats['trainings_triggered']}")
         logger.info(f"  Component Restarts:  {self._stats['restarts']}")
-        logger.info("-" * 50)
+        logger.info("-" * 60)
+
+        # v77.0 Service Stats
+        if HAS_V77_API:
+            logger.info("v77.0 SERVICE METRICS:")
+            if self._telemetry:
+                try:
+                    telemetry_stats = self._telemetry.get_stats()
+                    logger.info(f"  Telemetry Events:    {telemetry_stats.get('total_events', 'N/A')}")
+                except Exception:
+                    logger.info("  Telemetry Events:    N/A")
+            if self._model_registry:
+                logger.info(f"  Models Registered:   {self._model_registry.model_count}")
+            if self._scheduler:
+                try:
+                    scheduler_stats = self._scheduler.get_stats()
+                    logger.info(f"  Scheduled Jobs Run:  {scheduler_stats.get('jobs_executed', 'N/A')}")
+                except Exception:
+                    logger.info("  Scheduled Jobs Run:  N/A")
+            if self._model_server:
+                try:
+                    server_stats = self._model_server.get_stats()
+                    logger.info(f"  Inference Requests:  {server_stats.get('total_requests', 'N/A')}")
+                    logger.info(f"  Models Hot-Reloaded: {server_stats.get('hot_reloads', 'N/A')}")
+                except Exception:
+                    logger.info("  Inference Requests:  N/A")
+            if self._health_aggregator:
+                try:
+                    health_stats = self._health_aggregator.get_stats()
+                    logger.info(f"  Health Checks:       {health_stats.get('total_checks', 'N/A')}")
+                except Exception:
+                    logger.info("  Health Checks:       N/A")
+
+        logger.info("=" * 60)
 
     async def run_until_shutdown(self) -> None:
         """Run until shutdown signal received."""
