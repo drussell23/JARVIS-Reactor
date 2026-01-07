@@ -204,9 +204,23 @@ def read_json_safe(
 #
 # All configuration now sourced from the unified TrinityConfig system.
 # This ensures consistency across all Trinity repos (JARVIS, Prime, Reactor Core).
+#
+# Configuration Priority:
+# 1. JARVIS-AI-Agent backend.core.trinity_config (if available - cross-repo consistency)
+# 2. reactor_core.config.trinity_config (local fallback - self-contained)
+# 3. Environment variables (override any config)
 # =============================================================================
 
-# Try to import unified config, fall back to local env vars if not available
+# Import local Trinity config (always available)
+from reactor_core.config.trinity_config import (
+    TrinityConfig,
+    get_config as _get_local_trinity_config,
+    sleep_with_jitter,
+    get_retry_delay,
+)
+
+# Try to import JARVIS config for cross-repo consistency (optional)
+_JARVIS_CONFIG_AVAILABLE = False
 try:
     import sys
     # Add JARVIS path to allow cross-repo imports
@@ -215,59 +229,56 @@ try:
         sys.path.insert(0, str(_jarvis_path))
 
     from backend.core.trinity_config import (
-        get_config as _get_trinity_config,
-        sleep_with_jitter,
-        get_retry_delay,
-        TrinityConfig,
+        get_config as _get_jarvis_trinity_config,
     )
-    _UNIFIED_CONFIG = True
-    logger.debug("[Trinity] Using unified TrinityConfig")
-except ImportError:
-    _UNIFIED_CONFIG = False
-    _get_trinity_config = None
-    logger.debug("[Trinity] Unified config not available, using local defaults")
+    _JARVIS_CONFIG_AVAILABLE = True
+    logger.debug("[Trinity v79.0] Using JARVIS backend.core.trinity_config for cross-repo consistency")
+except ImportError as e:
+    logger.debug(f"[Trinity v79.0] JARVIS config not available ({e}), using local reactor_core.config.trinity_config")
 
 
-def _get_config_value(attr_path: str, default: Any) -> Any:
-    """Get configuration value with fallback to default."""
-    if not _UNIFIED_CONFIG or _get_trinity_config is None:
-        return default
-    try:
-        config = _get_trinity_config()
-        parts = attr_path.split(".")
-        value = config
-        for part in parts:
-            value = getattr(value, part)
-        return value
-    except (AttributeError, TypeError):
-        return default
+def _get_trinity_config() -> TrinityConfig:
+    """
+    Get Trinity configuration with priority:
+    1. JARVIS backend config (if available)
+    2. Local reactor_core config (fallback)
+    """
+    if _JARVIS_CONFIG_AVAILABLE:
+        try:
+            return _get_jarvis_trinity_config()
+        except Exception as e:
+            logger.warning(f"[Trinity] Failed to get JARVIS config: {e}, falling back to local config")
 
+    return _get_local_trinity_config()
+
+
+# Get unified Trinity configuration
+_trinity_config = _get_trinity_config()
 
 # Directories - all configurable via environment or unified config
-TRINITY_DIR = Path(os.getenv(
-    "TRINITY_DIR",
-    str(_get_config_value("trinity_dir", Path.home() / ".jarvis" / "trinity"))
-))
-ORCHESTRATOR_STATE_FILE = TRINITY_DIR / "orchestrator_state.json"
-COMPONENTS_DIR = TRINITY_DIR / "components"
+TRINITY_DIR = _trinity_config.trinity_dir
+
+# Use properties if available (reactor_core config), otherwise construct paths
+ORCHESTRATOR_STATE_FILE = (
+    _trinity_config.orchestrator_state_file
+    if hasattr(_trinity_config, 'orchestrator_state_file')
+    else TRINITY_DIR / "orchestrator_state.json"
+)
+COMPONENTS_DIR = (
+    _trinity_config.components_dir
+    if hasattr(_trinity_config, 'components_dir')
+    else TRINITY_DIR / "components"
+)
 
 # Health thresholds - all configurable
-HEARTBEAT_TIMEOUT = float(os.getenv(
-    "TRINITY_HEARTBEAT_TIMEOUT",
-    str(_get_config_value("health.heartbeat_timeout", 15.0))
-))
-HEALTH_CHECK_INTERVAL = float(os.getenv(
-    "TRINITY_HEALTH_CHECK_INTERVAL",
-    str(_get_config_value("health.health_check_interval", 5.0))
-))
-CIRCUIT_BREAKER_THRESHOLD = int(os.getenv(
-    "TRINITY_CIRCUIT_BREAKER_THRESHOLD",
-    str(_get_config_value("circuit_breaker.failure_threshold", 3))
-))
-CIRCUIT_BREAKER_RESET = float(os.getenv(
-    "TRINITY_CIRCUIT_BREAKER_RESET",
-    str(_get_config_value("circuit_breaker.timeout_seconds", 30.0))
-))
+HEARTBEAT_TIMEOUT = _trinity_config.health.heartbeat_timeout
+HEALTH_CHECK_INTERVAL = _trinity_config.health.health_check_interval
+CIRCUIT_BREAKER_THRESHOLD = _trinity_config.circuit_breaker.failure_threshold
+CIRCUIT_BREAKER_RESET = _trinity_config.circuit_breaker.timeout_seconds
+
+# Ensure directories exist
+TRINITY_DIR.mkdir(parents=True, exist_ok=True)
+COMPONENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================

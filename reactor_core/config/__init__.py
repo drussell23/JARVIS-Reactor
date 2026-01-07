@@ -32,6 +32,19 @@ from reactor_core.config.unified_config import (
     reset_config as reset_unified_config,
 )
 
+from reactor_core.config.trinity_config import (
+    TrinityConfig,
+    HealthConfig,
+    CircuitBreakerConfig,
+    CommandConfig,
+    DeadLetterQueueConfig,
+    get_config as get_trinity_config,
+    reset_config as reset_trinity_config,
+    sleep_with_jitter,
+    async_sleep_with_jitter,
+    get_retry_delay,
+)
+
 __all__ = [
     # Base configs
     "BaseConfig",
@@ -52,4 +65,15 @@ __all__ = [
     "Environment",
     "get_unified_config",
     "reset_unified_config",
+    # Trinity config
+    "TrinityConfig",
+    "HealthConfig",
+    "CircuitBreakerConfig",
+    "CommandConfig",
+    "DeadLetterQueueConfig",
+    "get_trinity_config",
+    "reset_trinity_config",
+    "sleep_with_jitter",
+    "async_sleep_with_jitter",
+    "get_retry_delay",
 ]
