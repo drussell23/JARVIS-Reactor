@@ -70,6 +70,478 @@ T = TypeVar("T")
 
 
 # =============================================================================
+# AUTO-FALLBACK AND PORT DETECTION (v76.0 Enhancement)
+# =============================================================================
+
+class BackendFallbackChain:
+    """
+    Manages automatic fallback between inference backends.
+
+    When primary backend fails (e.g., vLLM not available on macOS),
+    automatically falls back to compatible alternatives.
+
+    Fallback Order:
+    1. vLLM (Linux only, highest throughput)
+    2. MLX-LM (macOS ARM only)
+    3. llama.cpp (cross-platform, GGUF support)
+    4. Transformers (universal fallback)
+    """
+
+    # Platform-specific backend preferences
+    LINUX_CHAIN = ["vllm", "llama_cpp", "transformers"]
+    MACOS_ARM_CHAIN = ["mlx_lm", "llama_cpp", "transformers"]
+    MACOS_INTEL_CHAIN = ["llama_cpp", "transformers"]
+    DEFAULT_CHAIN = ["transformers"]
+
+    def __init__(self):
+        self._platform = self._detect_platform()
+        self._available_backends: Dict[str, bool] = {}
+        self._fallback_chain = self._get_chain_for_platform()
+        self._check_backends()
+
+    def _detect_platform(self) -> str:
+        """Detect current platform."""
+        import platform as plat
+        system = plat.system().lower()
+        machine = plat.machine().lower()
+
+        if system == "darwin":
+            if "arm" in machine or machine == "arm64":
+                return "macos_arm"
+            return "macos_intel"
+        elif system == "linux":
+            return "linux"
+        return "other"
+
+    def _get_chain_for_platform(self) -> List[str]:
+        """Get fallback chain for current platform."""
+        chains = {
+            "linux": self.LINUX_CHAIN,
+            "macos_arm": self.MACOS_ARM_CHAIN,
+            "macos_intel": self.MACOS_INTEL_CHAIN,
+        }
+        return chains.get(self._platform, self.DEFAULT_CHAIN)
+
+    def _check_backends(self) -> None:
+        """Check which backends are available."""
+        backend_checks = {
+            "vllm": self._check_vllm,
+            "mlx_lm": self._check_mlx,
+            "llama_cpp": self._check_llama_cpp,
+            "transformers": self._check_transformers,
+        }
+
+        for backend, check_fn in backend_checks.items():
+            try:
+                self._available_backends[backend] = check_fn()
+            except Exception:
+                self._available_backends[backend] = False
+
+        logger.info(f"Available backends: {[k for k, v in self._available_backends.items() if v]}")
+
+    def _check_vllm(self) -> bool:
+        """Check if vLLM is available."""
+        if self._platform != "linux":
+            return False
+        try:
+            import vllm
+            return True
+        except ImportError:
+            return False
+
+    def _check_mlx(self) -> bool:
+        """Check if MLX-LM is available."""
+        if self._platform != "macos_arm":
+            return False
+        try:
+            import mlx
+            import mlx_lm
+            return True
+        except ImportError:
+            return False
+
+    def _check_llama_cpp(self) -> bool:
+        """Check if llama-cpp-python is available."""
+        try:
+            from llama_cpp import Llama
+            return True
+        except ImportError:
+            return False
+
+    def _check_transformers(self) -> bool:
+        """Check if transformers is available."""
+        try:
+            import transformers
+            return True
+        except ImportError:
+            return False
+
+    def get_best_backend(self, preferred: Optional[str] = None) -> str:
+        """
+        Get the best available backend.
+
+        Args:
+            preferred: Preferred backend (if available)
+
+        Returns:
+            Name of best available backend
+        """
+        # Check preferred first
+        if preferred and self._available_backends.get(preferred, False):
+            return preferred
+
+        # Go through fallback chain
+        for backend in self._fallback_chain:
+            if self._available_backends.get(backend, False):
+                if preferred and preferred != backend:
+                    logger.warning(f"Backend '{preferred}' not available, falling back to '{backend}'")
+                return backend
+
+        # Ultimate fallback
+        return "transformers"
+
+    def is_available(self, backend: str) -> bool:
+        """Check if a specific backend is available."""
+        return self._available_backends.get(backend, False)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get backend availability status."""
+        return {
+            "platform": self._platform,
+            "available_backends": dict(self._available_backends),
+            "fallback_chain": self._fallback_chain,
+            "recommended": self.get_best_backend(),
+        }
+
+
+class PortManager:
+    """
+    Manages port allocation for inference servers.
+
+    Features:
+    - Automatic free port detection
+    - Port range configuration
+    - Health checking on ports
+    - Conflict resolution
+    """
+
+    DEFAULT_PORT_RANGE = (8000, 8100)
+
+    def __init__(
+        self,
+        port_range: Tuple[int, int] = DEFAULT_PORT_RANGE,
+        reserved_ports: Optional[Set[int]] = None,
+    ):
+        self.port_range = port_range
+        self.reserved_ports = reserved_ports or set()
+        self._allocated_ports: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+        """Check if a port is free."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                result = s.connect_ex((host, port))
+                return result != 0
+        except Exception:
+            return False
+
+    async def find_free_port(self, preferred: Optional[int] = None) -> int:
+        """
+        Find a free port.
+
+        Args:
+            preferred: Preferred port number
+
+        Returns:
+            Available port number
+        """
+        async with self._lock:
+            # Try preferred port first
+            if preferred and preferred not in self.reserved_ports:
+                if self.is_port_free(preferred):
+                    return preferred
+
+            # Search in range
+            start, end = self.port_range
+            for port in range(start, end):
+                if port in self.reserved_ports:
+                    continue
+                if port in self._allocated_ports.values():
+                    continue
+                if self.is_port_free(port):
+                    return port
+
+            raise RuntimeError(f"No free ports available in range {self.port_range}")
+
+    async def allocate(self, service_id: str, preferred: Optional[int] = None) -> int:
+        """
+        Allocate a port for a service.
+
+        Args:
+            service_id: Unique identifier for the service
+            preferred: Preferred port number
+
+        Returns:
+            Allocated port number
+        """
+        async with self._lock:
+            # Check if already allocated
+            if service_id in self._allocated_ports:
+                return self._allocated_ports[service_id]
+
+            port = await self.find_free_port(preferred)
+            self._allocated_ports[service_id] = port
+            logger.info(f"Allocated port {port} for service '{service_id}'")
+            return port
+
+    async def release(self, service_id: str) -> None:
+        """Release an allocated port."""
+        async with self._lock:
+            if service_id in self._allocated_ports:
+                port = self._allocated_ports.pop(service_id)
+                logger.info(f"Released port {port} from service '{service_id}'")
+
+    def get_allocated(self, service_id: str) -> Optional[int]:
+        """Get allocated port for a service."""
+        return self._allocated_ports.get(service_id)
+
+    async def health_check(self, port: int, timeout: float = 5.0) -> bool:
+        """
+        Check if a service is responding on a port.
+
+        Args:
+            port: Port number to check
+            timeout: Timeout in seconds
+
+        Returns:
+            True if service is responding
+        """
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as session:
+                async with session.get(f"http://127.0.0.1:{port}/health") as response:
+                    return response.status == 200
+        except Exception:
+            return False
+
+
+class AutoRetryInference:
+    """
+    Wrapper for inference with automatic retry and fallback.
+
+    Features:
+    - Configurable retry attempts
+    - Exponential backoff
+    - Automatic backend fallback
+    - Circuit breaker integration
+    """
+
+    def __init__(
+        self,
+        max_retries: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        fallback_chain: Optional[BackendFallbackChain] = None,
+    ):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.fallback_chain = fallback_chain or BackendFallbackChain()
+
+        self._retry_count = 0
+        self._last_error: Optional[Exception] = None
+
+    async def execute_with_retry(
+        self,
+        func: Callable[..., Awaitable[T]],
+        *args,
+        **kwargs,
+    ) -> T:
+        """
+        Execute function with retry logic.
+
+        Args:
+            func: Async function to execute
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Function result
+
+        Raises:
+            Last exception if all retries fail
+        """
+        self._retry_count = 0
+
+        for attempt in range(self.max_retries):
+            try:
+                result = await func(*args, **kwargs)
+                self._retry_count = 0
+                return result
+
+            except Exception as e:
+                self._last_error = e
+                self._retry_count = attempt + 1
+
+                if attempt == self.max_retries - 1:
+                    logger.error(f"All {self.max_retries} retry attempts failed: {e}")
+                    raise
+
+                delay = min(
+                    self.base_delay * (2 ** attempt),
+                    self.max_delay
+                )
+                logger.warning(
+                    f"Attempt {attempt + 1} failed: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError("Retry logic error")
+
+    async def execute_with_fallback(
+        self,
+        backends: Dict[str, Callable[..., Awaitable[T]]],
+        *args,
+        **kwargs,
+    ) -> Tuple[T, str]:
+        """
+        Execute with backend fallback.
+
+        Args:
+            backends: Dict mapping backend name to function
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Tuple of (result, backend_used)
+        """
+        chain = self.fallback_chain._fallback_chain
+
+        for backend in chain:
+            if backend not in backends:
+                continue
+
+            if not self.fallback_chain.is_available(backend):
+                continue
+
+            try:
+                result = await self.execute_with_retry(
+                    backends[backend],
+                    *args,
+                    **kwargs,
+                )
+                return result, backend
+
+            except Exception as e:
+                logger.warning(f"Backend '{backend}' failed: {e}")
+                continue
+
+        raise RuntimeError("All backends failed")
+
+
+class InferenceHealthMonitor:
+    """
+    Monitor inference engine health and performance.
+
+    Tracks:
+    - Request latency
+    - Error rates
+    - Throughput
+    - Memory usage
+    - Model loading status
+    """
+
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+
+        self._latencies: List[float] = []
+        self._errors: List[Tuple[datetime, str]] = []
+        self._requests: int = 0
+        self._start_time = datetime.now()
+        self._lock = asyncio.Lock()
+
+    async def record_request(
+        self,
+        latency_ms: float,
+        success: bool,
+        error_msg: Optional[str] = None,
+    ) -> None:
+        """Record a request."""
+        async with self._lock:
+            self._requests += 1
+
+            self._latencies.append(latency_ms)
+            if len(self._latencies) > self.window_size:
+                self._latencies = self._latencies[-self.window_size:]
+
+            if not success and error_msg:
+                self._errors.append((datetime.now(), error_msg))
+                if len(self._errors) > self.window_size:
+                    self._errors = self._errors[-self.window_size:]
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current metrics."""
+        elapsed = (datetime.now() - self._start_time).total_seconds()
+
+        latency_stats = {}
+        if self._latencies:
+            sorted_lat = sorted(self._latencies)
+            latency_stats = {
+                "mean_ms": sum(self._latencies) / len(self._latencies),
+                "p50_ms": sorted_lat[len(sorted_lat) // 2],
+                "p95_ms": sorted_lat[int(len(sorted_lat) * 0.95)] if len(sorted_lat) > 20 else sorted_lat[-1],
+                "p99_ms": sorted_lat[int(len(sorted_lat) * 0.99)] if len(sorted_lat) > 100 else sorted_lat[-1],
+            }
+
+        return {
+            "total_requests": self._requests,
+            "requests_per_second": self._requests / elapsed if elapsed > 0 else 0,
+            "latency": latency_stats,
+            "error_count": len(self._errors),
+            "error_rate": len(self._errors) / self._requests if self._requests > 0 else 0,
+            "recent_errors": [
+                {"time": t.isoformat(), "error": e}
+                for t, e in self._errors[-5:]
+            ],
+            "uptime_seconds": elapsed,
+        }
+
+    def is_healthy(self, max_error_rate: float = 0.1) -> bool:
+        """Check if inference engine is healthy."""
+        if self._requests == 0:
+            return True
+        return (len(self._errors) / self._requests) < max_error_rate
+
+
+# Global instances
+_backend_fallback: Optional[BackendFallbackChain] = None
+_port_manager: Optional[PortManager] = None
+
+
+def get_backend_fallback() -> BackendFallbackChain:
+    """Get global backend fallback chain instance."""
+    global _backend_fallback
+    if _backend_fallback is None:
+        _backend_fallback = BackendFallbackChain()
+    return _backend_fallback
+
+
+def get_port_manager() -> PortManager:
+    """Get global port manager instance."""
+    global _port_manager
+    if _port_manager is None:
+        _port_manager = PortManager()
+    return _port_manager
+
+
+# =============================================================================
 # ENUMS AND CONSTANTS
 # =============================================================================
 
@@ -1382,6 +1854,13 @@ class ModelEnsemble:
 # =============================================================================
 
 __all__ = [
+    # === AUTO-FALLBACK AND PORT DETECTION (v76.0) ===
+    "BackendFallbackChain",
+    "PortManager",
+    "AutoRetryInference",
+    "InferenceHealthMonitor",
+    "get_backend_fallback",
+    "get_port_manager",
     # Enums
     "ModelBackend",
     "QuantizationType",

@@ -13,6 +13,13 @@ Components:
 """
 
 from reactor_core.serving.inference_engine import (
+    # === AUTO-FALLBACK AND PORT DETECTION (v76.0) ===
+    BackendFallbackChain,
+    PortManager,
+    AutoRetryInference,
+    InferenceHealthMonitor,
+    get_backend_fallback,
+    get_port_manager,
     # Enums
     ModelBackend,
     QuantizationType,
@@ -43,6 +50,13 @@ from reactor_core.serving.inference_engine import (
 )
 
 __all__ = [
+    # === AUTO-FALLBACK AND PORT DETECTION (v76.0) ===
+    "BackendFallbackChain",
+    "PortManager",
+    "AutoRetryInference",
+    "InferenceHealthMonitor",
+    "get_backend_fallback",
+    "get_port_manager",
     # Enums
     "ModelBackend",
     "QuantizationType",

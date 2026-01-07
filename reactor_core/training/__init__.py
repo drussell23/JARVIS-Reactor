@@ -29,6 +29,11 @@ from reactor_core.training.trainer import (
 
 # Advanced training methods
 from reactor_core.training.advanced_training import (
+    # === MEMORY OPTIMIZATION (v76.0) ===
+    MemoryManager,
+    ReferenceModelManager,
+    DynamicBatchSizer,
+    get_memory_manager,
     # Enums
     TrainingMethod,
     SafetyTier,
@@ -158,6 +163,11 @@ __all__ = [
     "create_optimal_lora_config",
     "TARGET_MODULES_MAP",
     # === ADVANCED TRAINING (v76.0) ===
+    # Memory Optimization
+    "MemoryManager",
+    "ReferenceModelManager",
+    "DynamicBatchSizer",
+    "get_memory_manager",
     # Training Method Enums
     "TrainingMethod",
     "SafetyTier",

@@ -87,6 +87,522 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# ROBUST CROSS-REPO DISCOVERY (v76.0 Enhancement)
+# =============================================================================
+
+class RepoDiscovery:
+    """
+    Robust cross-repo discovery for AGI OS ecosystem.
+
+    Features:
+    - Multi-strategy repo detection (env vars, config files, git remotes)
+    - Symlink resolution
+    - Validation of repo contents
+    - Caching of discovered paths
+    - Platform-aware search paths
+    """
+
+    # Known repo names and their identifying files
+    REPO_SIGNATURES = {
+        "JARVIS-AI-Agent": ["jarvis/main.py", "jarvis/__init__.py", "setup.py"],
+        "jarvis-prime": ["jarvis_prime/main.py", "jprime", "inference.py"],
+        "reactor-core": ["reactor_core/__init__.py", "run_supervisor.py"],
+    }
+
+    # Environment variable mappings
+    ENV_VAR_MAPPINGS = {
+        "JARVIS-AI-Agent": ["JARVIS_PATH", "JARVIS_HOME", "JARVIS_DIR"],
+        "jarvis-prime": ["JPRIME_PATH", "JARVIS_PRIME_PATH", "JPRIME_HOME"],
+        "reactor-core": ["REACTOR_CORE_PATH", "REACTOR_PATH"],
+    }
+
+    # Common project directories by platform
+    PROJECT_DIRS = {
+        "darwin": [
+            Path.home() / "Projects",
+            Path.home() / "Developer",
+            Path.home() / "dev",
+            Path.home() / "code",
+            Path.home() / "repos",
+            Path.home() / "git",
+            Path.home() / "src",
+        ],
+        "linux": [
+            Path.home() / "projects",
+            Path.home() / "dev",
+            Path.home() / "code",
+            Path.home() / "repos",
+            Path.home() / "git",
+            Path.home() / "src",
+            Path("/opt"),
+        ],
+    }
+
+    def __init__(self):
+        self._cache: Dict[str, Path] = {}
+        self._platform = sys.platform
+        self._search_history: List[str] = []
+
+    def find_repo(self, name: str, required: bool = False) -> Optional[Path]:
+        """
+        Find a repository by name using multiple strategies.
+
+        Args:
+            name: Repository name
+            required: If True, raise error if not found
+
+        Returns:
+            Path to repository or None
+        """
+        # Check cache first
+        if name in self._cache:
+            return self._cache[name]
+
+        # Strategy 1: Environment variables
+        path = self._find_via_env_var(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} via environment variable: {path}")
+            return path
+
+        # Strategy 2: Config file
+        path = self._find_via_config_file(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} via config file: {path}")
+            return path
+
+        # Strategy 3: Sibling directory (relative to current script)
+        path = self._find_sibling_repo(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} as sibling directory: {path}")
+            return path
+
+        # Strategy 4: Search common project directories
+        path = self._find_in_project_dirs(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} in project directories: {path}")
+            return path
+
+        # Strategy 5: Git remote search (if in a git repo)
+        path = self._find_via_git_remote(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} via git remote reference: {path}")
+            return path
+
+        # Strategy 6: Home directory scan (last resort)
+        path = self._scan_home_directory(name)
+        if path:
+            self._cache[name] = path
+            logger.info(f"Found {name} via home directory scan: {path}")
+            return path
+
+        if required:
+            raise FileNotFoundError(
+                f"Required repository '{name}' not found. "
+                f"Set {self.ENV_VAR_MAPPINGS.get(name, ['<repo>_PATH'])[0]} environment variable."
+            )
+
+        logger.warning(f"Repository '{name}' not found")
+        return None
+
+    def _find_via_env_var(self, name: str) -> Optional[Path]:
+        """Find repo via environment variable."""
+        env_vars = self.ENV_VAR_MAPPINGS.get(name, [])
+
+        for var in env_vars:
+            value = os.environ.get(var)
+            if value:
+                path = Path(value).resolve()
+                if self._validate_repo(path, name):
+                    return path
+
+        return None
+
+    def _find_via_config_file(self, name: str) -> Optional[Path]:
+        """Find repo via AGI OS config file."""
+        config_paths = [
+            Path.home() / ".jarvis" / "agi_config.json",
+            Path.home() / ".config" / "agi-os" / "config.json",
+            Path.home() / ".agi-os.json",
+        ]
+
+        for config_path in config_paths:
+            if config_path.exists():
+                try:
+                    with open(config_path) as f:
+                        config = json.load(f)
+
+                    # Check various config key formats
+                    repo_path = (
+                        config.get("repos", {}).get(name) or
+                        config.get("paths", {}).get(name) or
+                        config.get(f"{name.lower().replace('-', '_')}_path")
+                    )
+
+                    if repo_path:
+                        path = Path(repo_path).resolve()
+                        if self._validate_repo(path, name):
+                            return path
+
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    continue
+
+        return None
+
+    def _find_sibling_repo(self, name: str) -> Optional[Path]:
+        """Find repo as sibling directory."""
+        script_dir = Path(__file__).parent.resolve()
+        parent_dir = script_dir.parent
+
+        # Check direct sibling
+        sibling = parent_dir / name
+        if self._validate_repo(sibling, name):
+            return sibling
+
+        # Check with variations
+        variations = [
+            name,
+            name.lower(),
+            name.replace("-", "_"),
+            name.replace("_", "-"),
+        ]
+
+        for variation in variations:
+            sibling = parent_dir / variation
+            if self._validate_repo(sibling, name):
+                return sibling
+
+        return None
+
+    def _find_in_project_dirs(self, name: str) -> Optional[Path]:
+        """Find repo in common project directories."""
+        platform_key = "darwin" if self._platform == "darwin" else "linux"
+        project_dirs = self.PROJECT_DIRS.get(platform_key, [])
+
+        variations = [
+            name,
+            name.lower(),
+            name.replace("-", "_"),
+            name.replace("_", "-"),
+        ]
+
+        for project_dir in project_dirs:
+            if not project_dir.exists():
+                continue
+
+            for variation in variations:
+                repo_path = project_dir / variation
+                if self._validate_repo(repo_path, name):
+                    return repo_path
+
+        return None
+
+    def _find_via_git_remote(self, name: str) -> Optional[Path]:
+        """Find repo via git remote configuration."""
+        try:
+            # Check if we're in a git repo
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            if result.returncode != 0:
+                return None
+
+            git_root = Path(result.stdout.strip())
+            parent_dir = git_root.parent
+
+            # Check siblings
+            for sibling in parent_dir.iterdir():
+                if sibling.is_dir() and self._validate_repo(sibling, name):
+                    return sibling
+
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+        return None
+
+    def _scan_home_directory(self, name: str, max_depth: int = 3) -> Optional[Path]:
+        """
+        Scan home directory for repo (limited depth).
+
+        This is a last resort and is intentionally limited.
+        """
+        home = Path.home()
+        variations = [
+            name,
+            name.lower(),
+            name.replace("-", "_"),
+            name.replace("_", "-"),
+        ]
+
+        def scan_dir(directory: Path, depth: int) -> Optional[Path]:
+            if depth > max_depth:
+                return None
+
+            try:
+                for item in directory.iterdir():
+                    if not item.is_dir():
+                        continue
+
+                    # Skip hidden directories and common non-project dirs
+                    if item.name.startswith("."):
+                        continue
+                    if item.name in ("Library", "Applications", "Documents", "Downloads"):
+                        continue
+
+                    # Check if this is the repo
+                    if item.name in variations:
+                        if self._validate_repo(item, name):
+                            return item
+
+                    # Recurse (but not too deep)
+                    result = scan_dir(item, depth + 1)
+                    if result:
+                        return result
+
+            except PermissionError:
+                pass
+
+            return None
+
+        return scan_dir(home, 0)
+
+    def _validate_repo(self, path: Path, name: str) -> bool:
+        """Validate that path is a valid repo with expected contents."""
+        if not path.exists():
+            return False
+
+        # Resolve symlinks
+        path = path.resolve()
+
+        # Check for signature files
+        signatures = self.REPO_SIGNATURES.get(name, [])
+        if not signatures:
+            # No signatures known, just check if it's a directory with py files
+            return path.is_dir() and any(path.glob("*.py"))
+
+        # Check if any signature file exists
+        for sig in signatures:
+            if (path / sig).exists():
+                return True
+
+        # Also check for setup.py or pyproject.toml
+        if (path / "setup.py").exists() or (path / "pyproject.toml").exists():
+            return True
+
+        return False
+
+    def get_all_repos(self) -> Dict[str, Optional[Path]]:
+        """Find all known AGI OS repositories."""
+        return {
+            name: self.find_repo(name)
+            for name in self.REPO_SIGNATURES.keys()
+        }
+
+    def get_discovery_status(self) -> Dict[str, Any]:
+        """Get status of repo discovery."""
+        repos = self.get_all_repos()
+        return {
+            "discovered": {name: str(path) for name, path in repos.items() if path},
+            "missing": [name for name, path in repos.items() if not path],
+            "cached": list(self._cache.keys()),
+            "platform": self._platform,
+        }
+
+
+class ComponentHealthChecker:
+    """
+    Advanced health checking for AGI OS components.
+
+    Features:
+    - Multiple health check strategies
+    - Configurable thresholds
+    - Health history tracking
+    - Automatic recovery triggers
+    """
+
+    def __init__(
+        self,
+        heartbeat_timeout: float = 30.0,
+        consecutive_failures_threshold: int = 3,
+    ):
+        self.heartbeat_timeout = heartbeat_timeout
+        self.consecutive_failures_threshold = consecutive_failures_threshold
+
+        self._health_history: Dict[str, List[bool]] = {}
+        self._last_check_time: Dict[str, float] = {}
+        self._failure_counts: Dict[str, int] = {}
+
+    async def check_process_health(
+        self,
+        component_name: str,
+        process: Optional[subprocess.Popen],
+    ) -> Tuple[bool, str]:
+        """Check if a process is healthy."""
+        if process is None:
+            return False, "No process"
+
+        poll_result = process.poll()
+        if poll_result is not None:
+            return False, f"Process exited with code {poll_result}"
+
+        return True, "Process running"
+
+    async def check_heartbeat_health(
+        self,
+        component_name: str,
+        last_heartbeat: float,
+    ) -> Tuple[bool, str]:
+        """Check if heartbeat is recent."""
+        now = time.time()
+        elapsed = now - last_heartbeat
+
+        if last_heartbeat == 0:
+            return False, "No heartbeat received"
+
+        if elapsed > self.heartbeat_timeout:
+            return False, f"Heartbeat timeout ({elapsed:.1f}s > {self.heartbeat_timeout}s)"
+
+        return True, f"Heartbeat OK ({elapsed:.1f}s ago)"
+
+    async def check_port_health(
+        self,
+        component_name: str,
+        port: int,
+        host: str = "127.0.0.1",
+    ) -> Tuple[bool, str]:
+        """Check if a service is responding on a port."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)
+                result = s.connect_ex((host, port))
+                if result == 0:
+                    return True, f"Port {port} responding"
+                return False, f"Port {port} not responding"
+        except Exception as e:
+            return False, f"Port check error: {e}"
+
+    def record_health(self, component_name: str, is_healthy: bool) -> None:
+        """Record health check result."""
+        if component_name not in self._health_history:
+            self._health_history[component_name] = []
+
+        self._health_history[component_name].append(is_healthy)
+        if len(self._health_history[component_name]) > 100:
+            self._health_history[component_name] = self._health_history[component_name][-100:]
+
+        if not is_healthy:
+            self._failure_counts[component_name] = self._failure_counts.get(component_name, 0) + 1
+        else:
+            self._failure_counts[component_name] = 0
+
+        self._last_check_time[component_name] = time.time()
+
+    def should_restart(self, component_name: str) -> bool:
+        """Check if component should be restarted."""
+        failures = self._failure_counts.get(component_name, 0)
+        return failures >= self.consecutive_failures_threshold
+
+    def get_health_summary(self, component_name: str) -> Dict[str, Any]:
+        """Get health summary for a component."""
+        history = self._health_history.get(component_name, [])
+        return {
+            "recent_checks": len(history),
+            "success_rate": sum(history) / len(history) if history else 0,
+            "consecutive_failures": self._failure_counts.get(component_name, 0),
+            "last_check": self._last_check_time.get(component_name, 0),
+            "should_restart": self.should_restart(component_name),
+        }
+
+
+class SelfHealer:
+    """
+    Self-healing capabilities for AGI OS components.
+
+    Features:
+    - Automatic restart on failure
+    - Exponential backoff
+    - Max restart limits
+    - Recovery validation
+    """
+
+    def __init__(
+        self,
+        max_restarts: int = 5,
+        base_backoff: float = 5.0,
+        max_backoff: float = 300.0,
+        backoff_multiplier: float = 2.0,
+    ):
+        self.max_restarts = max_restarts
+        self.base_backoff = base_backoff
+        self.max_backoff = max_backoff
+        self.backoff_multiplier = backoff_multiplier
+
+        self._restart_counts: Dict[str, int] = {}
+        self._last_restart_time: Dict[str, float] = {}
+
+    def should_restart(self, component_name: str) -> Tuple[bool, float]:
+        """
+        Check if component should be restarted.
+
+        Returns:
+            Tuple of (should_restart, delay_seconds)
+        """
+        count = self._restart_counts.get(component_name, 0)
+
+        if count >= self.max_restarts:
+            logger.error(f"Max restarts ({self.max_restarts}) exceeded for {component_name}")
+            return False, 0
+
+        delay = min(
+            self.base_backoff * (self.backoff_multiplier ** count),
+            self.max_backoff
+        )
+
+        return True, delay
+
+    def record_restart(self, component_name: str) -> None:
+        """Record a restart."""
+        self._restart_counts[component_name] = self._restart_counts.get(component_name, 0) + 1
+        self._last_restart_time[component_name] = time.time()
+        logger.info(f"Restart recorded for {component_name} (count: {self._restart_counts[component_name]})")
+
+    def record_recovery(self, component_name: str) -> None:
+        """Record successful recovery (resets restart count)."""
+        self._restart_counts[component_name] = 0
+        logger.info(f"Recovery recorded for {component_name}, restart count reset")
+
+    def get_status(self, component_name: str) -> Dict[str, Any]:
+        """Get self-healing status for a component."""
+        return {
+            "restart_count": self._restart_counts.get(component_name, 0),
+            "max_restarts": self.max_restarts,
+            "last_restart": self._last_restart_time.get(component_name, 0),
+            "can_restart": self._restart_counts.get(component_name, 0) < self.max_restarts,
+        }
+
+
+# Global instance
+_repo_discovery: Optional[RepoDiscovery] = None
+
+
+def get_repo_discovery() -> RepoDiscovery:
+    """Get global repo discovery instance."""
+    global _repo_discovery
+    if _repo_discovery is None:
+        _repo_discovery = RepoDiscovery()
+    return _repo_discovery
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
@@ -133,29 +649,30 @@ class SupervisorConfig:
     log_file: Optional[Path] = None
 
     def __post_init__(self):
-        # Auto-detect paths
+        # Use robust repo discovery (v76.0)
+        discovery = get_repo_discovery()
+
         if self.jarvis_path is None:
-            self.jarvis_path = self._find_repo("JARVIS-AI-Agent")
+            self.jarvis_path = discovery.find_repo("JARVIS-AI-Agent")
         if self.jprime_path is None:
-            self.jprime_path = self._find_repo("jarvis-prime")
+            self.jprime_path = discovery.find_repo("jarvis-prime")
         if self.reactor_core_path is None:
             self.reactor_core_path = Path(__file__).parent
 
-    def _find_repo(self, name: str) -> Optional[Path]:
-        """Find repository by name."""
-        search_paths = [
-            Path(__file__).parent.parent / name,  # Sibling directory
-            Path.home() / name,
-            Path.home() / "Projects" / name,
-            Path.home() / "code" / name,
-            Path.home() / "dev" / name,
-        ]
+        # Log discovery status
+        status = discovery.get_discovery_status()
+        logger.info(f"Repo discovery status: {status}")
 
-        for path in search_paths:
-            if path.exists():
-                return path
-
-        return None
+    @staticmethod
+    def from_environment() -> "SupervisorConfig":
+        """Create config from environment variables."""
+        return SupervisorConfig(
+            jarvis_path=Path(os.environ["JARVIS_PATH"]) if "JARVIS_PATH" in os.environ else None,
+            jprime_path=Path(os.environ["JPRIME_PATH"]) if "JPRIME_PATH" in os.environ else None,
+            api_port=int(os.environ.get("AGI_API_PORT", 8003)),
+            serving_port=int(os.environ.get("AGI_SERVING_PORT", 8001)),
+            log_level=os.environ.get("AGI_LOG_LEVEL", "INFO"),
+        )
 
 
 class ComponentStatus(Enum):

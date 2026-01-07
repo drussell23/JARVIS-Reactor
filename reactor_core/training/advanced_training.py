@@ -75,6 +75,350 @@ ModelT = TypeVar("ModelT", bound=nn.Module)
 
 
 # =============================================================================
+# MEMORY OPTIMIZATION UTILITIES (v76.0 Enhancement)
+# =============================================================================
+
+class MemoryManager:
+    """
+    Memory management utilities for training with limited GPU/MPS memory.
+
+    Features:
+    - Dynamic batch size adjustment based on available memory
+    - Gradient checkpointing management
+    - Reference model CPU offloading
+    - Automatic garbage collection
+    - Memory usage monitoring
+    """
+
+    def __init__(
+        self,
+        target_memory_usage: float = 0.85,  # Target GPU utilization
+        min_batch_size: int = 1,
+        max_batch_size: int = 64,
+        enable_gc: bool = True,
+    ):
+        self.target_memory_usage = target_memory_usage
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.enable_gc = enable_gc
+
+        self._current_batch_size = 4  # Start conservative
+        self._oom_count = 0
+        self._device = self._detect_device()
+
+    def _detect_device(self) -> str:
+        """Detect available device."""
+        if torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def get_memory_info(self) -> Dict[str, float]:
+        """Get current memory usage information."""
+        if self._device == "cuda":
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            return {
+                "allocated_gb": allocated,
+                "reserved_gb": reserved,
+                "total_gb": total,
+                "usage_pct": allocated / total if total > 0 else 0,
+            }
+        elif self._device == "mps":
+            if hasattr(torch.mps, "current_allocated_memory"):
+                allocated = torch.mps.current_allocated_memory() / 1024**3
+                return {"allocated_gb": allocated, "usage_pct": 0}
+        return {"allocated_gb": 0, "usage_pct": 0}
+
+    def clear_cache(self) -> None:
+        """Clear device cache and run garbage collection."""
+        if self._device == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif self._device == "mps":
+            if hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+
+        if self.enable_gc:
+            gc.collect()
+
+    def adjust_batch_size_on_oom(self) -> int:
+        """Reduce batch size after OOM error."""
+        self._oom_count += 1
+        old_size = self._current_batch_size
+        self._current_batch_size = max(
+            self.min_batch_size,
+            self._current_batch_size // 2
+        )
+        self.clear_cache()
+        logger.warning(
+            f"OOM detected, reducing batch size: {old_size} -> {self._current_batch_size}"
+        )
+        return self._current_batch_size
+
+    def suggest_batch_size(self) -> int:
+        """Suggest batch size based on current memory usage."""
+        mem_info = self.get_memory_info()
+        usage = mem_info.get("usage_pct", 0)
+
+        if usage > self.target_memory_usage + 0.1:
+            # Reduce
+            self._current_batch_size = max(
+                self.min_batch_size,
+                self._current_batch_size - 1
+            )
+        elif usage < self.target_memory_usage - 0.1 and self._oom_count == 0:
+            # Can try larger
+            self._current_batch_size = min(
+                self.max_batch_size,
+                self._current_batch_size + 1
+            )
+
+        return self._current_batch_size
+
+    @staticmethod
+    def enable_gradient_checkpointing(model: nn.Module) -> None:
+        """Enable gradient checkpointing on model if supported."""
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
+        elif hasattr(model, "config"):
+            model.config.gradient_checkpointing = True
+            logger.info("Gradient checkpointing enabled via config")
+
+    @staticmethod
+    def offload_to_cpu(model: nn.Module) -> nn.Module:
+        """Offload model to CPU to free GPU memory."""
+        model = model.cpu()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return model
+
+    @staticmethod
+    def get_optimal_dtype() -> torch.dtype:
+        """Get optimal dtype for current device."""
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        return torch.float32
+
+
+class ReferenceModelManager:
+    """
+    Manage reference model for DPO/PPO with memory optimization.
+
+    Strategies:
+    - CPU offload with on-demand GPU transfer
+    - Shared parameters with main model
+    - Chunked computation for large sequences
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        offload_to_cpu: bool = False,
+        share_parameters: bool = False,
+        compute_chunk_size: int = 256,
+    ):
+        self.offload_to_cpu = offload_to_cpu
+        self.share_parameters = share_parameters
+        self.compute_chunk_size = compute_chunk_size
+
+        if share_parameters:
+            # Use same model but disable gradients
+            self._ref_model = model
+            self._is_shared = True
+        else:
+            import copy
+            self._ref_model = copy.deepcopy(model)
+            self._is_shared = False
+
+        # Freeze and configure
+        self._ref_model.eval()
+        for param in self._ref_model.parameters():
+            param.requires_grad = False
+
+        if offload_to_cpu and not share_parameters:
+            self._ref_model = self._ref_model.cpu()
+            logger.info("Reference model offloaded to CPU")
+
+        self._device = next(model.parameters()).device
+
+    @torch.no_grad()
+    def compute_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute log probabilities with optional chunking."""
+        # Move reference model to GPU if needed
+        if self.offload_to_cpu and not self._is_shared:
+            self._ref_model = self._ref_model.to(self._device)
+
+        try:
+            # Chunked computation for memory efficiency
+            if input_ids.size(1) > self.compute_chunk_size:
+                return self._compute_chunked(input_ids, attention_mask, labels)
+
+            outputs = self._ref_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+            logits = outputs.logits
+
+            # Compute log probs
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_mask = attention_mask[..., 1:].contiguous()
+
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            per_token_log_probs = torch.gather(
+                log_probs, dim=-1, index=shift_labels.unsqueeze(-1)
+            ).squeeze(-1)
+
+            per_token_log_probs = per_token_log_probs * shift_mask
+            sequence_log_probs = per_token_log_probs.sum(dim=-1) / shift_mask.sum(dim=-1).clamp(min=1)
+
+            return sequence_log_probs
+
+        finally:
+            # Offload back to CPU if configured
+            if self.offload_to_cpu and not self._is_shared:
+                self._ref_model = self._ref_model.cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    def _compute_chunked(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute log probs in chunks to save memory."""
+        batch_size, seq_len = input_ids.shape
+        all_log_probs = []
+
+        for i in range(0, seq_len, self.compute_chunk_size):
+            chunk_end = min(i + self.compute_chunk_size, seq_len)
+
+            chunk_ids = input_ids[:, :chunk_end]
+            chunk_mask = attention_mask[:, :chunk_end]
+            chunk_labels = labels[:, :chunk_end]
+
+            outputs = self._ref_model(
+                input_ids=chunk_ids,
+                attention_mask=chunk_mask,
+                return_dict=True,
+            )
+
+            # Only keep last chunk_size logits
+            chunk_logits = outputs.logits[:, max(0, i-1):chunk_end-1, :]
+            chunk_shift_labels = chunk_labels[:, max(1, i):chunk_end]
+            chunk_shift_mask = chunk_mask[:, max(1, i):chunk_end]
+
+            log_probs = F.log_softmax(chunk_logits, dim=-1)
+            per_token_log_probs = torch.gather(
+                log_probs, dim=-1, index=chunk_shift_labels.unsqueeze(-1)
+            ).squeeze(-1) * chunk_shift_mask
+
+            all_log_probs.append(per_token_log_probs.sum(dim=-1))
+
+            # Clear intermediate tensors
+            del outputs, chunk_logits, log_probs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        total_log_probs = sum(all_log_probs)
+        total_tokens = attention_mask[:, 1:].sum(dim=-1).clamp(min=1)
+
+        return total_log_probs / total_tokens
+
+
+class DynamicBatchSizer:
+    """
+    Dynamically adjust batch size based on sequence lengths and memory.
+
+    Prevents OOM errors by computing effective batch size based on
+    total tokens rather than fixed batch count.
+    """
+
+    def __init__(
+        self,
+        max_tokens_per_batch: int = 4096,
+        min_batch_size: int = 1,
+        max_batch_size: int = 32,
+    ):
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+
+    def compute_batch_size(self, sequence_lengths: List[int]) -> int:
+        """Compute optimal batch size for given sequence lengths."""
+        if not sequence_lengths:
+            return self.min_batch_size
+
+        max_seq_len = max(sequence_lengths)
+        avg_seq_len = sum(sequence_lengths) / len(sequence_lengths)
+
+        # Compute batch size to stay under token limit
+        batch_size = int(self.max_tokens_per_batch / max_seq_len)
+
+        return max(self.min_batch_size, min(self.max_batch_size, batch_size))
+
+    def split_into_batches(
+        self,
+        items: List[Any],
+        get_length: Callable[[Any], int],
+    ) -> List[List[Any]]:
+        """Split items into batches based on token budget."""
+        batches = []
+        current_batch = []
+        current_tokens = 0
+
+        # Sort by length for better packing
+        sorted_items = sorted(items, key=get_length, reverse=True)
+
+        for item in sorted_items:
+            item_len = get_length(item)
+
+            if current_tokens + item_len > self.max_tokens_per_batch and current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+            current_batch.append(item)
+            current_tokens += item_len
+
+            if len(current_batch) >= self.max_batch_size:
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
+
+# Global memory manager instance
+_memory_manager: Optional[MemoryManager] = None
+
+
+def get_memory_manager() -> MemoryManager:
+    """Get global memory manager instance."""
+    global _memory_manager
+    if _memory_manager is None:
+        _memory_manager = MemoryManager()
+    return _memory_manager
+
+
+# =============================================================================
 # ENUMS AND CONSTANTS
 # =============================================================================
 
@@ -2513,6 +2857,11 @@ class AdvancedTrainer:
 # =============================================================================
 
 __all__ = [
+    # === MEMORY OPTIMIZATION (v76.0) ===
+    "MemoryManager",
+    "ReferenceModelManager",
+    "DynamicBatchSizer",
+    "get_memory_manager",
     # Enums
     "TrainingMethod",
     "SafetyTier",
