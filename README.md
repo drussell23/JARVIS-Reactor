@@ -1,8 +1,8 @@
-# Reactor Core
+# JARVIS Reactor
 
 **An Advanced AI/ML Training & Serving Engine for AGI OS**
 
-Reactor Core is the "nervous system" of the JARVIS AGI ecosystem, providing enterprise-grade ML training, model serving, and real-time event coordination across distributed AI systems.
+JARVIS Reactor (formerly Reactor Core) is the "nervous system" of the JARVIS AGI ecosystem, providing enterprise-grade ML training, model serving, and real-time event coordination across distributed AI systems.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -10,9 +10,9 @@ Reactor Core is the "nervous system" of the JARVIS AGI ecosystem, providing ente
 
 ---
 
-## 🚀 What is Reactor Core?
+## 🚀 What is JARVIS Reactor?
 
-Reactor Core is a production-grade ML infrastructure combining:
+JARVIS Reactor is a production-grade ML infrastructure combining:
 
 - **Advanced Training Methods**: DPO, RLHF, Constitutional AI, Curriculum Learning
 - **Model Serving**: Hot-reload model server with multi-backend support (vLLM, llama.cpp, MLX)
@@ -121,7 +121,7 @@ Reactor Core is a production-grade ML infrastructure combining:
 ### Project Structure
 
 ```
-reactor-core/
+JARVIS-Reactor/
 ├── reactor_core/
 │   ├── training/              # Advanced training methods
 │   │   ├── advanced_training.py   # DPO, RLHF, Constitutional AI (2,899 lines)
@@ -249,15 +249,15 @@ Total: ~18,996+ lines of production code added in v75.0-v77.1
 ### Quick Install (Python only, no C++ bindings)
 
 ```bash
-pip install reactor-core
+pip install jarvis-reactor
 ```
 
 ### Build from Source (with MLForge C++ bindings)
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/drussell23/reactor-core.git
-cd reactor-core
+git clone --recursive https://github.com/drussell23/JARVIS-Reactor.git
+cd JARVIS-Reactor
 
 # Install dependencies (requires CMake and pybind11)
 pip install pybind11 cmake
@@ -270,10 +270,10 @@ pip install -e .
 
 ```bash
 # For local development (M1 Mac)
-pip install reactor-core[local]
+pip install jarvis-reactor[local]
 
 # For GCP training (32GB+ VM)
-pip install reactor-core[gcp]
+pip install jarvis-reactor[gcp]
 
 # For full development (includes testing, linting, docs)
 pip install -e ".[dev]"
@@ -595,7 +595,7 @@ Multi-repo coordination with heartbeat monitoring, command routing, state reconc
 
 ## 🔗 Links
 
-- **GitHub**: https://github.com/drussell23/reactor-core
+- **GitHub**: https://github.com/drussell23/JARVIS-Reactor
 - **MLForge C++ Core**: https://github.com/drussell23/MLForge
 - **JARVIS-AI-Agent**: https://github.com/drussell23/JARVIS-AI-Agent
 - **JARVIS Prime**: https://github.com/drussell23/jarvis-prime

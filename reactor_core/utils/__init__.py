@@ -106,6 +106,20 @@ from reactor_core.utils.dependencies import (
     print_environment_status,
 )
 
+# Dependency Injection (v79.0)
+from reactor_core.utils.dependency_injection import (
+    DependencyInjectionContainer,
+    ServiceLifetime,
+    ServiceStatus,
+    ServiceDescriptor,
+    HealthCheck as DIHealthCheck,
+    CircularDependencyError,
+    ServiceNotFoundError,
+    get_container,
+    reset_container,
+    injectable,
+)
+
 __all__ = [
     # Environment
     "detect_environment",
@@ -184,4 +198,15 @@ __all__ = [
     "get_torch_backend",
     "validate_environment",
     "print_environment_status",
+    # === DEPENDENCY INJECTION (v79.0) ===
+    "DependencyInjectionContainer",
+    "ServiceLifetime",
+    "ServiceStatus",
+    "ServiceDescriptor",
+    "DIHealthCheck",
+    "CircularDependencyError",
+    "ServiceNotFoundError",
+    "get_container",
+    "reset_container",
+    "injectable",
 ]

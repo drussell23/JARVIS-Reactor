@@ -1,8 +1,8 @@
-# Testing Guide for Reactor Core
+# Testing Guide for JARVIS Reactor
 
 ## Overview
 
-Reactor Core includes tests at multiple levels:
+JARVIS Reactor includes tests at multiple levels:
 1. **MLForge C++ Tests** - Native C++ algorithm tests
 2. **Python Binding Tests** - pybind11 interface tests
 3. **Integration Tests** - End-to-end Python API tests
@@ -314,7 +314,7 @@ make
 
 ```bash
 # Verify installation
-pip show reactor-core
+pip show jarvis-reactor
 
 # Check import path
 python -c "import reactor_core; print(reactor_core.__file__)"

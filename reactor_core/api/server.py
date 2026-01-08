@@ -1660,6 +1660,93 @@ async def get_experience_count():
 
 
 # ============================================================================
+# Corrections Endpoints (JARVIS-Prime → Reactor-Core)
+# ============================================================================
+
+class CorrectionData(BaseModel):
+    """A single correction record."""
+    correction_id: str
+    original_prompt: str
+    original_response: str
+    corrected_response: str
+    correction_type: str
+    timestamp: float
+    context: Optional[List[Dict[str, Any]]] = None
+    user_feedback: Optional[str] = None
+    quality_score: float = 1.0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CorrectionsStreamRequest(BaseModel):
+    """Request to stream corrections for training."""
+    corrections: List[CorrectionData]
+    source: str = "jarvis_prime"
+    timestamp: float = Field(default_factory=time.time)
+
+
+@app.post("/api/v1/corrections/stream", tags=["Corrections"])
+async def stream_corrections(request: CorrectionsStreamRequest):
+    """
+    Stream corrections from JARVIS-Prime for training.
+
+    Corrections are high-value training data because they represent
+    direct user feedback on model errors.
+    """
+    corrections_added = 0
+
+    for correction in request.corrections:
+        # Convert correction to experience format for training
+        experience = {
+            "user_input": correction.original_prompt,
+            "jarvis_response": correction.corrected_response,  # Use corrected as target
+            "original_response": correction.original_response,
+            "correction_type": correction.correction_type,
+            "timestamp": datetime.fromtimestamp(correction.timestamp).isoformat(),
+            "ingested_at": datetime.now().isoformat(),
+            "source": request.source,
+            "quality_score": correction.quality_score * 1.5,  # Boost corrections
+            "is_correction": True,
+            "user_feedback": correction.user_feedback,
+            "metadata": correction.metadata,
+        }
+
+        await job_manager.add_experience(experience)
+        corrections_added += 1
+
+    # Ingest telemetry
+    if ServerConfig.TELEMETRY_ENABLED:
+        telemetry = get_telemetry()
+        await telemetry.ingest_metric(
+            name="corrections_ingested",
+            value=corrections_added,
+            metric_type=MetricType.COUNTER,
+            labels={"source": request.source},
+        )
+
+    logger.info(f"[Corrections] Received {corrections_added} corrections from {request.source}")
+
+    # Check if corrections trigger training (lower threshold for corrections)
+    if ServerConfig.SCHEDULER_ENABLED and corrections_added >= 3:
+        scheduler = get_scheduler()
+        job = await scheduler.add_experiences(corrections_added)
+        if job:
+            return {
+                "accepted": True,
+                "count": corrections_added,
+                "training_triggered": True,
+                "job_id": job.job_id,
+                "message": "Corrections received - training triggered due to high-value data",
+            }
+
+    return {
+        "accepted": True,
+        "count": corrections_added,
+        "training_triggered": False,
+        "message": f"Received {corrections_added} corrections for training",
+    }
+
+
+# ============================================================================
 # WebSocket Endpoints
 # ============================================================================
 

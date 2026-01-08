@@ -3,9 +3,9 @@ requires = ["setuptools>=65.0", "wheel", "pybind11>=2.11.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "reactor-core"
+name = "jarvis-reactor"
 version = "2.2.0"
-description = "Night Shift Training Engine - Autonomous Continuous Learning Pipeline for JARVIS AGI with Safe Scout"
+description = "JARVIS Reactor - Advanced ML Training & Serving Engine for AGI OS (formerly reactor-core)"
 authors = [
     {name = "Derek Russell", email = "derek@example.com"}
 ]
@@ -117,7 +117,7 @@ dev = [
 ]
 
 all = [
-    "reactor-core[local,gcp,quantization,distillation,scout,evaluation,dev]",
+    "jarvis-reactor[local,gcp,quantization,distillation,scout,evaluation,dev]",
 ]
 
 [project.scripts]
@@ -129,10 +129,10 @@ nightshift-scout = "reactor_core.cli:scout"
 nightshift-pipeline = "reactor_core.cli:run_pipeline"
 
 [project.urls]
-Homepage = "https://github.com/drussell23/reactor-core"
-Repository = "https://github.com/drussell23/reactor-core"
-Documentation = "https://github.com/drussell23/reactor-core#readme"
-"Bug Tracker" = "https://github.com/drussell23/reactor-core/issues"
+Homepage = "https://github.com/drussell23/JARVIS-Reactor"
+Repository = "https://github.com/drussell23/JARVIS-Reactor"
+Documentation = "https://github.com/drussell23/JARVIS-Reactor#readme"
+"Bug Tracker" = "https://github.com/drussell23/JARVIS-Reactor/issues"
 
 [tool.setuptools]
 packages = ["reactor_core"]

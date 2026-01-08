@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--user-agent",
-        default="Mozilla/5.0 (compatible; SafeScout/1.0; +https://github.com/drussell23/reactor-core)",
+        default="Mozilla/5.0 (compatible; SafeScout/1.0; +https://github.com/drussell23/JARVIS-Reactor)",
         help="Custom user agent",
     )
     parser.add_argument(

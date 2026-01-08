@@ -172,7 +172,7 @@ class URLValidatorConfig:
     user_agent: str = field(
         default_factory=lambda: os.getenv(
             "NIGHTSHIFT_USER_AGENT",
-            "NightShift-Scout/1.0 (+https://github.com/djrussell23/reactor-core; training-data-collection)"
+            "NightShift-Scout/1.0 (+https://github.com/drussell23/JARVIS-Reactor; training-data-collection)"
         )
     )
 

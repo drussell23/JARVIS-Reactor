@@ -1,5 +1,5 @@
 """
-Setup script for Reactor Core with MLForge C++ bindings
+Setup script for JARVIS Reactor with MLForge C++ bindings
 """
 import os
 import sys
@@ -50,8 +50,8 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    name="reactor-core",
-    version="1.0.0",
+    name="jarvis-reactor",
+    version="2.2.0",
     packages=find_packages(),
     ext_modules=[CMakeExtension("reactor_core.reactor_core_native")],
     cmdclass={"build_ext": CMakeBuild},

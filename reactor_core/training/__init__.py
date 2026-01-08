@@ -8,12 +8,15 @@ Provides:
 - Training callbacks for progress tracking
 - Gradient checkpointing and memory optimization
 
-ADVANCED TRAINING (v76.0):
+ADVANCED TRAINING (v76.0-v80.0):
 - DPO (Direct Preference Optimization)
 - RLHF (Reinforcement Learning from Human Feedback)
 - Constitutional AI training
 - FSDP (Fully Sharded Data Parallel)
-- Curriculum Learning
+- Curriculum Learning (v79.0)
+- Meta-Learning: MAML, Reptile, Meta-SGD (v79.0)
+- World Model Training (v80.0)
+- Causal Reasoning (v80.0)
 - Experience Buffer for continuous learning
 """
 
@@ -116,6 +119,68 @@ from reactor_core.training.lora import (
     TARGET_MODULES_MAP,
 )
 
+# Curriculum Learning (v79.0)
+from reactor_core.training.curriculum_learning import (
+    DifficultyMetric,
+    DifficultyScore,
+    LossDifficultyScorer,
+    LengthDifficultyScorer,
+    CurriculumStage,
+    CurriculumSampler,
+    CurriculumLearner,
+    create_default_curriculum,
+)
+
+# Meta-Learning (v79.0)
+from reactor_core.training.meta_learning import (
+    MetaAlgorithm,
+    Task,
+    TaskSampler,
+    MAMLConfig,
+    MAMLTrainer,
+    ReptileConfig,
+    ReptileTrainer,
+    MetaSGDConfig,
+    MetaSGDTrainer,
+    create_n_way_k_shot_task,
+)
+
+# World Model Training (v80.0)
+from reactor_core.training.world_model_training import (
+    # Components
+    LatentEncoder,
+    LatentDecoder,
+    TransitionModel,
+    RewardModel,
+    ValueModel,
+    # World Model
+    WorldModelConfig,
+    WorldModel,
+    # Training
+    WorldModelTrainingConfig,
+    WorldModelTrainer,
+    # Reasoning
+    CounterfactualReasoner,
+)
+
+# Causal Reasoning (v80.0)
+from reactor_core.training.causal_reasoning import (
+    # Causal Graph
+    CausalEdge,
+    CausalGraph,
+    # Structural Causal Model
+    StructuralCausalModel,
+    # Causal Discovery
+    CausalDiscovery,
+    # Neural Causal Model
+    NeuralCausalModel,
+    # Causal Attention
+    CausalAttention,
+    # Evaluation
+    CausalEvaluationMetrics,
+    evaluate_causal_graph,
+)
+
 __all__ = [
     # Trainer
     "Trainer",
@@ -202,4 +267,54 @@ __all__ = [
     # Unified Trainer
     "AdvancedTrainingConfig",
     "AdvancedTrainer",
+    # === CURRICULUM LEARNING (v79.0) ===
+    "DifficultyMetric",
+    "DifficultyScore",
+    "LossDifficultyScorer",
+    "LengthDifficultyScorer",
+    "CurriculumStage",
+    "CurriculumSampler",
+    "CurriculumLearner",
+    "create_default_curriculum",
+    # === META-LEARNING (v79.0) ===
+    "MetaAlgorithm",
+    "Task",
+    "TaskSampler",
+    "MAMLConfig",
+    "MAMLTrainer",
+    "ReptileConfig",
+    "ReptileTrainer",
+    "MetaSGDConfig",
+    "MetaSGDTrainer",
+    "create_n_way_k_shot_task",
+    # === WORLD MODEL TRAINING (v80.0) ===
+    # Components
+    "LatentEncoder",
+    "LatentDecoder",
+    "TransitionModel",
+    "RewardModel",
+    "ValueModel",
+    # World Model
+    "WorldModelConfig",
+    "WorldModel",
+    # Training
+    "WorldModelTrainingConfig",
+    "WorldModelTrainer",
+    # Reasoning
+    "CounterfactualReasoner",
+    # === CAUSAL REASONING (v80.0) ===
+    # Causal Graph
+    "CausalEdge",
+    "CausalGraph",
+    # Structural Causal Model
+    "StructuralCausalModel",
+    # Causal Discovery
+    "CausalDiscovery",
+    # Neural Causal Model
+    "NeuralCausalModel",
+    # Causal Attention
+    "CausalAttention",
+    # Evaluation
+    "CausalEvaluationMetrics",
+    "evaluate_causal_graph",
 ]
