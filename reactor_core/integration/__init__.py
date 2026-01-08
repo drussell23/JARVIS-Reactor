@@ -72,6 +72,20 @@ from reactor_core.integration.trinity_connector import (
     get_jarvis_heartbeat,
 )
 
+# PROJECT TRINITY: Ultra-High Performance Event Bus (v82.0)
+from reactor_core.integration.trinity_bridge import (
+    EventPriority,
+    EventType as TrinityEventType,
+    BridgeState,
+    TrinityEvent,
+    BridgeMetrics,
+    TrinityBridge,
+    create_trinity_bridge,
+    CircuitBreaker,
+    BloomFilter,
+    PriorityEventQueue,
+)
+
 __all__ = [
     # JARVIS-AI-Agent
     "JARVISConnector",
@@ -122,4 +136,15 @@ __all__ = [
     "send_bring_back_command",
     "get_jarvis_status",
     "get_jarvis_heartbeat",
+    # PROJECT TRINITY: Trinity Bridge (v82.0)
+    "EventPriority",
+    "TrinityEventType",
+    "BridgeState",
+    "TrinityEvent",
+    "BridgeMetrics",
+    "TrinityBridge",
+    "create_trinity_bridge",
+    "CircuitBreaker",
+    "BloomFilter",
+    "PriorityEventQueue",
 ]

@@ -47,6 +47,17 @@ from reactor_core.orchestration.trinity_orchestrator import (
     update_jprime_heartbeat,
 )
 
+# PROJECT TRINITY: Ultra-Robust Service Manager (v82.0)
+from reactor_core.orchestration.service_manager import (
+    VenvDetector,
+    ProcessManager,
+    HealthChecker,
+    HealthCheckConfig,
+    ServiceManager,
+    ServiceConfig,
+    ServiceStatus,
+)
+
 __all__ = [
     # Pipeline
     "NightShiftPipeline",
@@ -78,4 +89,12 @@ __all__ = [
     "dispatch_to_jprime",
     "update_jarvis_heartbeat",
     "update_jprime_heartbeat",
+    # PROJECT TRINITY: Service Manager (v82.0)
+    "VenvDetector",
+    "ProcessManager",
+    "HealthChecker",
+    "HealthCheckConfig",
+    "ServiceManager",
+    "ServiceConfig",
+    "ServiceStatus",
 ]

@@ -37,6 +37,13 @@ ULTIMATE SCALE (v81.0):
 - Cognitive Modules - Specialized training for Planning, Reasoning, Memory, Perception modules
 - Cognitive Orchestrator - Coordinate multiple cognitive modules for complex AGI behaviors
 
+TRINITY UNIFICATION (v82.0):
+- **Trinity Bridge** - Ultra-high performance event bus with WebSocket + HTTP
+- **Service Manager** - Venv detection, zombie prevention, health-check gating
+- **Cross-Repo Symphony** - JARVIS + Prime + Reactor unified via `python3 run_supervisor.py`
+- **Zero-Copy Messaging** - Bloom filters, circuit breakers, priority queues
+- **Self-Healing** - Auto-restart, exponential backoff, distributed tracing
+
 TRINITY INTEGRATION:
 - Cross-repo communication (JARVIS ↔ Prime ↔ Reactor)
 - Event-driven coordination
@@ -44,7 +51,7 @@ TRINITY INTEGRATION:
 - Unified supervisor for single-command startup
 """
 
-__version__ = "2.3.0"  # v81.0 - Phase 3: FSDP + Federated Learning + Cognitive Modules
+__version__ = "2.5.0"  # v83.0 - Unified Model Management: Intelligence Orchestration
 
 # Core training
 from reactor_core.training import (
@@ -301,6 +308,83 @@ from reactor_core.training import (
     create_cognitive_system,
 )
 
+# === TRINITY UNIFICATION (v82.0) ===
+
+# Trinity Bridge - Ultra-High Performance Event Bus
+from reactor_core.integration import (
+    EventPriority as BridgeEventPriority,
+    TrinityEventType as BridgeEventType,
+    BridgeState,
+    TrinityEvent,
+    BridgeMetrics,
+    TrinityBridge,
+    create_trinity_bridge,
+)
+
+# Service Manager - Venv Detection, Zombie Prevention, Health Gating
+from reactor_core.orchestration import (
+    VenvDetector,
+    ProcessManager,
+    HealthChecker,
+    HealthCheckConfig,
+    ServiceManager,
+    ServiceConfig,
+    ServiceStatus,
+)
+
+# === UNIFIED MODEL MANAGEMENT (v83.0) ===
+
+# Unified Model Manager - Multi-backend orchestration
+from reactor_core.serving import (
+    UnifiedModelBackend,
+    BackendDetector,
+    UnifiedModelMetadata,
+    ModelInstance,
+    UnifiedModelPool,
+    UnifiedModelManager,
+    create_unified_manager,
+)
+
+# Hybrid Model Router - Intelligent complexity-based routing
+from reactor_core.serving import (
+    TaskComplexity,
+    ComplexityScore,
+    ComplexityAnalyzer,
+    HybridRoutingStrategy,
+    RoutingDecision,
+    HybridModelRouter,
+    create_hybrid_router,
+)
+
+# Parallel Inference Engine - Concurrent batching & optimization
+from reactor_core.serving import (
+    ParallelRequestPriority,
+    BatchStrategy,
+    CircuitState,
+    InferenceTask,
+    BatchConfig,
+    ResourcePool,
+    CircuitBreakerConfig,
+    ParallelEngineConfig,
+    ParallelCircuitBreaker,
+    PerformanceMetrics,
+    ParallelInferenceEngine,
+    create_parallel_engine,
+)
+
+# Trinity Model Registry - Cross-repo model synchronization
+from reactor_core.serving import (
+    RepositoryType,
+    ModelSource,
+    ModelStatus,
+    SyncStrategy,
+    RegistryModelMetadata,
+    RegistryConfig,
+    SyncEvent,
+    TrinityModelRegistry,
+    create_trinity_registry,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -498,4 +582,61 @@ __all__ = [
     "CognitiveOrchestrator",
     "CognitiveModuleTrainer",
     "create_cognitive_system",
+    # === TRINITY UNIFICATION (v82.0) ===
+    # Trinity Bridge
+    "BridgeEventPriority",
+    "BridgeEventType",
+    "BridgeState",
+    "TrinityEvent",
+    "BridgeMetrics",
+    "TrinityBridge",
+    "create_trinity_bridge",
+    # Service Manager
+    "VenvDetector",
+    "ProcessManager",
+    "HealthChecker",
+    "HealthCheckConfig",
+    "ServiceManager",
+    "ServiceConfig",
+    "ServiceStatus",
+    # === UNIFIED MODEL MANAGEMENT (v83.0) ===
+    # Unified Model Manager
+    "UnifiedModelBackend",
+    "BackendDetector",
+    "UnifiedModelMetadata",
+    "ModelInstance",
+    "UnifiedModelPool",
+    "UnifiedModelManager",
+    "create_unified_manager",
+    # Hybrid Model Router
+    "TaskComplexity",
+    "ComplexityScore",
+    "ComplexityAnalyzer",
+    "HybridRoutingStrategy",
+    "RoutingDecision",
+    "HybridModelRouter",
+    "create_hybrid_router",
+    # Parallel Inference Engine
+    "ParallelRequestPriority",
+    "BatchStrategy",
+    "CircuitState",
+    "InferenceTask",
+    "BatchConfig",
+    "ResourcePool",
+    "CircuitBreakerConfig",
+    "ParallelEngineConfig",
+    "ParallelCircuitBreaker",
+    "PerformanceMetrics",
+    "ParallelInferenceEngine",
+    "create_parallel_engine",
+    # Trinity Model Registry
+    "RepositoryType",
+    "ModelSource",
+    "ModelStatus",
+    "SyncStrategy",
+    "RegistryModelMetadata",
+    "RegistryConfig",
+    "SyncEvent",
+    "TrinityModelRegistry",
+    "create_trinity_registry",
 ]
