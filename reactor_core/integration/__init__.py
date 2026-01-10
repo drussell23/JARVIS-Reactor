@@ -130,6 +130,62 @@ from reactor_core.integration.async_db_coordinator import (
     ConnectionMetrics,
 )
 
+# PROJECT TRINITY: Distributed Health Monitor (v87.0)
+from reactor_core.integration.distributed_health_monitor import (
+    # Core Monitor
+    DistributedHealthMonitor,
+    get_health_monitor,
+    # Helpers
+    HeartbeatHelper,
+    # Enums
+    HealthState,
+    ComponentRole,
+    RestartStrategy as HealthRestartStrategy,
+    # Data Classes
+    HealthMetrics,
+    ComponentHealth,
+    RestartPolicy,
+)
+
+# PROJECT TRINITY: Async Lifecycle Coordinator (v88.0)
+from reactor_core.integration.async_lifecycle_coordinator import (
+    # Core Coordinator
+    AsyncLifecycleCoordinator,
+    get_lifecycle_coordinator,
+    # Task Management
+    TaskLifecycleManager,
+    ShutdownOrchestrator,
+    # Utilities
+    cancellation_safe,
+    wait_for_safe,
+    gather_safe,
+    cancellation_safe_decorator,
+    # Enums
+    TaskState,
+    ShutdownPhase,
+    TaskPriority,
+    # Data Classes
+    TaskMetadata,
+    ShutdownConfig,
+)
+
+# PROJECT TRINITY: Ultimate Unification Engine (v89.0)
+from reactor_core.integration.trinity_unification_engine import (
+    # Main Engine
+    TrinityUnificationEngine,
+    get_trinity_engine,
+    # Component Management
+    ComponentRegistry,
+    ComponentRegistration,
+    UnifiedShutdownOrchestrator,
+    # Enums
+    ComponentType as TrinityComponentType,
+    LifecyclePhase as TrinityLifecyclePhase,
+    ShutdownLayer,
+    # Data Classes
+    ShutdownPlan,
+)
+
 __all__ = [
     # JARVIS-AI-Agent
     "JARVISConnector",
@@ -219,4 +275,38 @@ __all__ = [
     "RetryStrategy",
     "RetryConfig",
     "ConnectionMetrics",
+    # PROJECT TRINITY: Distributed Health Monitor (v87.0)
+    "DistributedHealthMonitor",
+    "get_health_monitor",
+    "HeartbeatHelper",
+    "HealthState",
+    "ComponentRole",
+    "HealthRestartStrategy",
+    "HealthMetrics",
+    "ComponentHealth",
+    "RestartPolicy",
+    # PROJECT TRINITY: Async Lifecycle Coordinator (v88.0)
+    "AsyncLifecycleCoordinator",
+    "get_lifecycle_coordinator",
+    "TaskLifecycleManager",
+    "ShutdownOrchestrator",
+    "cancellation_safe",
+    "wait_for_safe",
+    "gather_safe",
+    "cancellation_safe_decorator",
+    "TaskState",
+    "ShutdownPhase",
+    "TaskPriority",
+    "TaskMetadata",
+    "ShutdownConfig",
+    # PROJECT TRINITY: Ultimate Unification Engine (v89.0)
+    "TrinityUnificationEngine",
+    "get_trinity_engine",
+    "ComponentRegistry",
+    "ComponentRegistration",
+    "UnifiedShutdownOrchestrator",
+    "TrinityComponentType",
+    "TrinityLifecyclePhase",
+    "ShutdownLayer",
+    "ShutdownPlan",
 ]

@@ -51,7 +51,7 @@ TRINITY INTEGRATION:
 - Unified supervisor for single-command startup
 """
 
-__version__ = "2.7.0"  # v86.0 - Async Database Coordinator: Unbreakable Database Layer
+__version__ = "2.10.0"  # v89.0 - Trinity Unification Engine: Ultimate System Coordination
 
 # Core training
 from reactor_core.training import (
@@ -423,6 +423,55 @@ from reactor_core.integration import (
     ConnectionMetrics,
 )
 
+# === DISTRIBUTED HEALTH MONITOR (v87.0) ===
+
+# Distributed Health Monitor - Self-healing heartbeat system
+from reactor_core.integration import (
+    DistributedHealthMonitor,
+    get_health_monitor,
+    HeartbeatHelper,
+    HealthState,
+    ComponentRole,
+    HealthRestartStrategy,
+    HealthMetrics,
+    ComponentHealth,
+    RestartPolicy,
+)
+
+# === ASYNC LIFECYCLE COORDINATOR (v88.0) ===
+
+# Async Lifecycle Coordinator - Bulletproof cancellation & shutdown
+from reactor_core.integration import (
+    AsyncLifecycleCoordinator,
+    get_lifecycle_coordinator,
+    TaskLifecycleManager,
+    ShutdownOrchestrator,
+    cancellation_safe,
+    wait_for_safe,
+    gather_safe,
+    cancellation_safe_decorator,
+    TaskState,
+    ShutdownPhase,
+    TaskPriority,
+    TaskMetadata,
+    ShutdownConfig,
+)
+
+# === TRINITY UNIFICATION ENGINE (v89.0) ===
+
+# Trinity Unification Engine - Ultimate system coordination
+from reactor_core.integration import (
+    TrinityUnificationEngine,
+    get_trinity_engine,
+    ComponentRegistry,
+    ComponentRegistration,
+    UnifiedShutdownOrchestrator,
+    TrinityComponentType,
+    TrinityLifecyclePhase,
+    ShutdownLayer,
+    ShutdownPlan,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -705,4 +754,38 @@ __all__ = [
     "RetryStrategy",
     "RetryConfig",
     "ConnectionMetrics",
+    # === DISTRIBUTED HEALTH MONITOR (v87.0) ===
+    "DistributedHealthMonitor",
+    "get_health_monitor",
+    "HeartbeatHelper",
+    "HealthState",
+    "ComponentRole",
+    "HealthRestartStrategy",
+    "HealthMetrics",
+    "ComponentHealth",
+    "RestartPolicy",
+    # === ASYNC LIFECYCLE COORDINATOR (v88.0) ===
+    "AsyncLifecycleCoordinator",
+    "get_lifecycle_coordinator",
+    "TaskLifecycleManager",
+    "ShutdownOrchestrator",
+    "cancellation_safe",
+    "wait_for_safe",
+    "gather_safe",
+    "cancellation_safe_decorator",
+    "TaskState",
+    "ShutdownPhase",
+    "TaskPriority",
+    "TaskMetadata",
+    "ShutdownConfig",
+    # === TRINITY UNIFICATION ENGINE (v89.0) ===
+    "TrinityUnificationEngine",
+    "get_trinity_engine",
+    "ComponentRegistry",
+    "ComponentRegistration",
+    "UnifiedShutdownOrchestrator",
+    "TrinityComponentType",
+    "TrinityLifecyclePhase",
+    "ShutdownLayer",
+    "ShutdownPlan",
 ]
