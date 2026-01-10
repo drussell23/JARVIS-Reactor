@@ -109,6 +109,27 @@ from reactor_core.integration.unified_coordinator import (
     TrinityEntryPointDetector,
 )
 
+# PROJECT TRINITY: Async Database Coordinator (v86.0)
+from reactor_core.integration.async_db_coordinator import (
+    # Core Coordinator
+    DistributedDatabaseCoordinator,
+    get_db_coordinator,
+    # Connection Management
+    SafeDatabaseConnection,
+    SafeDatabaseCursor,
+    ConnectionPool,
+    # Context Managers
+    CancellationSafeContextManager,
+    safe_db_operation,
+    # Enums
+    TransactionState,
+    IsolationLevel,
+    RetryStrategy,
+    # Data Classes
+    RetryConfig,
+    ConnectionMetrics,
+)
+
 __all__ = [
     # JARVIS-AI-Agent
     "JARVISConnector",
@@ -185,4 +206,17 @@ __all__ = [
     "UnixSocketEventBus",
     "ConsensusProtocol",
     "TrinityEntryPointDetector",
+    # PROJECT TRINITY: Async Database Coordinator (v86.0)
+    "DistributedDatabaseCoordinator",
+    "get_db_coordinator",
+    "SafeDatabaseConnection",
+    "SafeDatabaseCursor",
+    "ConnectionPool",
+    "CancellationSafeContextManager",
+    "safe_db_operation",
+    "TransactionState",
+    "IsolationLevel",
+    "RetryStrategy",
+    "RetryConfig",
+    "ConnectionMetrics",
 ]
