@@ -374,9 +374,32 @@ class UnifiedTrainingPipeline:
 
             # Step 3: Train model
             await self._update_state(PipelineState.TRAINING, "Training model")
+
+            # Voice announcement: Training started
+            try:
+                from reactor_core.voice_integration import announce_training_started
+                asyncio.create_task(announce_training_started(
+                    model_name=self.config.base_model.split("/")[-1],
+                    samples=len(raw_interactions),
+                    epochs=self.config.num_epochs,
+                ))
+            except Exception:
+                pass
+
             training_result = await self._train_model(train_dataset, eval_dataset)
 
             if not training_result.success:
+                # Voice announcement: Training failed
+                try:
+                    from reactor_core.voice_integration import announce_training_failed
+                    asyncio.create_task(announce_training_failed(
+                        model_name=self.config.base_model.split("/")[-1],
+                        error_message=training_result.error_message or "Unknown error",
+                        steps_completed=training_result.total_steps or 0,
+                    ))
+                except Exception:
+                    pass
+
                 raise RuntimeError(f"Training failed: {training_result.error_message}")
 
             result.adapter_path = training_result.adapter_path
@@ -385,17 +408,75 @@ class UnifiedTrainingPipeline:
             result.final_loss = training_result.final_loss
             result.training_time_seconds = training_result.training_time_seconds
 
+            # Voice announcement: Training complete
+            try:
+                from reactor_core.voice_integration import announce_training_complete
+                asyncio.create_task(announce_training_complete(
+                    model_name=self.config.base_model.split("/")[-1],
+                    steps=training_result.total_steps or 0,
+                    loss=training_result.final_loss or 0.0,
+                    duration_seconds=training_result.training_time_seconds or 0.0,
+                    success=True,
+                ))
+            except Exception:
+                pass
+
             # Step 4: Export to GGUF (if configured)
             if self.config.export_gguf and result.model_path:
                 await self._update_state(PipelineState.EXPORTING, "Exporting to GGUF")
+
+                # Voice announcement: Export started
+                try:
+                    from reactor_core.voice_integration import announce_export_started
+                    asyncio.create_task(announce_export_started(
+                        format="GGUF",
+                        quantization=self.config.gguf_quantization,
+                    ))
+                except Exception:
+                    pass
+
                 result.gguf_path = await self._export_gguf(result.model_path)
+
+                # Voice announcement: Export complete
+                if result.gguf_path:
+                    try:
+                        from reactor_core.voice_integration import announce_export_complete
+                        file_size_mb = result.gguf_path.stat().st_size / (1024 * 1024) if result.gguf_path.exists() else None
+                        asyncio.create_task(announce_export_complete(
+                            format="GGUF",
+                            file_size_mb=file_size_mb,
+                        ))
+                    except Exception:
+                        pass
 
             # Step 5: Deploy to J-Prime (if configured)
             if self.config.auto_deploy and (result.gguf_path or result.model_path):
                 await self._update_state(PipelineState.DEPLOYING, "Deploying to J-Prime")
+
+                # Voice announcement: Deployment started
+                try:
+                    from reactor_core.voice_integration import announce_deployment_started
+                    asyncio.create_task(announce_deployment_started(
+                        target="JARVIS-Prime",
+                    ))
+                except Exception:
+                    pass
+
                 result.deployed_to = await self._deploy_to_jprime(
                     result.gguf_path or result.model_path
                 )
+
+                # Voice announcement: Deployment complete
+                if result.deployed_to:
+                    try:
+                        from reactor_core.voice_integration import announce_deployment_complete
+                        model_version = result.gguf_path.name if result.gguf_path else None
+                        asyncio.create_task(announce_deployment_complete(
+                            target="JARVIS-Prime",
+                            model_version=model_version,
+                        ))
+                    except Exception:
+                        pass
 
             # Success
             await self._update_state(PipelineState.COMPLETED, "Training cycle complete")
