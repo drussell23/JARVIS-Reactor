@@ -386,6 +386,22 @@ class UnifiedTrainingPipeline:
             except Exception:
                 pass
 
+            # Trinity Event: Training started
+            try:
+                from reactor_core.integration.trinity_publisher import publish_training_started
+                asyncio.create_task(publish_training_started(
+                    model_name=self.config.base_model.split("/")[-1],
+                    config={
+                        "epochs": self.config.num_epochs,
+                        "batch_size": self.config.batch_size,
+                        "learning_rate": self.config.learning_rate,
+                        "samples": len(raw_interactions),
+                        "lora_rank": self.config.lora_rank,
+                    },
+                ))
+            except Exception as e:
+                logger.debug(f"Trinity event publish failed: {e}")
+
             training_result = await self._train_model(train_dataset, eval_dataset)
 
             if not training_result.success:
@@ -420,6 +436,22 @@ class UnifiedTrainingPipeline:
                 ))
             except Exception:
                 pass
+
+            # Trinity Event: Training complete
+            try:
+                from reactor_core.integration.trinity_publisher import publish_training_complete
+                asyncio.create_task(publish_training_complete(
+                    model_name=self.config.base_model.split("/")[-1],
+                    model_path=str(training_result.merged_model_path or training_result.adapter_path or ""),
+                    metrics={
+                        "final_loss": training_result.final_loss,
+                        "total_steps": training_result.total_steps,
+                    },
+                    total_steps=training_result.total_steps,
+                    training_time_seconds=training_result.training_time_seconds,
+                ))
+            except Exception as e:
+                logger.debug(f"Trinity event publish failed: {e}")
 
             # Step 4: Export to GGUF (if configured)
             if self.config.export_gguf and result.model_path:
@@ -478,6 +510,26 @@ class UnifiedTrainingPipeline:
                     except Exception:
                         pass
 
+                    # Trinity Event: Model ready for hot-swap
+                    # This is THE KEY EVENT that closes the loop!
+                    try:
+                        from reactor_core.integration.trinity_publisher import publish_model_ready
+                        asyncio.create_task(publish_model_ready(
+                            model_name=self.config.base_model.split("/")[-1],
+                            model_path=str(result.deployed_to or result.gguf_path or result.model_path),
+                            capabilities=["text_generation", "instruction_following"],
+                            model_type="llm",
+                            metadata={
+                                "final_loss": result.final_loss,
+                                "training_steps": result.training_steps,
+                                "samples_used": result.samples_used,
+                                "quantization": self.config.gguf_quantization,
+                            },
+                        ))
+                        logger.info("[Trinity] Published MODEL_READY - hot-swap can now occur!")
+                    except Exception as e:
+                        logger.debug(f"Trinity MODEL_READY publish failed: {e}")
+
             # Success
             await self._update_state(PipelineState.COMPLETED, "Training cycle complete")
             result.success = True
@@ -494,6 +546,18 @@ class UnifiedTrainingPipeline:
             result.error_message = str(e)
             result.metrics["traceback"] = traceback.format_exc()
             logger.error(f"[Pipeline] Training cycle failed: {e}")
+
+            # Trinity Event: Training failed
+            try:
+                from reactor_core.integration.trinity_publisher import publish_training_failed
+                asyncio.create_task(publish_training_failed(
+                    model_name=self.config.base_model.split("/")[-1],
+                    error_message=str(e),
+                    step=self._progress.training_step,
+                    traceback=traceback.format_exc(),
+                ))
+            except Exception:
+                pass  # Don't let event publishing failure mask the real error
 
         finally:
             await self._trinity.stop()
