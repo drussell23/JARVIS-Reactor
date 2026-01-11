@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AGI OS Unified Supervisor - Project Trinity v91.0
+AGI OS Unified Supervisor - Project Trinity v92.0
 ==================================================
 
 The central command that orchestrates the entire AGI ecosystem:
@@ -12,7 +12,7 @@ RUN: python3 run_supervisor.py
 
 ARCHITECTURE:
     ┌─────────────────────────────────────────────────────────────────────┐
-    │                  AGI OS UNIFIED SUPERVISOR v91.0                   │
+    │                  AGI OS UNIFIED SUPERVISOR v92.0                   │
     │                    (Central Coordination Hub)                       │
     └─────────────────────────────────────────────────────────────────────┘
                                       │
@@ -66,6 +66,15 @@ v91.0 ADVANCED FEATURES:
 - Distributed Training: Multi-VM coordination with gradient compression
 - Dynamic Resource Allocation: Auto-scaling with cost-aware decisions
 - MLForge C++ Bindings: High-performance matrix/neural ops with pybind11
+
+v92.0 RELIABILITY FEATURES:
+- Atomic File Writes: Prevents checkpoint corruption from partial writes
+- Circuit Breaker Pattern: Protects external service calls with auto-recovery
+- Backpressure Control: Prevents memory exhaustion under high load
+- Proper Async Patterns: Deadlock-free async/await with timeouts
+- Gradient Verification: Checksum validation for distributed training
+- Memory Pressure Awareness: Adaptive behavior under resource constraints
+- Unified Error Handling: Centralized error classification and routing
 """
 
 from __future__ import annotations
@@ -162,6 +171,26 @@ try:
 except ImportError as e:
     logger.debug(f"MLForge bindings not available: {e}")
     HAS_MLFORGE_BINDINGS = False
+
+# v92.0: Unified Error Handling
+try:
+    from reactor_core.core.error_handling import (
+        CircuitBreaker,
+        CircuitBreakerConfig,
+        ErrorRegistry,
+        RetryHandler,
+        RetryConfig,
+        Bulkhead,
+        resilient,
+        get_error_registry,
+        record_error,
+        ErrorCategory,
+        ClassifiedError,
+    )
+    HAS_ERROR_HANDLING = True
+except ImportError as e:
+    logger.debug(f"Error handling module not available: {e}")
+    HAS_ERROR_HANDLING = False
 
 # v77.0 API Integration
 try:
