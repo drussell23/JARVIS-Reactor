@@ -13,5 +13,8 @@
     },
     "python.analysis.extraPaths": [
         "${workspaceFolder}/reactor_core"
+    ],
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}/reactor_core"
     ]
 }

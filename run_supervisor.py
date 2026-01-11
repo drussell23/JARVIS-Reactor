@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AGI OS Unified Supervisor - Project Trinity
-============================================
+AGI OS Unified Supervisor - Project Trinity v91.0
+==================================================
 
 The central command that orchestrates the entire AGI ecosystem:
 - JARVIS (Body) - macOS automation and interaction
@@ -12,7 +12,7 @@ RUN: python3 run_supervisor.py
 
 ARCHITECTURE:
     ┌─────────────────────────────────────────────────────────────────────┐
-    │                      AGI OS UNIFIED SUPERVISOR                     │
+    │                  AGI OS UNIFIED SUPERVISOR v91.0                   │
     │                    (Central Coordination Hub)                       │
     └─────────────────────────────────────────────────────────────────────┘
                                       │
@@ -28,17 +28,27 @@ ARCHITECTURE:
     └─────────┘               │ State Sync  │               └─────────┘
                               └─────────────┘
                                       │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                 ▼
+            ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+            │REACTOR CORE │   │  ONLINE     │   │ DISTRIBUTED │
+            │  (Nerves)   │   │  LEARNING   │   │  TRAINING   │
+            │             │   │             │   │             │
+            │ Training    │   │ Experience  │   │ Multi-VM    │
+            │ Learning    │   │ Replay      │   │ Gradient    │
+            │ Serving     │   │ EWC/Drift   │   │ Sync        │
+            └─────────────┘   └─────────────┘   └─────────────┘
+                    │                 │                 │
+                    └─────────────────┼─────────────────┘
                                       ▼
                               ┌─────────────┐
-                              │REACTOR CORE │
-                              │  (Nerves)   │
-                              │             │
-                              │ Training    │
-                              │ Learning    │
-                              │ Serving     │
+                              │   MLForge   │
+                              │ C++ Bindings│
+                              │ + GCP Spot  │
+                              │ + Versioning│
                               └─────────────┘
 
-FEATURES:
+v77.0 FEATURES:
 - One-command startup for entire AGI ecosystem
 - Automatic component discovery and health monitoring
 - Graceful startup/shutdown sequence
@@ -46,6 +56,16 @@ FEATURES:
 - Continuous learning from JARVIS interactions
 - Model serving for J-Prime inference
 - Fault tolerance with automatic recovery
+
+v91.0 ADVANCED FEATURES:
+- Online/Incremental Learning: Prioritized experience replay with importance sampling
+- Elastic Weight Consolidation (EWC): Prevents catastrophic forgetting during updates
+- Concept Drift Detection: Page-Hinkley test for automatic model adaptation
+- Data Versioning: Content-addressed storage with lineage tracking (DVC compatible)
+- GCP Spot VM Checkpointing: Predictive preemption with multi-signal detection
+- Distributed Training: Multi-VM coordination with gradient compression
+- Dynamic Resource Allocation: Auto-scaling with cost-aware decisions
+- MLForge C++ Bindings: High-performance matrix/neural ops with pybind11
 """
 
 from __future__ import annotations
@@ -84,6 +104,64 @@ from reactor_core.integration.event_bridge import (
 )
 
 logger = logging.getLogger(__name__)
+
+# v91.0 Advanced Module Imports
+try:
+    from reactor_core.training.online_learning import (
+        OnlineLearningEngine,
+        PrioritizedExperienceBuffer,
+        FeedbackIntegrator,
+        DriftDetector,
+    )
+    HAS_ONLINE_LEARNING = True
+except ImportError as e:
+    logger.debug(f"Online learning module not available: {e}")
+    HAS_ONLINE_LEARNING = False
+
+try:
+    from reactor_core.training.distributed_coordinator import (
+        DistributedCoordinator,
+        DynamicResourceAllocator,
+        WorkerManager,
+        AutoScaler,
+    )
+    HAS_DISTRIBUTED_TRAINING = True
+except ImportError as e:
+    logger.debug(f"Distributed training module not available: {e}")
+    HAS_DISTRIBUTED_TRAINING = False
+
+try:
+    from reactor_core.data.versioning import (
+        DataVersionController,
+        VersionStore,
+        LineageTracker,
+    )
+    HAS_DATA_VERSIONING = True
+except ImportError as e:
+    logger.debug(f"Data versioning module not available: {e}")
+    HAS_DATA_VERSIONING = False
+
+try:
+    from reactor_core.gcp.checkpointer import (
+        SpotVMCheckpointer,
+        PreemptionDetector,
+        spot_vm_training_context,
+    )
+    HAS_SPOT_VM_CHECKPOINTING = True
+except ImportError as e:
+    logger.debug(f"Spot VM checkpointing module not available: {e}")
+    HAS_SPOT_VM_CHECKPOINTING = False
+
+try:
+    from reactor_core.bindings import (
+        MLForgeBridge,
+        get_bridge,
+        has_cpp_backend,
+    )
+    HAS_MLFORGE_BINDINGS = True
+except ImportError as e:
+    logger.debug(f"MLForge bindings not available: {e}")
+    HAS_MLFORGE_BINDINGS = False
 
 # v77.0 API Integration
 try:
@@ -660,6 +738,40 @@ class SupervisorConfig:
     log_level: str = "INFO"
     log_file: Optional[Path] = None
 
+    # v91.0 Advanced Features
+    enable_online_learning: bool = True
+    enable_distributed_training: bool = True
+    enable_data_versioning: bool = True
+    enable_spot_vm_checkpointing: bool = True
+    enable_mlforge_bindings: bool = True
+
+    # Online Learning Settings
+    experience_buffer_size: int = 100000
+    priority_alpha: float = 0.6
+    ewc_lambda: float = 100.0
+    drift_threshold: float = 0.1
+
+    # Distributed Training Settings
+    distributed_mode: str = "auto"  # auto, single, multi
+    min_workers: int = 1
+    max_workers: int = 8
+    gradient_compression: bool = True
+
+    # Data Versioning Settings
+    version_store_path: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "data_versions")
+    track_lineage: bool = True
+    auto_detect_drift: bool = True
+
+    # GCP Spot VM Settings
+    gcp_project: Optional[str] = None
+    checkpoint_bucket: Optional[str] = None
+    preemption_prediction: bool = True
+    checkpoint_interval: int = 300  # seconds
+
+    # MLForge Settings
+    mlforge_backend: str = "auto"  # auto, cpp, numpy, torch
+    enable_cpp_optimizations: bool = True
+
     def __post_init__(self):
         # Use robust repo discovery (v76.0)
         discovery = get_repo_discovery()
@@ -756,6 +868,16 @@ class AGISupervisor:
         self._health_aggregator = None
         self._model_server: Optional[ModelServer] = None
 
+        # v91.0 Advanced Services
+        self._online_learning_engine: Optional[OnlineLearningEngine] = None
+        self._distributed_coordinator: Optional[DistributedCoordinator] = None
+        self._data_version_controller: Optional[DataVersionController] = None
+        self._spot_vm_checkpointer: Optional[SpotVMCheckpointer] = None
+        self._mlforge_bridge: Optional[MLForgeBridge] = None
+        self._feedback_integrator: Optional[FeedbackIntegrator] = None
+        self._drift_detector: Optional[DriftDetector] = None
+        self._resource_allocator: Optional[DynamicResourceAllocator] = None
+
         # Background tasks
         self._tasks: List[asyncio.Task] = []
 
@@ -772,6 +894,13 @@ class AGISupervisor:
             "restarts": 0,
             "models_served": 0,
             "api_requests": 0,
+            # v91.0 stats
+            "online_updates": 0,
+            "drift_detections": 0,
+            "checkpoints_saved": 0,
+            "preemptions_survived": 0,
+            "distributed_syncs": 0,
+            "data_versions_created": 0,
         }
 
         # Initialize logging
@@ -831,21 +960,25 @@ class AGISupervisor:
             logger.info("[Phase 4] Starting Reactor Core services...")
             await self._start_reactor_core_services()
 
-            # Phase 5: Start external components
+            # Phase 5: Initialize v91.0 Advanced Services
+            logger.info("[Phase 5] Initializing v91.0 Advanced Services...")
+            await self._initialize_v91_services()
+
+            # Phase 6: Start external components
             if self.config.enable_jarvis and self._components.get("jarvis"):
-                logger.info("[Phase 5] Starting JARVIS (Body)...")
+                logger.info("[Phase 6] Starting JARVIS (Body)...")
                 await self._start_component("jarvis")
 
             if self.config.enable_jprime and self._components.get("jprime"):
-                logger.info("[Phase 6] Starting J-Prime (Mind)...")
+                logger.info("[Phase 7] Starting J-Prime (Mind)...")
                 await self._start_component("jprime")
 
-            # Phase 6: Start background tasks
-            logger.info("[Phase 7] Starting background services...")
+            # Phase 8: Start background tasks
+            logger.info("[Phase 8] Starting background services...")
             await self._start_background_tasks()
 
             # Wait for components to become healthy
-            logger.info("[Phase 8] Waiting for component health...")
+            logger.info("[Phase 9] Waiting for component health...")
             healthy = await self._wait_for_health()
 
             if healthy:
@@ -878,6 +1011,35 @@ class AGISupervisor:
         # Wait for tasks to complete
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        # Stop v91.0 services first (they depend on v77.0 services)
+        if self._distributed_coordinator:
+            try:
+                await self._distributed_coordinator.stop()
+                logger.info("  [OK] Distributed Coordinator stopped")
+            except Exception as e:
+                logger.warning(f"  Distributed Coordinator stop failed: {e}")
+
+        if self._spot_vm_checkpointer:
+            try:
+                await self._spot_vm_checkpointer.stop()
+                logger.info("  [OK] Spot VM Checkpointer stopped")
+            except Exception as e:
+                logger.warning(f"  Spot VM Checkpointer stop failed: {e}")
+
+        if self._online_learning_engine:
+            try:
+                await self._online_learning_engine.stop()
+                logger.info("  [OK] Online Learning Engine stopped")
+            except Exception as e:
+                logger.warning(f"  Online Learning Engine stop failed: {e}")
+
+        if self._data_version_controller:
+            try:
+                await self._data_version_controller.close()
+                logger.info("  [OK] Data Version Controller stopped")
+            except Exception as e:
+                logger.warning(f"  Data Version Controller stop failed: {e}")
 
         # Stop v77.0 services in reverse dependency order
         if self._model_server:
@@ -1129,6 +1291,215 @@ class AGISupervisor:
         # Scout (optional)
         if self.config.enable_scout:
             logger.info("  [OK] Scout ingestion ready")
+
+    async def _initialize_v91_services(self) -> None:
+        """Initialize v91.0 Advanced Services for enhanced training and learning."""
+        # === MLForge C++ Bindings ===
+        if HAS_MLFORGE_BINDINGS and self.config.enable_mlforge_bindings:
+            try:
+                self._mlforge_bridge = get_bridge()
+                backend = self._mlforge_bridge.get_backend_info()
+                cpp_available = has_cpp_backend()
+                logger.info(f"  [OK] MLForge Bridge initialized (backend: {backend['backend']}, C++ available: {cpp_available})")
+            except Exception as e:
+                logger.warning(f"  MLForge Bridge failed: {e}")
+
+        # === Data Versioning Controller ===
+        if HAS_DATA_VERSIONING and self.config.enable_data_versioning:
+            try:
+                # Ensure version store directory exists
+                self.config.version_store_path.mkdir(parents=True, exist_ok=True)
+
+                self._data_version_controller = DataVersionController(
+                    store_path=self.config.version_store_path,
+                    track_lineage=self.config.track_lineage,
+                    auto_detect_drift=self.config.auto_detect_drift,
+                )
+                await self._data_version_controller.initialize()
+                logger.info(f"  [OK] Data Version Controller initialized (path: {self.config.version_store_path})")
+            except Exception as e:
+                logger.warning(f"  Data Version Controller failed: {e}")
+
+        # === Online Learning Engine ===
+        if HAS_ONLINE_LEARNING and self.config.enable_online_learning:
+            try:
+                self._online_learning_engine = OnlineLearningEngine(
+                    buffer_size=self.config.experience_buffer_size,
+                    priority_alpha=self.config.priority_alpha,
+                    ewc_lambda=self.config.ewc_lambda,
+                )
+
+                # Initialize drift detector
+                self._drift_detector = DriftDetector(
+                    threshold=self.config.drift_threshold,
+                    window_size=1000,
+                )
+
+                # Initialize feedback integrator for JARVIS integration
+                self._feedback_integrator = FeedbackIntegrator(
+                    learning_engine=self._online_learning_engine,
+                    event_bridge=self._event_bridge,
+                )
+
+                await self._online_learning_engine.start()
+                logger.info(f"  [OK] Online Learning Engine initialized (buffer: {self.config.experience_buffer_size}, EWC λ: {self.config.ewc_lambda})")
+            except Exception as e:
+                logger.warning(f"  Online Learning Engine failed: {e}")
+
+        # === GCP Spot VM Checkpointer ===
+        if HAS_SPOT_VM_CHECKPOINTING and self.config.enable_spot_vm_checkpointing:
+            try:
+                # Auto-detect GCP project if not specified
+                gcp_project = self.config.gcp_project
+                if not gcp_project:
+                    import subprocess
+                    result = subprocess.run(
+                        ["gcloud", "config", "get-value", "project"],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        gcp_project = result.stdout.strip()
+
+                if gcp_project:
+                    self._spot_vm_checkpointer = SpotVMCheckpointer(
+                        project_id=gcp_project,
+                        bucket_name=self.config.checkpoint_bucket or f"{gcp_project}-checkpoints",
+                        enable_prediction=self.config.preemption_prediction,
+                        checkpoint_interval=self.config.checkpoint_interval,
+                    )
+                    await self._spot_vm_checkpointer.start()
+                    logger.info(f"  [OK] Spot VM Checkpointer initialized (project: {gcp_project}, predictive: {self.config.preemption_prediction})")
+                else:
+                    logger.info("  [--] Spot VM Checkpointer skipped (no GCP project detected)")
+            except Exception as e:
+                logger.warning(f"  Spot VM Checkpointer failed: {e}")
+
+        # === Distributed Training Coordinator ===
+        if HAS_DISTRIBUTED_TRAINING and self.config.enable_distributed_training:
+            try:
+                # Determine distributed mode
+                mode = self.config.distributed_mode
+                if mode == "auto":
+                    # Auto-detect based on environment
+                    import torch
+                    if torch.cuda.device_count() > 1:
+                        mode = "multi"
+                    else:
+                        mode = "single"
+
+                self._distributed_coordinator = DistributedCoordinator(
+                    mode=mode,
+                    min_workers=self.config.min_workers,
+                    max_workers=self.config.max_workers,
+                    enable_gradient_compression=self.config.gradient_compression,
+                )
+
+                # Initialize resource allocator
+                self._resource_allocator = DynamicResourceAllocator(
+                    coordinator=self._distributed_coordinator,
+                    min_workers=self.config.min_workers,
+                    max_workers=self.config.max_workers,
+                )
+
+                await self._distributed_coordinator.start()
+                logger.info(f"  [OK] Distributed Coordinator initialized (mode: {mode}, workers: {self.config.min_workers}-{self.config.max_workers})")
+            except Exception as e:
+                logger.warning(f"  Distributed Coordinator failed: {e}")
+
+        # === Connect components for integrated operation ===
+        await self._connect_v91_services()
+
+    async def _connect_v91_services(self) -> None:
+        """Connect v91.0 services for integrated operation."""
+        # Connect online learning to event bridge for JARVIS feedback
+        if self._online_learning_engine and self._event_bridge:
+            @self._event_bridge.on_event(EventType.FEEDBACK)
+            async def handle_feedback_for_learning(event):
+                """Route feedback to online learning engine."""
+                try:
+                    await self._online_learning_engine.add_experience({
+                        "type": "feedback",
+                        "payload": event.payload,
+                        "timestamp": event.timestamp,
+                        "source": event.source.value if hasattr(event.source, 'value') else str(event.source),
+                    })
+                    self._stats["online_updates"] += 1
+                except Exception as e:
+                    logger.debug(f"Failed to route feedback to online learning: {e}")
+
+            @self._event_bridge.on_event(EventType.CORRECTION)
+            async def handle_correction_for_learning(event):
+                """Route corrections to online learning with high priority."""
+                try:
+                    await self._online_learning_engine.add_experience({
+                        "type": "correction",
+                        "payload": event.payload,
+                        "timestamp": event.timestamp,
+                        "priority": 1.0,  # Corrections get max priority
+                    })
+                    self._stats["online_updates"] += 1
+                except Exception as e:
+                    logger.debug(f"Failed to route correction to online learning: {e}")
+
+        # Connect drift detector to trigger retraining
+        if self._drift_detector and self._online_learning_engine:
+            async def on_drift_detected(drift_info: dict):
+                """Handle concept drift detection."""
+                logger.warning(f"Concept drift detected: {drift_info}")
+                self._stats["drift_detections"] += 1
+
+                if self._telemetry:
+                    await self._telemetry.record_event("concept_drift_detected", drift_info)
+
+                # Trigger incremental retraining
+                if self._scheduler:
+                    await self._scheduler.trigger_job("daily_incremental", reason="drift_detected")
+
+            self._drift_detector.on_drift(on_drift_detected)
+
+        # Connect checkpointer to training events
+        if self._spot_vm_checkpointer and self._event_bridge:
+            @self._event_bridge.on_event(EventType.TRAINING_STARTED)
+            async def handle_training_started(event):
+                """Start checkpointing when training begins."""
+                try:
+                    await self._spot_vm_checkpointer.start_session(
+                        training_id=event.payload.get("training_id", "default"),
+                        model_config=event.payload.get("model_config", {}),
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to start checkpoint session: {e}")
+
+            @self._event_bridge.on_event(EventType.TRAINING_COMPLETE)
+            async def handle_training_complete_checkpoint(event):
+                """Finalize checkpointing when training completes."""
+                try:
+                    await self._spot_vm_checkpointer.finalize_session()
+                    self._stats["checkpoints_saved"] += 1
+                except Exception as e:
+                    logger.debug(f"Failed to finalize checkpoint session: {e}")
+
+        # Connect data versioning to training pipeline
+        if self._data_version_controller and self._event_bridge:
+            @self._event_bridge.on_event(EventType.TRAINING_STARTED)
+            async def version_training_data(event):
+                """Create version snapshot of training data."""
+                try:
+                    data_path = event.payload.get("data_path")
+                    if data_path:
+                        version = await self._data_version_controller.create_version(
+                            data_path=data_path,
+                            metadata={
+                                "training_id": event.payload.get("training_id"),
+                                "timestamp": event.timestamp,
+                            }
+                        )
+                        self._stats["data_versions_created"] += 1
+                        logger.debug(f"Created data version: {version.version_id}")
+                except Exception as e:
+                    logger.debug(f"Failed to create data version: {e}")
+
+        logger.info("  [OK] v91.0 Services connected for integrated operation")
 
     async def _start_component(self, name: str) -> bool:
         """Start an external component."""
@@ -1473,6 +1844,20 @@ class AGISupervisor:
             logger.info(f"  [{'OK' if self._model_server else '--'}] Model Server (Hot-Reload)")
             logger.info("-" * 50)
 
+        # v91.0 Advanced Services Status
+        logger.info("")
+        logger.info("v91.0 ADVANCED SERVICES:")
+        logger.info("-" * 50)
+        mlforge_info = f" (backend: {self._mlforge_bridge.get_backend_info()['backend']})" if self._mlforge_bridge else ""
+        logger.info(f"  [{'OK' if self._mlforge_bridge else '--'}] MLForge Bridge{mlforge_info}")
+        logger.info(f"  [{'OK' if self._online_learning_engine else '--'}] Online Learning Engine")
+        logger.info(f"  [{'OK' if self._drift_detector else '--'}] Concept Drift Detector")
+        logger.info(f"  [{'OK' if self._data_version_controller else '--'}] Data Version Controller")
+        logger.info(f"  [{'OK' if self._spot_vm_checkpointer else '--'}] Spot VM Checkpointer")
+        logger.info(f"  [{'OK' if self._distributed_coordinator else '--'}] Distributed Coordinator")
+        logger.info(f"  [{'OK' if self._resource_allocator else '--'}] Dynamic Resource Allocator")
+        logger.info("-" * 50)
+
         logger.info("")
         logger.info("ENDPOINTS:")
         if self.config.enable_api:
@@ -1489,6 +1874,15 @@ class AGISupervisor:
         logger.info("  - Scheduled training (daily 2am, weekly Sunday 3am)")
         logger.info("  - Cross-component health monitoring")
         logger.info("  - Telemetry collection and event tracking")
+        logger.info("  v91.0 ADVANCED:")
+        logger.info("  - Online/incremental learning with experience replay")
+        logger.info("  - Elastic Weight Consolidation (anti-forgetting)")
+        logger.info("  - Concept drift detection with auto-retraining")
+        logger.info("  - Content-addressed data versioning with lineage")
+        logger.info("  - GCP Spot VM predictive checkpointing")
+        logger.info("  - Distributed training with gradient compression")
+        logger.info("  - Dynamic resource allocation with auto-scaling")
+        logger.info("  - MLForge C++ bindings for accelerated ops")
         logger.info("")
         logger.info("Press Ctrl+C to shutdown")
         logger.info("")
@@ -1541,6 +1935,40 @@ class AGISupervisor:
                 except Exception:
                     logger.info("  Health Checks:       N/A")
 
+        # v91.0 Service Stats
+        logger.info("")
+        logger.info("v91.0 ADVANCED SERVICE METRICS:")
+        logger.info(f"  Online Updates:      {self._stats['online_updates']}")
+        logger.info(f"  Drift Detections:    {self._stats['drift_detections']}")
+        logger.info(f"  Checkpoints Saved:   {self._stats['checkpoints_saved']}")
+        logger.info(f"  Preemptions Survived:{self._stats['preemptions_survived']}")
+        logger.info(f"  Distributed Syncs:   {self._stats['distributed_syncs']}")
+        logger.info(f"  Data Versions:       {self._stats['data_versions_created']}")
+
+        if self._online_learning_engine:
+            try:
+                ole_stats = self._online_learning_engine.get_stats()
+                logger.info(f"  Experience Buffer:   {ole_stats.get('buffer_size', 'N/A')}/{ole_stats.get('buffer_capacity', 'N/A')}")
+                logger.info(f"  Incremental Updates: {ole_stats.get('incremental_updates', 'N/A')}")
+            except Exception:
+                pass
+
+        if self._distributed_coordinator:
+            try:
+                dc_stats = self._distributed_coordinator.get_stats()
+                logger.info(f"  Active Workers:      {dc_stats.get('active_workers', 'N/A')}")
+                logger.info(f"  Gradient Syncs:      {dc_stats.get('gradient_syncs', 'N/A')}")
+            except Exception:
+                pass
+
+        if self._data_version_controller:
+            try:
+                dvc_stats = self._data_version_controller.get_stats()
+                logger.info(f"  Total Versions:      {dvc_stats.get('total_versions', 'N/A')}")
+                logger.info(f"  Lineage Edges:       {dvc_stats.get('lineage_edges', 'N/A')}")
+            except Exception:
+                pass
+
         logger.info("=" * 60)
 
     async def run_until_shutdown(self) -> None:
@@ -1555,7 +1983,7 @@ class AGISupervisor:
 async def main():
     """Main entry point for AGI Supervisor."""
     parser = argparse.ArgumentParser(
-        description="AGI OS Unified Supervisor - Project Trinity",
+        description="AGI OS Unified Supervisor - Project Trinity (v91.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1563,6 +1991,8 @@ Examples:
   python3 run_supervisor.py --no-jarvis        # Start without JARVIS
   python3 run_supervisor.py --no-training      # Disable training
   python3 run_supervisor.py --api-port 8080    # Custom API port
+  python3 run_supervisor.py --distributed multi --max-workers 4   # Multi-GPU distributed
+  python3 run_supervisor.py --gcp-project myproj --checkpoint-bucket mybucket  # GCP Spot VM
         """,
     )
 
@@ -1586,6 +2016,38 @@ Examples:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--log-file", type=Path, help="Log file path")
 
+    # v91.0 Advanced Feature Flags
+    v91_group = parser.add_argument_group("v91.0 Advanced Features")
+    v91_group.add_argument("--no-online-learning", action="store_true", help="Disable online/incremental learning")
+    v91_group.add_argument("--no-distributed", action="store_true", help="Disable distributed training")
+    v91_group.add_argument("--no-versioning", action="store_true", help="Disable data versioning")
+    v91_group.add_argument("--no-spot-checkpointing", action="store_true", help="Disable GCP Spot VM checkpointing")
+    v91_group.add_argument("--no-mlforge", action="store_true", help="Disable MLForge C++ bindings")
+
+    # Online Learning Settings
+    ol_group = parser.add_argument_group("Online Learning")
+    ol_group.add_argument("--experience-buffer-size", type=int, default=100000, help="Experience replay buffer size")
+    ol_group.add_argument("--ewc-lambda", type=float, default=100.0, help="EWC regularization strength")
+    ol_group.add_argument("--drift-threshold", type=float, default=0.1, help="Concept drift detection threshold")
+
+    # Distributed Training Settings
+    dist_group = parser.add_argument_group("Distributed Training")
+    dist_group.add_argument("--distributed", choices=["auto", "single", "multi"], default="auto", help="Distributed mode")
+    dist_group.add_argument("--min-workers", type=int, default=1, help="Minimum worker count")
+    dist_group.add_argument("--max-workers", type=int, default=8, help="Maximum worker count")
+    dist_group.add_argument("--no-gradient-compression", action="store_true", help="Disable gradient compression")
+
+    # GCP Settings
+    gcp_group = parser.add_argument_group("GCP Spot VM")
+    gcp_group.add_argument("--gcp-project", type=str, help="GCP project ID")
+    gcp_group.add_argument("--checkpoint-bucket", type=str, help="GCS bucket for checkpoints")
+    gcp_group.add_argument("--checkpoint-interval", type=int, default=300, help="Checkpoint interval in seconds")
+    gcp_group.add_argument("--no-preemption-prediction", action="store_true", help="Disable preemption prediction")
+
+    # MLForge Settings
+    mlforge_group = parser.add_argument_group("MLForge")
+    mlforge_group.add_argument("--mlforge-backend", choices=["auto", "cpp", "numpy", "torch"], default="auto", help="MLForge backend")
+
     args = parser.parse_args()
 
     # Build config
@@ -1602,6 +2064,24 @@ Examples:
         jprime_port=args.jprime_port,
         log_level=args.log_level,
         log_file=args.log_file,
+        # v91.0 settings
+        enable_online_learning=not args.no_online_learning,
+        enable_distributed_training=not args.no_distributed,
+        enable_data_versioning=not args.no_versioning,
+        enable_spot_vm_checkpointing=not args.no_spot_checkpointing,
+        enable_mlforge_bindings=not args.no_mlforge,
+        experience_buffer_size=args.experience_buffer_size,
+        ewc_lambda=args.ewc_lambda,
+        drift_threshold=args.drift_threshold,
+        distributed_mode=args.distributed,
+        min_workers=args.min_workers,
+        max_workers=args.max_workers,
+        gradient_compression=not args.no_gradient_compression,
+        gcp_project=args.gcp_project,
+        checkpoint_bucket=args.checkpoint_bucket,
+        checkpoint_interval=args.checkpoint_interval,
+        preemption_prediction=not args.no_preemption_prediction,
+        mlforge_backend=args.mlforge_backend,
     )
 
     # Create supervisor
