@@ -839,6 +839,31 @@ async def shutdown_unified_model_manager():
         _manager = None
 
 
+async def create_unified_manager(
+    config_path: Optional[Path] = None,
+    max_pool_memory_gb: float = 32.0,
+) -> UnifiedModelManager:
+    """
+    Create and initialize a new UnifiedModelManager.
+
+    This is a factory function for creating standalone manager instances.
+    For singleton access, use get_unified_model_manager() instead.
+
+    Args:
+        config_path: Optional path to model configuration file
+        max_pool_memory_gb: Maximum memory for model pool (default: 32GB)
+
+    Returns:
+        Initialized UnifiedModelManager instance
+    """
+    manager = UnifiedModelManager(
+        config_path=config_path,
+        max_pool_memory_gb=max_pool_memory_gb,
+    )
+    await manager.initialize()
+    return manager
+
+
 __all__ = [
     # Enums
     "ModelBackend",
@@ -852,7 +877,8 @@ __all__ = [
     "ModelInstance",
     "ModelPool",
     "UnifiedModelManager",
-    # Utilities
+    # Factory and utilities
+    "create_unified_manager",
     "get_unified_model_manager",
     "shutdown_unified_model_manager",
 ]

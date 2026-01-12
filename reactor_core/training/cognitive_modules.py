@@ -15,7 +15,7 @@ Version: v81.0 (Phase 3 - Ultimate Scale)
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Callable, Protocol
+from typing import Dict, List, Optional, Tuple, Any, Callable, Protocol, Union
 from enum import Enum
 import asyncio
 import torch
@@ -166,7 +166,7 @@ class BaseCognitiveModule(nn.Module):
         context: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         return_state: bool = False,
-    ) -> torch.Tensor | Tuple[torch.Tensor, CognitiveState]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, CognitiveState]]:
         """
         Forward pass through the cognitive module.
 

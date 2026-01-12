@@ -592,6 +592,39 @@ class HybridModelRouter:
         return reasoning
 
 
+# ============================================================================
+# FACTORY FUNCTIONS
+# ============================================================================
+
+
+def create_hybrid_router(
+    strategy: RoutingStrategy = RoutingStrategy.BALANCED,
+    prefer_local: bool = True,
+    max_latency_ms: Optional[float] = None,
+    max_cost: Optional[float] = None,
+) -> HybridModelRouter:
+    """
+    Create a HybridModelRouter with the specified configuration.
+
+    Factory function for creating router instances.
+
+    Args:
+        strategy: Routing strategy to use (default: BALANCED)
+        prefer_local: Whether to prefer local models (default: True)
+        max_latency_ms: Maximum acceptable latency in milliseconds
+        max_cost: Maximum acceptable cost per request
+
+    Returns:
+        Configured HybridModelRouter instance
+    """
+    return HybridModelRouter(
+        strategy=strategy,
+        prefer_local=prefer_local,
+        max_latency_ms=max_latency_ms,
+        max_cost=max_cost,
+    )
+
+
 __all__ = [
     # Enums
     "TaskComplexity",
@@ -602,4 +635,6 @@ __all__ = [
     # Core classes
     "ComplexityAnalyzer",
     "HybridModelRouter",
+    # Factory
+    "create_hybrid_router",
 ]

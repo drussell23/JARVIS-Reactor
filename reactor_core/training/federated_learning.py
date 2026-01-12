@@ -137,6 +137,93 @@ class ClientUpdate:
     staleness: int = 0
 
 
+@dataclass
+class AggregationResult:
+    """Result from aggregating client updates."""
+
+    round_number: int
+    num_clients: int
+    aggregated_weights: Dict[str, torch.Tensor]
+    average_loss: float
+    average_metrics: Dict[str, float]
+    total_samples: int
+    aggregation_time_seconds: float
+    strategy_used: AggregationStrategy
+    excluded_clients: List[str] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for logging/serialization."""
+        return {
+            "round_number": self.round_number,
+            "num_clients": self.num_clients,
+            "average_loss": self.average_loss,
+            "average_metrics": self.average_metrics,
+            "total_samples": self.total_samples,
+            "aggregation_time_seconds": self.aggregation_time_seconds,
+            "strategy_used": self.strategy_used.value,
+            "excluded_clients": self.excluded_clients,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+@dataclass
+class FederatedMetrics:
+    """Metrics for federated learning training."""
+
+    round_number: int
+    global_loss: float
+    global_accuracy: float
+    participating_clients: int
+    total_clients: int
+    communication_rounds: int
+    average_client_training_time: float
+    average_client_samples: int
+    convergence_rate: float
+    additional_metrics: Dict[str, float] = field(default_factory=dict)
+
+    @classmethod
+    def aggregate(cls, client_metrics: List[Dict[str, float]], round_number: int) -> "FederatedMetrics":
+        """Aggregate metrics from multiple clients."""
+        if not client_metrics:
+            return cls(
+                round_number=round_number,
+                global_loss=0.0,
+                global_accuracy=0.0,
+                participating_clients=0,
+                total_clients=0,
+                communication_rounds=round_number,
+                average_client_training_time=0.0,
+                average_client_samples=0,
+                convergence_rate=0.0,
+            )
+
+        num_clients = len(client_metrics)
+        total_samples = sum(m.get("num_samples", 1) for m in client_metrics)
+
+        # Weighted average of losses
+        global_loss = sum(
+            m.get("loss", 0.0) * m.get("num_samples", 1) for m in client_metrics
+        ) / max(total_samples, 1)
+
+        # Weighted average of accuracy
+        global_accuracy = sum(
+            m.get("accuracy", 0.0) * m.get("num_samples", 1) for m in client_metrics
+        ) / max(total_samples, 1)
+
+        return cls(
+            round_number=round_number,
+            global_loss=global_loss,
+            global_accuracy=global_accuracy,
+            participating_clients=num_clients,
+            total_clients=num_clients,
+            communication_rounds=round_number,
+            average_client_training_time=sum(m.get("training_time", 0.0) for m in client_metrics) / max(num_clients, 1),
+            average_client_samples=total_samples // max(num_clients, 1),
+            convergence_rate=0.0,  # Computed over multiple rounds
+        )
+
+
 # =============================================================================
 # FEDERATED SERVER
 # =============================================================================
@@ -638,6 +725,90 @@ class FederatedClient:
 
 
 # =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def create_federated_setup(
+    model: nn.Module,
+    num_clients: int,
+    config: Optional[FederatedConfig] = None,
+    device: str = "cpu",
+    data_heterogeneity: float = 0.5,
+) -> Tuple["FederatedServer", List["FederatedClient"]]:
+    """
+    Create a complete federated learning setup with server and clients.
+
+    This is a convenience function for quickly setting up federated learning
+    experiments without manual instantiation of each component.
+
+    Args:
+        model: Base model to be trained federatedly
+        num_clients: Number of federated clients to create
+        config: Federated learning configuration (default: sensible defaults)
+        device: Device for training (cpu, cuda, etc.)
+        data_heterogeneity: Degree of non-IID data distribution (0.0 = IID, 1.0 = fully heterogeneous)
+
+    Returns:
+        Tuple of (FederatedServer, List[FederatedClient])
+
+    Example:
+        >>> model = MyModel()
+        >>> server, clients = create_federated_setup(
+        ...     model=model,
+        ...     num_clients=10,
+        ...     config=FederatedConfig(num_rounds=100),
+        ... )
+        >>> await server.start()
+    """
+    # Use default config if not provided
+    if config is None:
+        config = FederatedConfig(
+            num_rounds=100,
+            clients_per_round=min(10, num_clients),
+            aggregation_strategy=AggregationStrategy.FED_AVG,
+            client_selection_strategy=ClientSelectionStrategy.RANDOM,
+            learning_rate=0.01,
+            local_epochs=5,
+        )
+
+    # Create server with global model
+    server = FederatedServer(
+        model=model,
+        config=config,
+        device=device,
+    )
+
+    # Create clients with copies of the model
+    clients = []
+    for i in range(num_clients):
+        client_id = f"client_{i:03d}"
+
+        # Each client gets its own copy of the model
+        import copy
+        client_model = copy.deepcopy(model)
+
+        client = FederatedClient(
+            client_id=client_id,
+            model=client_model,
+            server=server,
+            config=config,
+            device=device,
+        )
+        clients.append(client)
+
+        # Register client with server
+        server.registered_clients.add(client_id)
+
+    logger.info(
+        f"Created federated setup: {num_clients} clients, "
+        f"strategy={config.aggregation_strategy.value}, "
+        f"rounds={config.num_rounds}"
+    )
+
+    return server, clients
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -651,4 +822,8 @@ __all__ = [
     "FederatedClient",
     # Data structures
     "ClientUpdate",
+    "AggregationResult",
+    "FederatedMetrics",
+    # Utilities
+    "create_federated_setup",
 ]

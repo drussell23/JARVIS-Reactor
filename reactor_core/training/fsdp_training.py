@@ -89,6 +89,54 @@ class FSDPMixedPrecisionPolicy(Enum):
     BF16_WORKING = "bf16_working"  # BF16 for forward/backward, FP32 for params
 
 
+class FSDPBackwardPrefetch(Enum):
+    """
+    Backward prefetch strategies for FSDP.
+
+    Controls when to prefetch parameters during backward pass:
+    - BACKWARD_PRE: Prefetch before backward computation (overlaps communication)
+    - BACKWARD_POST: Prefetch after backward computation
+    - NO_PREFETCH: Disable prefetching (useful for debugging)
+    """
+
+    BACKWARD_PRE = "BACKWARD_PRE"  # Prefetch before backward (recommended)
+    BACKWARD_POST = "BACKWARD_POST"  # Prefetch after backward
+    NO_PREFETCH = "NO_PREFETCH"  # No prefetching
+
+    def to_torch(self) -> Optional[BackwardPrefetch]:
+        """Convert to PyTorch BackwardPrefetch enum."""
+        mapping = {
+            FSDPBackwardPrefetch.BACKWARD_PRE: BackwardPrefetch.BACKWARD_PRE,
+            FSDPBackwardPrefetch.BACKWARD_POST: BackwardPrefetch.BACKWARD_POST,
+            FSDPBackwardPrefetch.NO_PREFETCH: None,
+        }
+        return mapping.get(self)
+
+
+class FSDPStateDictType(Enum):
+    """
+    State dict types for FSDP checkpointing.
+
+    Controls how model state is saved:
+    - FULL_STATE_DICT: Full state on rank 0 (for inference)
+    - SHARDED_STATE_DICT: Sharded across ranks (for resume)
+    - LOCAL_STATE_DICT: Local shards only (for debugging)
+    """
+
+    FULL_STATE_DICT = "FULL_STATE_DICT"  # Full consolidated state dict
+    SHARDED_STATE_DICT = "SHARDED_STATE_DICT"  # Sharded for distributed resume
+    LOCAL_STATE_DICT = "LOCAL_STATE_DICT"  # Local shards only
+
+    def to_torch(self) -> StateDictType:
+        """Convert to PyTorch StateDictType enum."""
+        mapping = {
+            FSDPStateDictType.FULL_STATE_DICT: StateDictType.FULL_STATE_DICT,
+            FSDPStateDictType.SHARDED_STATE_DICT: StateDictType.SHARDED_STATE_DICT,
+            FSDPStateDictType.LOCAL_STATE_DICT: StateDictType.LOCAL_STATE_DICT,
+        }
+        return mapping[self]
+
+
 @dataclass
 class FSDPConfig:
     """
@@ -659,6 +707,122 @@ class FSDPTrainer:
 
 
 # =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def apply_fsdp_wrapping(
+    model: nn.Module,
+    config: Optional[FSDPConfig] = None,
+    auto_wrap_policy: Optional[Callable] = None,
+    sharding_strategy: Optional[FSDPShardingStrategy] = None,
+    mixed_precision: Optional[FSDPMixedPrecisionPolicy] = None,
+    cpu_offload: bool = False,
+    backward_prefetch: Optional[FSDPBackwardPrefetch] = None,
+    device_id: Optional[int] = None,
+) -> FSDP:
+    """
+    Apply FSDP wrapping to a model with flexible configuration.
+
+    This is a convenience function for wrapping models with FSDP without
+    creating a full FSDPTrainer. Useful for custom training loops.
+
+    Args:
+        model: Model to wrap with FSDP
+        config: Full FSDPConfig (overrides other parameters if provided)
+        auto_wrap_policy: Custom auto-wrap policy (default: size-based)
+        sharding_strategy: Sharding strategy (default: FULL_SHARD)
+        mixed_precision: Mixed precision policy (default: BF16)
+        cpu_offload: Enable CPU offloading (default: False)
+        backward_prefetch: Backward prefetch strategy (default: BACKWARD_PRE)
+        device_id: CUDA device ID (default: current device)
+
+    Returns:
+        FSDP-wrapped model
+
+    Example:
+        >>> model = MyLargeModel()
+        >>> fsdp_model = apply_fsdp_wrapping(
+        ...     model,
+        ...     sharding_strategy=FSDPShardingStrategy.FULL_SHARD,
+        ...     mixed_precision=FSDPMixedPrecisionPolicy.BF16,
+        ... )
+    """
+    # Use config if provided, otherwise build from parameters
+    if config is not None:
+        effective_sharding = config.sharding_strategy
+        effective_mixed_precision = config.mixed_precision
+        effective_cpu_offload = config.cpu_offload
+        effective_backward_prefetch = config.backward_prefetch
+        effective_device_id = config.device_id
+    else:
+        effective_sharding = sharding_strategy or FSDPShardingStrategy.FULL_SHARD
+        effective_mixed_precision = mixed_precision or FSDPMixedPrecisionPolicy.BF16
+        effective_cpu_offload = cpu_offload
+        effective_backward_prefetch = (
+            backward_prefetch.value if backward_prefetch else "BACKWARD_PRE"
+        )
+        effective_device_id = device_id
+
+    # Get local rank if not specified
+    if effective_device_id is None:
+        if torch.cuda.is_available():
+            effective_device_id = int(os.environ.get("LOCAL_RANK", 0))
+        else:
+            effective_device_id = 0
+
+    # Map sharding strategy
+    sharding_strategy_map = {
+        FSDPShardingStrategy.FULL_SHARD: ShardingStrategy.FULL_SHARD,
+        FSDPShardingStrategy.SHARD_GRAD_OP: ShardingStrategy.SHARD_GRAD_OP,
+        FSDPShardingStrategy.NO_SHARD: ShardingStrategy.NO_SHARD,
+        FSDPShardingStrategy.HYBRID_SHARD: ShardingStrategy.HYBRID_SHARD,
+        FSDPShardingStrategy.HYBRID_SHARD_ZERO2: ShardingStrategy._HYBRID_SHARD_ZERO2,
+    }
+    torch_sharding = sharding_strategy_map[effective_sharding]
+
+    # Get mixed precision policy
+    torch_mixed_precision = get_mixed_precision_policy(effective_mixed_precision)
+
+    # CPU offload config
+    torch_cpu_offload = CPUOffload(offload_params=True) if effective_cpu_offload else None
+
+    # Backward prefetch
+    backward_prefetch_map = {
+        "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
+        "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
+        "NO_PREFETCH": None,
+    }
+    torch_backward_prefetch = backward_prefetch_map.get(effective_backward_prefetch)
+
+    # Default auto-wrap policy if not provided
+    if auto_wrap_policy is None:
+        auto_wrap_policy = size_based_auto_wrap_policy
+
+    # Move model to device
+    device = torch.device(f"cuda:{effective_device_id}" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    # Wrap with FSDP
+    fsdp_model = FSDP(
+        model,
+        sharding_strategy=torch_sharding,
+        mixed_precision=torch_mixed_precision,
+        cpu_offload=torch_cpu_offload,
+        backward_prefetch=torch_backward_prefetch,
+        auto_wrap_policy=auto_wrap_policy,
+        device_id=effective_device_id,
+    )
+
+    logger.info(
+        f"Applied FSDP wrapping: sharding={effective_sharding.value}, "
+        f"mixed_precision={effective_mixed_precision.value}, "
+        f"device={effective_device_id}"
+    )
+
+    return fsdp_model
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -667,9 +831,12 @@ __all__ = [
     "FSDPConfig",
     "FSDPShardingStrategy",
     "FSDPMixedPrecisionPolicy",
+    "FSDPBackwardPrefetch",
+    "FSDPStateDictType",
     # Trainer
     "FSDPTrainer",
     # Utilities
     "setup_distributed",
     "cleanup_distributed",
+    "apply_fsdp_wrapping",
 ]
