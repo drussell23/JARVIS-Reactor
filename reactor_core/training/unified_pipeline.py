@@ -38,6 +38,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,6 +47,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Singleton Pattern for Trinity Integration
+# =============================================================================
+
+_unified_trainer_instance: Optional["UnifiedTrainingPipeline"] = None
+_unified_trainer_lock: threading.Lock = threading.Lock()
 
 
 # =============================================================================
@@ -315,6 +323,226 @@ class UnifiedTrainingPipeline:
         self._ingestor = None
         self._dataset_builder = None
         self._trainer = None
+
+        # Experience buffer for real-time data ingestion
+        self._experience_buffer: List[Dict[str, Any]] = []
+        self._experience_lock = asyncio.Lock()
+        self._buffer_flush_threshold = int(
+            os.getenv("REACTOR_EXPERIENCE_BUFFER_THRESHOLD", "100")
+        )
+
+    async def add_experiences(
+        self,
+        experiences: Union[Dict[str, Any], List[Dict[str, Any]]],
+        flush: bool = False,
+    ) -> int:
+        """
+        Add experiences to the training buffer for real-time data ingestion.
+
+        This method enables the Trinity Loop by allowing JARVIS to send
+        experiences directly to the training pipeline without file I/O.
+
+        Args:
+            experiences: Single experience dict or list of experience dicts.
+                Each experience should have at minimum:
+                - user_input: str
+                - assistant_output: str
+                Optional fields:
+                - system_context: str
+                - confidence: float (0-1)
+                - timestamp: str (ISO format)
+                - session_id: str
+                - metadata: dict
+            flush: If True, trigger an immediate training cycle if buffer
+                   exceeds threshold.
+
+        Returns:
+            Current buffer size after adding experiences.
+
+        Example:
+            >>> trainer = get_unified_trainer()
+            >>> await trainer.add_experiences({
+            ...     "user_input": "What's the weather?",
+            ...     "assistant_output": "It's sunny today.",
+            ...     "confidence": 0.95
+            ... })
+        """
+        # Normalize to list
+        if isinstance(experiences, dict):
+            experiences = [experiences]
+
+        # Validate and filter experiences
+        valid_experiences = []
+        for exp in experiences:
+            if not isinstance(exp, dict):
+                logger.warning(f"Skipping non-dict experience: {type(exp)}")
+                continue
+
+            # Require minimum fields
+            if not exp.get("user_input") or not exp.get("assistant_output"):
+                logger.debug("Skipping experience missing user_input or assistant_output")
+                continue
+
+            # Check confidence threshold
+            confidence = exp.get("confidence", 1.0)
+            if confidence < self.config.min_confidence:
+                logger.debug(f"Skipping low-confidence experience: {confidence}")
+                continue
+
+            # Add timestamp if missing
+            if "timestamp" not in exp:
+                exp["timestamp"] = datetime.now().isoformat()
+
+            valid_experiences.append(exp)
+
+        if not valid_experiences:
+            logger.debug("No valid experiences to add")
+            return len(self._experience_buffer)
+
+        # Thread-safe buffer append
+        async with self._experience_lock:
+            self._experience_buffer.extend(valid_experiences)
+            buffer_size = len(self._experience_buffer)
+
+        logger.info(f"[Pipeline] Added {len(valid_experiences)} experiences (buffer: {buffer_size})")
+
+        # Check if we should trigger training
+        if flush and buffer_size >= self._buffer_flush_threshold:
+            logger.info(f"[Pipeline] Buffer threshold reached ({buffer_size}), scheduling training")
+            # Schedule training in background (don't await to avoid blocking)
+            asyncio.create_task(self._flush_experiences_to_training())
+
+        return buffer_size
+
+    async def get_buffered_experiences(self) -> List[Dict[str, Any]]:
+        """
+        Get a copy of the current experience buffer without clearing it.
+
+        Returns:
+            List of buffered experiences.
+        """
+        async with self._experience_lock:
+            return list(self._experience_buffer)
+
+    async def clear_experience_buffer(self) -> int:
+        """
+        Clear the experience buffer and return the number of cleared items.
+
+        Returns:
+            Number of experiences that were cleared.
+        """
+        async with self._experience_lock:
+            count = len(self._experience_buffer)
+            self._experience_buffer.clear()
+            return count
+
+    async def _flush_experiences_to_training(self) -> Optional["PipelineResult"]:
+        """
+        Flush buffered experiences to training.
+
+        This converts buffered experiences to the format expected by
+        _build_dataset and triggers a training cycle.
+        """
+        async with self._experience_lock:
+            if len(self._experience_buffer) < self.config.min_samples:
+                logger.info(
+                    f"[Pipeline] Not enough samples for training: "
+                    f"{len(self._experience_buffer)} < {self.config.min_samples}"
+                )
+                return None
+
+            # Move buffer to local variable and clear
+            experiences = self._experience_buffer.copy()
+            self._experience_buffer.clear()
+
+        logger.info(f"[Pipeline] Flushing {len(experiences)} experiences to training")
+
+        # Convert to interaction format expected by _build_dataset
+        class ExperienceInteraction:
+            """Adapter class to match TelemetryIngestor output format."""
+            def __init__(self, exp: Dict[str, Any]):
+                self.user_input = exp.get("user_input", "")
+                self.assistant_output = exp.get("assistant_output", "")
+                self.system_context = exp.get("system_context", "")
+                self.confidence = exp.get("confidence", 1.0)
+                self.timestamp = exp.get("timestamp", datetime.now().isoformat())
+                self.session_id = exp.get("session_id", "")
+                self.metadata = exp.get("metadata", {})
+
+        interactions = [ExperienceInteraction(exp) for exp in experiences]
+
+        # Run training cycle with these interactions
+        return await self._run_training_from_interactions(interactions)
+
+    async def _run_training_from_interactions(
+        self,
+        interactions: List[Any],
+    ) -> "PipelineResult":
+        """
+        Run training cycle from pre-processed interactions.
+
+        This is an internal method that bypasses telemetry collection
+        since we already have the interactions.
+        """
+        self._start_time = time.time()
+        result = PipelineResult(success=False, state=PipelineState.FAILED)
+
+        try:
+            await self._trinity.start(self._progress)
+
+            result.samples_used = len(interactions)
+            self._progress.samples_collected = len(interactions)
+
+            # Skip collection, go straight to preprocessing
+            await self._update_state(PipelineState.PREPROCESSING, "Building dataset from experiences")
+            train_dataset, eval_dataset = await self._build_dataset(interactions)
+
+            # Continue with normal training flow
+            await self._update_state(PipelineState.TRAINING, "Training model")
+
+            training_result = await self._train_model(train_dataset, eval_dataset)
+
+            if not training_result.success:
+                raise RuntimeError(f"Training failed: {training_result.error_message}")
+
+            result.adapter_path = training_result.adapter_path
+            result.model_path = training_result.merged_model_path or training_result.adapter_path
+            result.training_steps = training_result.total_steps
+            result.final_loss = training_result.final_loss
+            result.training_time_seconds = training_result.training_time_seconds
+
+            # Export and deploy as normal
+            if self.config.export_gguf and result.model_path:
+                await self._update_state(PipelineState.EXPORTING, "Exporting to GGUF")
+                result.gguf_path = await self._export_gguf(result.model_path)
+
+            if self.config.auto_deploy and (result.gguf_path or result.model_path):
+                await self._update_state(PipelineState.DEPLOYING, "Deploying to J-Prime")
+                result.deployed_to = await self._deploy_to_jprime(
+                    result.gguf_path or result.model_path
+                )
+
+            await self._update_state(PipelineState.COMPLETED, "Training from experiences complete")
+            result.success = True
+            result.state = PipelineState.COMPLETED
+
+            logger.info(
+                f"[Pipeline] Experience training complete: "
+                f"{result.training_steps} steps, loss={result.final_loss:.4f}"
+            )
+
+        except Exception as e:
+            import traceback
+            await self._update_state(PipelineState.FAILED, f"Failed: {e}")
+            result.error_message = str(e)
+            result.metrics["traceback"] = traceback.format_exc()
+            logger.error(f"[Pipeline] Experience training failed: {e}")
+
+        finally:
+            await self._trinity.stop()
+            result.total_time_seconds = time.time() - self._start_time
+
+        return result
 
     async def initialize(self) -> None:
         """Initialize pipeline components."""
@@ -955,6 +1183,115 @@ async def quick_finetune(
 
 
 # =============================================================================
+# Singleton Accessor
+# =============================================================================
+
+def get_unified_trainer(
+    config: Optional[PipelineConfig] = None,
+    progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
+    reinitialize: bool = False,
+) -> UnifiedTrainingPipeline:
+    """
+    Get the singleton UnifiedTrainingPipeline instance.
+
+    This function provides thread-safe access to a single training pipeline
+    instance, enabling the Trinity Loop integration where JARVIS can send
+    experiences to Reactor-Core for training.
+
+    Args:
+        config: Optional pipeline configuration (only used on first call
+            or when reinitialize=True).
+        progress_callback: Optional callback for progress updates (only used
+            on first call or when reinitialize=True).
+        reinitialize: If True, create a new instance even if one exists.
+            Use with caution as this may interrupt ongoing training.
+
+    Returns:
+        The singleton UnifiedTrainingPipeline instance.
+
+    Example:
+        >>> from reactor_core.training.unified_pipeline import get_unified_trainer
+        >>> trainer = get_unified_trainer()
+        >>> await trainer.add_experiences([
+        ...     {"user_input": "Hello", "assistant_output": "Hi there!"}
+        ... ])
+
+    Thread Safety:
+        This function uses double-checked locking to ensure thread-safe
+        singleton creation without excessive lock contention.
+    """
+    global _unified_trainer_instance
+
+    # Fast path: instance already exists and no reinitialization requested
+    if _unified_trainer_instance is not None and not reinitialize:
+        return _unified_trainer_instance
+
+    # Slow path: need to create instance (with lock)
+    with _unified_trainer_lock:
+        # Double-check after acquiring lock
+        if _unified_trainer_instance is not None and not reinitialize:
+            return _unified_trainer_instance
+
+        # Create new instance
+        _unified_trainer_instance = UnifiedTrainingPipeline(
+            config=config,
+            progress_callback=progress_callback,
+        )
+        logger.info("[Pipeline] Singleton UnifiedTrainingPipeline created")
+
+    return _unified_trainer_instance
+
+
+async def get_unified_trainer_async(
+    config: Optional[PipelineConfig] = None,
+    progress_callback: Optional[Callable[[PipelineProgress], None]] = None,
+    auto_initialize: bool = True,
+) -> UnifiedTrainingPipeline:
+    """
+    Get the singleton UnifiedTrainingPipeline instance with async initialization.
+
+    This is the preferred method when calling from async context as it ensures
+    the pipeline is fully initialized before returning.
+
+    Args:
+        config: Optional pipeline configuration.
+        progress_callback: Optional callback for progress updates.
+        auto_initialize: If True, automatically call initialize() on new instances.
+
+    Returns:
+        The initialized singleton UnifiedTrainingPipeline instance.
+
+    Example:
+        >>> trainer = await get_unified_trainer_async()
+        >>> await trainer.add_experiences(experience_data)
+    """
+    trainer = get_unified_trainer(
+        config=config,
+        progress_callback=progress_callback,
+    )
+
+    # Initialize if needed
+    if auto_initialize:
+        await trainer.initialize()
+
+    return trainer
+
+
+def reset_unified_trainer() -> None:
+    """
+    Reset the singleton instance to None.
+
+    This should only be used for testing or when explicitly cleaning up
+    resources. Any ongoing training will be interrupted.
+    """
+    global _unified_trainer_instance
+    with _unified_trainer_lock:
+        if _unified_trainer_instance is not None:
+            logger.info("[Pipeline] Resetting singleton UnifiedTrainingPipeline")
+            _unified_trainer_instance = None
+
+
+# =============================================================================
 # Exports
 # =============================================================================
 
@@ -967,6 +1304,10 @@ __all__ = [
     "PipelineState",
     # Trinity integration
     "TrinityHeartbeat",
+    # Singleton accessors
+    "get_unified_trainer",
+    "get_unified_trainer_async",
+    "reset_unified_trainer",
     # Convenience functions
     "run_night_shift",
     "quick_finetune",

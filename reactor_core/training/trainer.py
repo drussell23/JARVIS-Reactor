@@ -458,8 +458,13 @@ class AsyncTrainer:
             return False
 
     def _apply_lora(self, model) -> Any:
-        """Apply LoRA/QLoRA to model."""
+        """Apply LoRA/QLoRA to model with dynamic target module detection."""
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from reactor_core.training.lora import (
+            detect_model_architecture,
+            LoRAConfig as ReactorLoRAConfig,
+            TARGET_MODULES_MAP,
+        )
 
         logger.info(f"Applying LoRA (rank={self.config.lora_rank}, alpha={self.config.lora_alpha})")
 
@@ -470,12 +475,33 @@ class AsyncTrainer:
                 use_gradient_checkpointing=self.config.gradient_checkpointing,
             )
 
-        # LoRA config
+        # Dynamic target module detection
+        target_modules = self.config.lora_target_modules
+
+        # Check if using default hardcoded modules - if so, auto-detect
+        default_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        if target_modules == default_modules:
+            # Auto-detect architecture and get optimal target modules
+            model_arch = detect_model_architecture(model)
+            logger.info(f"[LoRA] Auto-detected model architecture: {model_arch}")
+
+            # Use ReactorLoRAConfig to get optimal target modules
+            lora_helper = ReactorLoRAConfig(
+                rank=self.config.lora_rank,
+                alpha=self.config.lora_alpha,
+                dropout=self.config.lora_dropout,
+            )
+            target_modules = lora_helper.get_target_modules(model_arch)
+            logger.info(f"[LoRA] Using dynamic target modules for {model_arch}: {target_modules}")
+        else:
+            logger.info(f"[LoRA] Using explicitly configured target modules: {target_modules}")
+
+        # LoRA config with dynamically detected modules
         self._peft_config = LoraConfig(
             r=self.config.lora_rank,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout,
-            target_modules=self.config.lora_target_modules,
+            target_modules=target_modules,
             bias="none",
             task_type="CAUSAL_LM",
         )
