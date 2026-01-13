@@ -907,6 +907,9 @@ class AGISupervisor:
         self._drift_detector: Optional[DriftDetector] = None
         self._resource_allocator: Optional[DynamicResourceAllocator] = None
 
+        # v101.0 Trinity Experience Receiver (closes the Trinity Loop)
+        self._experience_receiver = None
+
         # Background tasks
         self._tasks: List[asyncio.Task] = []
 
@@ -1040,6 +1043,15 @@ class AGISupervisor:
         # Wait for tasks to complete
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        # Stop v101.0 services first
+        if self._experience_receiver:
+            try:
+                from reactor_core.integration.trinity_experience_receiver import shutdown_experience_receiver
+                await shutdown_experience_receiver()
+                logger.info("  [OK] Trinity Experience Receiver stopped")
+            except Exception as e:
+                logger.warning(f"  Trinity Experience Receiver stop failed: {e}")
 
         # Stop v91.0 services first (they depend on v77.0 services)
         if self._distributed_coordinator:
@@ -1690,6 +1702,16 @@ class AGISupervisor:
 
         # Event processing
         self._tasks.append(asyncio.create_task(self._event_processing_loop()))
+
+        # v101.0: Start Trinity Experience Receiver (closes the Trinity Loop)
+        try:
+            from reactor_core.integration.trinity_experience_receiver import get_experience_receiver
+            self._experience_receiver = await get_experience_receiver()
+            logger.info("[OK] Trinity Experience Receiver started (Trinity Loop CLOSED)")
+        except ImportError:
+            logger.debug("Trinity Experience Receiver not available")
+        except Exception as e:
+            logger.warning(f"Trinity Experience Receiver failed to start: {e}")
 
     async def _health_monitor_loop(self) -> None:
         """Monitor component health and handle failures."""
