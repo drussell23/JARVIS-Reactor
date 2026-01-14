@@ -1,9 +1,16 @@
 """
-Trinity Event Publisher for Reactor-Core v1.0
+Trinity Event Publisher for Reactor-Core v2.0
 ==============================================
 
 This module enables Reactor-Core to publish events to the Trinity ecosystem.
 It writes events to the shared event directory that the Trinity Bridge Adapter watches.
+
+v2.0 FEATURES:
+- Dead Letter Queue (DLQ) for failed event retry
+- Pydantic schema validation for all events
+- Event versioning for schema evolution
+- Distributed tracing with trace IDs
+- Circuit breaker for fault tolerance
 
 THE LOOP:
     ┌─────────────────────────────────────────────────────────────────────────┐
@@ -65,7 +72,9 @@ import json
 import logging
 import os
 import time
+import traceback as tb
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -73,6 +82,170 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
+
+# Event schema version for evolution
+EVENT_SCHEMA_VERSION = "2.0"
+
+# =============================================================================
+# PYDANTIC VALIDATION (with graceful fallback)
+# =============================================================================
+
+try:
+    from pydantic import BaseModel, Field, validator, ValidationError
+
+    class ModelReadyEventSchema(BaseModel):
+        """Pydantic schema for MODEL_READY events."""
+        model_name: str = Field(..., min_length=1, max_length=200)
+        model_path: str = Field(..., description="Absolute path to model")
+        model_type: str = Field(default="llm")
+        capabilities: List[str] = Field(default_factory=lambda: ["text_generation"])
+        metadata: Dict[str, Any] = Field(default_factory=dict)
+        ready_at: str = Field(..., description="ISO timestamp")
+
+        @validator("model_path")
+        def validate_path(cls, v):
+            path = Path(v)
+            if not path.is_absolute():
+                raise ValueError(f"Model path must be absolute: {v}")
+            return str(path.resolve())
+
+        @validator("capabilities")
+        def validate_capabilities(cls, v):
+            valid = {"text_generation", "code_generation", "embeddings", "classification", "chat"}
+            # Allow any capabilities but log warning for unknown ones
+            unknown = set(v) - valid
+            if unknown:
+                logger.debug(f"Unknown capabilities (allowed): {unknown}")
+            return v
+
+    class TrainingEventSchema(BaseModel):
+        """Pydantic schema for training events."""
+        model_name: str = Field(..., min_length=1, max_length=200)
+        config: Dict[str, Any] = Field(default_factory=dict)
+        run_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
+        started_at: Optional[str] = None
+        completed_at: Optional[str] = None
+        metrics: Dict[str, Any] = Field(default_factory=dict)
+
+    HAS_PYDANTIC = True
+except ImportError:
+    HAS_PYDANTIC = False
+    ValidationError = Exception
+    logger.debug("Pydantic not available, schema validation disabled")
+
+# =============================================================================
+# DLQ AND CIRCUIT BREAKER
+# =============================================================================
+
+_dlq = None
+_circuit_breaker = None
+_dlq_lock = asyncio.Lock()
+
+
+async def _get_dlq():
+    """Get or create Dead Letter Queue for failed events."""
+    global _dlq
+    if _dlq is not None:
+        return _dlq
+
+    async with _dlq_lock:
+        if _dlq is not None:
+            return _dlq
+
+        try:
+            from reactor_core.utils.async_helpers import DeadLetterQueue
+            from reactor_core.config.base_config import resolve_path
+
+            dlq_path = resolve_path("dlq", env_var="REACTOR_DLQ_PATH", subdir="dlq")
+            _dlq = DeadLetterQueue(
+                name="trinity_publisher",
+                persist_path=dlq_path / "trinity_publisher_dlq.json",
+                auto_retry_interval=60.0,
+            )
+
+            # Register retry operations
+            _dlq.register_operation("publish_event", _retry_publish_event)
+
+            # Start auto-retry
+            await _dlq.start_auto_retry()
+            logger.info("[TRINITY] Dead Letter Queue initialized")
+
+        except ImportError:
+            logger.debug("DLQ not available")
+        except Exception as e:
+            logger.debug(f"DLQ initialization failed: {e}")
+
+    return _dlq
+
+
+async def _get_circuit_breaker():
+    """Get or create circuit breaker for event publishing."""
+    global _circuit_breaker
+    if _circuit_breaker is not None:
+        return _circuit_breaker
+
+    try:
+        from reactor_core.utils.async_helpers import CircuitBreaker, CircuitBreakerConfig
+
+        _circuit_breaker = CircuitBreaker(
+            "trinity_publisher",
+            CircuitBreakerConfig(
+                failure_threshold=5,
+                success_threshold=2,
+                timeout_seconds=30.0,
+            )
+        )
+        logger.debug("[TRINITY] Circuit breaker initialized")
+
+    except ImportError:
+        logger.debug("Circuit breaker not available")
+
+    return _circuit_breaker
+
+
+async def _retry_publish_event(event_dict: Dict[str, Any]) -> bool:
+    """Retry function for DLQ - republish failed event."""
+    event = ReactorEvent(
+        event_id=event_dict.get("event_id", uuid.uuid4().hex[:12]),
+        event_type=ReactorEventType(event_dict["event_type"]),
+        timestamp=event_dict.get("timestamp", datetime.now().isoformat()),
+        payload=event_dict.get("payload", {}),
+        metadata=event_dict.get("metadata", {}),
+    )
+    return await _publish_event_internal(event)
+
+
+# =============================================================================
+# DISTRIBUTED TRACING
+# =============================================================================
+
+_current_trace_id: Optional[str] = None
+
+
+def set_trace_id(trace_id: str) -> None:
+    """Set the current trace ID for distributed tracing."""
+    global _current_trace_id
+    _current_trace_id = trace_id
+
+
+def get_trace_id() -> str:
+    """Get current trace ID or generate a new one."""
+    global _current_trace_id
+    if _current_trace_id is None:
+        _current_trace_id = f"reactor-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    return _current_trace_id
+
+
+@asynccontextmanager
+async def trace_context(trace_id: Optional[str] = None):
+    """Context manager for distributed tracing."""
+    global _current_trace_id
+    old_trace_id = _current_trace_id
+    _current_trace_id = trace_id or get_trace_id()
+    try:
+        yield _current_trace_id
+    finally:
+        _current_trace_id = old_trace_id
 
 
 # =============================================================================
@@ -157,13 +330,16 @@ class ReactorEventType(Enum):
 
 @dataclass
 class ReactorEvent:
-    """An event from Reactor-Core."""
+    """An event from Reactor-Core with versioning and tracing."""
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     event_type: ReactorEventType = ReactorEventType.TRAINING_PROGRESS
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     payload: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     source: str = "reactor_core"
+    # v2.0: Add versioning and tracing
+    schema_version: str = EVENT_SCHEMA_VERSION
+    trace_id: str = field(default_factory=get_trace_id)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -173,42 +349,99 @@ class ReactorEvent:
             "payload": self.payload,
             "metadata": self.metadata,
             "source": self.source,
+            # v2.0 fields
+            "schema_version": self.schema_version,
+            "trace_id": self.trace_id,
         }
+
+
+async def _publish_event_internal(event: ReactorEvent) -> bool:
+    """
+    Internal publish function (without DLQ fallback).
+
+    Events are written as JSON files to ~/.jarvis/reactor/events/
+    The TrinityBridgeAdapter watches this directory and forwards events.
+    """
+    events_dir = _get_events_dir()
+
+    # Use timestamp prefix for ordering
+    timestamp_prefix = f"{int(time.time() * 1000):015d}"
+    event_file = events_dir / f"{timestamp_prefix}_{event.event_id}.json"
+
+    # Atomic write: write to temp then rename
+    temp_file = event_file.with_suffix(".tmp")
+
+    # Use asyncio.to_thread for file I/O
+    def write_event():
+        with open(temp_file, "w") as f:
+            json.dump(event.to_dict(), f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_file.rename(event_file)
+
+    try:
+        await asyncio.to_thread(write_event)
+    except AttributeError:
+        # Python < 3.9 fallback
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, write_event)
+
+    logger.info(
+        f"[TRINITY] Published {event.event_type.value}: "
+        f"{event.payload.get('model_name', 'N/A')} (trace={event.trace_id[:8]})"
+    )
+    return True
 
 
 async def _publish_event(event: ReactorEvent) -> bool:
     """
-    Publish an event to the Trinity ecosystem.
+    Publish an event to the Trinity ecosystem with fault tolerance.
 
-    Events are written as JSON files to ~/.jarvis/reactor/events/
-    The TrinityBridgeAdapter watches this directory and forwards events.
+    Features:
+    - Circuit breaker to prevent cascading failures
+    - Dead Letter Queue for retry on failure
+    - Distributed tracing support
     """
     if not _is_publishing_enabled():
         logger.debug("Event publishing disabled")
         return False
 
+    # Use circuit breaker if available
+    circuit_breaker = await _get_circuit_breaker()
+
     try:
-        events_dir = _get_events_dir()
+        if circuit_breaker:
+            # Execute through circuit breaker
+            async def publish_with_cb():
+                return await _publish_event_internal(event)
 
-        # Use timestamp prefix for ordering
-        timestamp_prefix = f"{int(time.time() * 1000):015d}"
-        event_file = events_dir / f"{timestamp_prefix}_{event.event_id}.json"
-
-        # Atomic write: write to temp then rename
-        temp_file = event_file.with_suffix(".tmp")
-
-        with open(temp_file, "w") as f:
-            json.dump(event.to_dict(), f, indent=2, default=str)
-            f.flush()
-            os.fsync(f.fileno())
-
-        temp_file.rename(event_file)
-
-        logger.info(f"[TRINITY] Published {event.event_type.value}: {event.payload.get('model_name', 'N/A')}")
-        return True
+            return await circuit_breaker.execute(publish_with_cb)
+        else:
+            # Direct execution
+            return await _publish_event_internal(event)
 
     except Exception as e:
         logger.error(f"[TRINITY] Failed to publish event: {e}")
+
+        # Add to DLQ for retry
+        dlq = await _get_dlq()
+        if dlq:
+            try:
+                await dlq.add(
+                    operation="publish_event",
+                    args=(),
+                    kwargs={"event_dict": event.to_dict()},
+                    exception=e,
+                    metadata={
+                        "event_id": event.event_id,
+                        "event_type": event.event_type.value,
+                        "trace_id": event.trace_id,
+                    },
+                )
+                logger.info(f"[TRINITY] Event {event.event_id} added to DLQ for retry")
+            except Exception as dlq_error:
+                logger.error(f"[TRINITY] Failed to add to DLQ: {dlq_error}")
+
         return False
 
 
@@ -357,6 +590,7 @@ async def publish_model_ready(
     capabilities: Optional[List[str]] = None,
     model_type: str = "llm",
     metadata: Optional[Dict[str, Any]] = None,
+    trace_id: Optional[str] = None,
 ) -> bool:
     """
     Publish MODEL_READY event (maps to MODEL_UPDATED).
@@ -370,23 +604,46 @@ async def publish_model_ready(
         capabilities: List of capabilities (text_generation, code_generation, etc.)
         model_type: Type of model (llm, embedding, etc.)
         metadata: Additional metadata
+        trace_id: Optional trace ID for distributed tracing
 
     Returns:
         True if published successfully
     """
     # Validate and resolve path
     validated_path = _validate_model_path(str(model_path))
+    ready_at = datetime.now().isoformat()
 
-    event = ReactorEvent(
-        event_type=ReactorEventType.MODEL_UPDATED,
-        payload={
+    # v2.0: Pydantic validation if available
+    if HAS_PYDANTIC:
+        try:
+            validated = ModelReadyEventSchema(
+                model_name=model_name,
+                model_path=str(validated_path),
+                model_type=model_type,
+                capabilities=capabilities or ["text_generation"],
+                metadata=metadata or {},
+                ready_at=ready_at,
+            )
+            # Use validated data
+            payload = validated.dict()
+        except ValidationError as e:
+            logger.error(f"[TRINITY] Invalid MODEL_READY event: {e}")
+            return False
+    else:
+        # Fallback without validation
+        payload = {
             "model_name": model_name,
-            "model_path": str(validated_path),  # Use validated absolute path
+            "model_path": str(validated_path),
             "model_type": model_type,
             "capabilities": capabilities or ["text_generation"],
             "metadata": metadata or {},
-            "ready_at": datetime.now().isoformat(),
-        },
+            "ready_at": ready_at,
+        }
+
+    event = ReactorEvent(
+        event_type=ReactorEventType.MODEL_UPDATED,
+        payload=payload,
+        trace_id=trace_id or get_trace_id(),
     )
     return await _publish_event(event)
 
@@ -464,6 +721,46 @@ def publish_model_ready_sync(
 
 
 # =============================================================================
+# LIFECYCLE MANAGEMENT
+# =============================================================================
+
+async def shutdown_publisher() -> None:
+    """Shutdown the publisher and cleanup resources."""
+    global _dlq, _circuit_breaker
+
+    if _dlq:
+        try:
+            await _dlq.stop_auto_retry()
+            logger.info("[TRINITY] Publisher DLQ stopped")
+        except Exception as e:
+            logger.debug(f"DLQ stop error: {e}")
+        _dlq = None
+
+    _circuit_breaker = None
+
+
+async def get_publisher_stats() -> Dict[str, Any]:
+    """Get publisher statistics."""
+    stats = {
+        "schema_version": EVENT_SCHEMA_VERSION,
+        "trace_id": get_trace_id(),
+        "dlq_available": _dlq is not None,
+        "circuit_breaker_available": _circuit_breaker is not None,
+        "pydantic_validation": HAS_PYDANTIC,
+    }
+
+    if _dlq:
+        dlq_stats = _dlq.get_stats()
+        stats["dlq"] = dlq_stats
+
+    if _circuit_breaker:
+        cb_stats = _circuit_breaker.get_stats()
+        stats["circuit_breaker"] = cb_stats
+
+    return stats
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -471,6 +768,7 @@ __all__ = [
     # Types
     "ReactorEventType",
     "ReactorEvent",
+    "EVENT_SCHEMA_VERSION",
     # Async functions
     "publish_training_started",
     "publish_training_progress",
@@ -481,4 +779,11 @@ __all__ = [
     "publish_training_started_sync",
     "publish_training_complete_sync",
     "publish_model_ready_sync",
+    # Tracing
+    "set_trace_id",
+    "get_trace_id",
+    "trace_context",
+    # Lifecycle
+    "shutdown_publisher",
+    "get_publisher_stats",
 ]

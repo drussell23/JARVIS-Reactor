@@ -705,6 +705,418 @@ class UnifiedConfig:
         return config
 
 
+# =============================================================================
+# VERSION COMPATIBILITY
+# =============================================================================
+
+# Current version of each component
+COMPONENT_VERSIONS = {
+    "reactor_core": "93.0",
+    "jarvis_agent": "12.0",
+    "jarvis_prime": "5.0",
+}
+
+# Compatibility matrix: what versions are compatible with what
+COMPATIBILITY_MATRIX = {
+    "reactor_core": {
+        "93.0": {
+            "jarvis_agent": (">=11.0", "<=15.0"),
+            "jarvis_prime": (">=4.0", "<=6.0"),
+        },
+        "92.0": {
+            "jarvis_agent": (">=10.0", "<=14.0"),
+            "jarvis_prime": (">=3.0", "<=5.0"),
+        },
+    }
+}
+
+
+@dataclass
+class VersionInfo:
+    """Version information for a component."""
+    component: str
+    version: str
+    api_version: str = "v1"
+    min_compatible: str = ""
+    max_compatible: str = ""
+    features: List[str] = field(default_factory=list)
+
+
+class VersionNegotiator:
+    """
+    Negotiate version compatibility across repositories.
+
+    Features:
+    - Check version compatibility before cross-repo operations
+    - Graceful degradation for version mismatches
+    - Feature flags based on version
+    """
+
+    def __init__(self):
+        self._version_cache: Dict[str, VersionInfo] = {}
+        self._http_pool: Optional[HTTPConnectionPool] = None
+
+    async def _get_pool(self) -> HTTPConnectionPool:
+        """Get HTTP connection pool."""
+        if self._http_pool is None:
+            self._http_pool = await HTTPConnectionPool.get_instance("version_negotiator")
+        return self._http_pool
+
+    async def check_compatibility(
+        self,
+        config: Optional[UnifiedConfig] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Check version compatibility with all configured services.
+
+        Returns:
+            Dict with compatibility status for each service.
+        """
+        if config is None:
+            config = get_config()
+
+        results = {}
+
+        # Check each service
+        for service_type, endpoint in config.services.items():
+            if service_type in (ServiceType.REDIS, ServiceType.POSTGRES):
+                continue  # Skip infrastructure services
+
+            result = await self._check_service_version(service_type, endpoint)
+            results[service_type.value] = result
+
+        return results
+
+    async def _check_service_version(
+        self,
+        service_type: ServiceType,
+        endpoint: ServiceEndpoint,
+    ) -> Dict[str, Any]:
+        """Check version of a specific service."""
+        result = {
+            "reachable": False,
+            "version": None,
+            "compatible": None,
+            "degraded_features": [],
+        }
+
+        try:
+            pool = await self._get_pool()
+            version_url = f"{endpoint.base_url}/version"
+
+            async with pool.request("GET", version_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    result["reachable"] = True
+                    result["version"] = data.get("version", "unknown")
+                    result["api_version"] = data.get("api_version", "v1")
+
+                    # Check compatibility
+                    compatible, degraded = self._is_compatible(
+                        service_type.value,
+                        result["version"],
+                    )
+                    result["compatible"] = compatible
+                    result["degraded_features"] = degraded
+
+                elif response.status == 404:
+                    # No version endpoint - assume compatible but degraded
+                    result["reachable"] = True
+                    result["version"] = "legacy"
+                    result["compatible"] = True
+                    result["degraded_features"] = ["version_check"]
+
+        except Exception as e:
+            logger.debug(f"Version check failed for {service_type.value}: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    def _is_compatible(
+        self,
+        service_name: str,
+        version: str,
+    ) -> tuple:
+        """
+        Check if a service version is compatible.
+
+        Returns:
+            Tuple of (is_compatible, degraded_features)
+        """
+        # Get our version compatibility requirements
+        our_version = COMPONENT_VERSIONS.get("reactor_core", "1.0")
+        matrix = COMPATIBILITY_MATRIX.get("reactor_core", {}).get(our_version, {})
+
+        if service_name not in matrix:
+            # No requirements - assume compatible
+            return True, []
+
+        min_ver, max_ver = matrix[service_name]
+
+        # Simple version comparison (semantic versioning)
+        try:
+            version_float = float(version.replace("v", "").split(".")[0])
+            min_float = float(min_ver.replace(">=", "").replace("v", "").split(".")[0])
+            max_float = float(max_ver.replace("<=", "").replace("v", "").split(".")[0])
+
+            if version_float < min_float:
+                return False, ["outdated_version"]
+            elif version_float > max_float:
+                return True, ["newer_version"]  # Compatible but may have new features
+            else:
+                return True, []
+
+        except (ValueError, IndexError):
+            # Can't parse version - assume compatible but degraded
+            return True, ["version_parse_error"]
+
+    def get_our_version(self) -> VersionInfo:
+        """Get version info for reactor_core."""
+        return VersionInfo(
+            component="reactor_core",
+            version=COMPONENT_VERSIONS.get("reactor_core", "1.0"),
+            api_version="v1",
+            features=[
+                "structured_concurrency",
+                "dlq_retry",
+                "event_versioning",
+                "distributed_tracing",
+                "connection_pooling",
+            ],
+        )
+
+
+# =============================================================================
+# CONFIGURATION HOT-RELOAD
+# =============================================================================
+
+_config_watchers: List[Callable] = []
+_hot_reload_task: Optional[asyncio.Task] = None
+
+
+def register_config_watcher(callback: Callable[[UnifiedConfig], None]) -> None:
+    """Register a callback for configuration changes."""
+    _config_watchers.append(callback)
+
+
+def unregister_config_watcher(callback: Callable[[UnifiedConfig], None]) -> None:
+    """Unregister a configuration change callback."""
+    if callback in _config_watchers:
+        _config_watchers.remove(callback)
+
+
+async def _notify_watchers(config: UnifiedConfig) -> None:
+    """Notify all watchers of configuration change."""
+    for watcher in _config_watchers:
+        try:
+            result = watcher(config)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.warning(f"Config watcher error: {e}")
+
+
+async def reload_config() -> UnifiedConfig:
+    """
+    Reload configuration from environment and notify watchers.
+
+    Call this after environment variables change or on SIGHUP.
+    """
+    global _config_instance
+
+    # Create new config (reads fresh from environment)
+    old_config = _config_instance
+    _config_instance = UnifiedConfig()
+
+    logger.info("Configuration reloaded")
+
+    # Notify watchers
+    await _notify_watchers(_config_instance)
+
+    return _config_instance
+
+
+def setup_signal_handlers() -> None:
+    """Setup signal handlers for hot-reload (SIGHUP)."""
+    import signal
+
+    def handle_sighup(signum, frame):
+        """Handle SIGHUP signal for config reload."""
+        logger.info("Received SIGHUP, reloading configuration...")
+        try:
+            # Schedule reload in event loop
+            loop = asyncio.get_running_loop()
+            loop.create_task(reload_config())
+        except RuntimeError:
+            # No running loop - reload synchronously
+            global _config_instance
+            _config_instance = UnifiedConfig()
+
+    # Only setup on Unix-like systems
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, handle_sighup)
+        logger.debug("SIGHUP handler registered for config hot-reload")
+
+
+async def start_config_file_watcher(
+    config_path: Optional[Path] = None,
+    poll_interval: float = 5.0,
+) -> None:
+    """
+    Start watching a config file for changes.
+
+    Args:
+        config_path: Path to config file (default: nightshift_work_dir/config.json)
+        poll_interval: How often to check for changes (seconds)
+    """
+    global _hot_reload_task
+
+    if _hot_reload_task and not _hot_reload_task.done():
+        return  # Already watching
+
+    config = get_config()
+    if config_path is None:
+        config_path = config.nightshift_work_dir / "config.json"
+
+    async def watch_loop():
+        """Watch config file for changes."""
+        last_mtime = 0.0
+
+        while True:
+            try:
+                if config_path.exists():
+                    current_mtime = config_path.stat().st_mtime
+                    if current_mtime > last_mtime:
+                        if last_mtime > 0:  # Not first check
+                            logger.info(f"Config file changed, reloading...")
+                            await reload_config()
+                        last_mtime = current_mtime
+
+                await asyncio.sleep(poll_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Config watcher error: {e}")
+                await asyncio.sleep(poll_interval)
+
+    _hot_reload_task = asyncio.create_task(watch_loop(), name="config_file_watcher")
+
+
+async def stop_config_file_watcher() -> None:
+    """Stop the config file watcher."""
+    global _hot_reload_task
+
+    if _hot_reload_task and not _hot_reload_task.done():
+        _hot_reload_task.cancel()
+        try:
+            await _hot_reload_task
+        except asyncio.CancelledError:
+            pass
+        _hot_reload_task = None
+
+
+# =============================================================================
+# GRACEFUL DEGRADATION
+# =============================================================================
+
+@dataclass
+class DegradedMode:
+    """Configuration for degraded operation mode."""
+    feature: str
+    enabled: bool = True
+    reason: str = ""
+    fallback_behavior: str = ""
+
+
+class GracefulDegradation:
+    """
+    Manage graceful degradation when components are unavailable.
+
+    Features:
+    - Feature flags based on component availability
+    - Fallback behaviors for missing dependencies
+    - Automatic recovery when components become available
+    """
+
+    def __init__(self):
+        self._degraded_modes: Dict[str, DegradedMode] = {}
+        self._recovery_callbacks: Dict[str, Callable] = {}
+
+    def set_degraded(
+        self,
+        feature: str,
+        reason: str,
+        fallback_behavior: str = "",
+    ) -> None:
+        """Mark a feature as degraded."""
+        self._degraded_modes[feature] = DegradedMode(
+            feature=feature,
+            enabled=False,
+            reason=reason,
+            fallback_behavior=fallback_behavior,
+        )
+        logger.warning(f"Feature '{feature}' degraded: {reason}")
+
+    def set_recovered(self, feature: str) -> None:
+        """Mark a feature as recovered."""
+        if feature in self._degraded_modes:
+            del self._degraded_modes[feature]
+            logger.info(f"Feature '{feature}' recovered")
+
+            # Call recovery callback if registered
+            if feature in self._recovery_callbacks:
+                try:
+                    callback = self._recovery_callbacks[feature]
+                    result = callback()
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
+                except Exception as e:
+                    logger.warning(f"Recovery callback error for {feature}: {e}")
+
+    def is_degraded(self, feature: str) -> bool:
+        """Check if a feature is degraded."""
+        return feature in self._degraded_modes
+
+    def get_degraded_features(self) -> List[DegradedMode]:
+        """Get all degraded features."""
+        return list(self._degraded_modes.values())
+
+    def register_recovery_callback(
+        self,
+        feature: str,
+        callback: Callable,
+    ) -> None:
+        """Register callback to be called when feature recovers."""
+        self._recovery_callbacks[feature] = callback
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get degradation status."""
+        return {
+            "degraded_count": len(self._degraded_modes),
+            "degraded_features": [
+                {
+                    "feature": mode.feature,
+                    "reason": mode.reason,
+                    "fallback": mode.fallback_behavior,
+                }
+                for mode in self._degraded_modes.values()
+            ],
+        }
+
+
+# Global degradation manager
+_degradation_manager: Optional[GracefulDegradation] = None
+
+
+def get_degradation_manager() -> GracefulDegradation:
+    """Get the global degradation manager."""
+    global _degradation_manager
+    if _degradation_manager is None:
+        _degradation_manager = GracefulDegradation()
+    return _degradation_manager
+
+
 # Global singleton instance
 _config_instance: Optional[UnifiedConfig] = None
 
@@ -725,14 +1137,33 @@ def reset_config() -> None:
 
 # Convenience exports
 __all__ = [
+    # Core config
     "UnifiedConfig",
     "ServiceType",
     "ServiceEndpoint",
     "RepoConfig",
     "Environment",
+    # Connection pooling
     "ConnectionPoolConfig",
     "HTTPConnectionPool",
     "RedisConnectionPool",
+    # Version compatibility
+    "VersionInfo",
+    "VersionNegotiator",
+    "COMPONENT_VERSIONS",
+    "COMPATIBILITY_MATRIX",
+    # Hot-reload
+    "register_config_watcher",
+    "unregister_config_watcher",
+    "reload_config",
+    "setup_signal_handlers",
+    "start_config_file_watcher",
+    "stop_config_file_watcher",
+    # Graceful degradation
+    "DegradedMode",
+    "GracefulDegradation",
+    "get_degradation_manager",
+    # Singleton management
     "get_config",
     "reset_config",
 ]

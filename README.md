@@ -7,6 +7,7 @@ JARVIS Reactor (formerly Reactor Core) is the "nervous system" of the JARVIS AGI
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Version](https://img.shields.io/badge/version-2.10.0-blue.svg)](https://github.com/drussell23/JARVIS-Reactor)
 
 ---
 
@@ -14,14 +15,18 @@ JARVIS Reactor (formerly Reactor Core) is the "nervous system" of the JARVIS AGI
 
 JARVIS Reactor is a production-grade ML infrastructure combining:
 
-- **Advanced Training Methods**: DPO, RLHF, Constitutional AI, Curriculum Learning
-- **Model Serving**: Hot-reload model server with multi-backend support (vLLM, llama.cpp, MLX)
-- **Async Infrastructure**: Circuit breakers, backpressure, bulkheads, dead letter queues
+- **Advanced Training Methods**: DPO, RLHF, Constitutional AI, Curriculum Learning, Meta-Learning, World Models, Causal Reasoning
+- **Model Serving**: Hot-reload model server with multi-backend support (vLLM, llama.cpp, MLX, Transformers)
+- **Async Infrastructure**: Circuit breakers, backpressure, bulkheads, dead letter queues, structured concurrency
 - **API Platform**: FastAPI server with telemetry, scheduling, model registry, health monitoring
 - **Trinity Orchestration**: Multi-repo coordination with heartbeat monitoring and state sync
 - **Event Streaming**: Real-time WebSocket/Redis pub-sub across JARVIS ecosystem
 - **GCP Integration**: Spot VM resilience, Cloud SQL storage, auto-checkpointing
 - **MLForge C++ Core**: High-performance ML primitives (optional submodule)
+- **Unified Supervisor**: One-command startup for entire AGI OS ecosystem (`python3 run_supervisor.py`)
+- **Connection Pooling**: Efficient HTTP/Redis connection management with automatic lifecycle
+- **Dynamic Configuration**: Zero hardcoding, XDG-compliant paths, environment-driven config
+- **Structured Concurrency**: Python 3.11+ TaskGroup patterns for robust async operations
 
 ---
 
@@ -31,16 +36,20 @@ JARVIS Reactor is a production-grade ML infrastructure combining:
 - [Key Features](#key-features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Unified Supervisor (One-Command Startup)](#unified-supervisor-one-command-startup)
 - [Advanced Features](#advanced-features)
-  - [Advanced Training Methods (v76.0)](#advanced-training-methods-v760)
-  - [Async Infrastructure (v76.1)](#async-infrastructure-v761)
+  - [Advanced Training Methods (v76.0-v80.0)](#advanced-training-methods-v760-v800)
+  - [Async Infrastructure (v76.1, v92.0)](#async-infrastructure-v761-v920)
   - [API Server & Telemetry (v77.0)](#api-server--telemetry-v770)
   - [Model Serving & Hot Reload (v77.1)](#model-serving--hot-reload-v771)
   - [Trinity Orchestrator (v75.0)](#trinity-orchestrator-v750)
+  - [Online Learning & Data Versioning (v91.0)](#online-learning--data-versioning-v910)
+  - [Distributed Training (v91.0)](#distributed-training-v910)
 - [Integration Architecture](#integration-architecture)
+- [Configuration Guide](#configuration-guide)
 - [API Documentation](#api-documentation)
-- [Configuration](#configuration)
-- [Development](#development)
+- [Troubleshooting](#troubleshooting)
+- [Development Guide](#development-guide)
 - [Version History](#version-history)
 - [Links](#links)
 
@@ -48,71 +57,145 @@ JARVIS Reactor is a production-grade ML infrastructure combining:
 
 ## 🏗️ Architecture
 
+### System Overview
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        REACTOR CORE v77.1                            │
+│                  AGI OS UNIFIED SUPERVISOR v92.0                   │
+│                    (Central Coordination Hub)                       │
+│                    python3 run_supervisor.py                        │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+    ┌─────────┐       ┌─────────────┐       ┌─────────┐
+    │ JARVIS  │◄─────►│   TRINITY   │◄─────►│ J-PRIME │
+    │ (Body)  │Events │ ORCHESTRATOR│Events │ (Mind)  │
+    │         │       │             │       │         │
+    │ macOS   │       │ Heartbeats  │       │ LLM     │
+    │ Actions │       │ Commands    │       │ Inference
+    └─────────┘       │ State Sync  │       └─────────┘
+                      └─────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+      ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+      │REACTOR CORE │  │  ONLINE     │  │ DISTRIBUTED │
+      │  (Nerves)   │  │  LEARNING   │  │  TRAINING   │
+      │             │  │             │  │             │
+      │ Training    │  │ Experience  │  │ Multi-VM    │
+      │ Learning    │  │ Replay      │  │ Gradient    │
+      │ Serving     │  │ EWC/Drift   │  │ Sync        │
+      └─────────────┘  └─────────────┘  └─────────────┘
+```
+
+### Reactor Core Internal Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        REACTOR CORE v2.10.0                         │
 │                    (AGI OS Nervous System)                           │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                   UNIFIED API SERVER (v77.0)                  │   │
+│  │              UNIFIED API SERVER (v77.0)                       │   │
 │  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐  │   │
 │  │  │ Telemetry   │  │  Night      │  │  Model               │  │   │
 │  │  │ Collector   │  │  Scheduler  │  │  Registry            │  │   │
+│  │  │ + WebSocket │  │ + Cron Jobs │  │ + A/B Testing         │  │   │
 │  │  └─────────────┘  └─────────────┘  └──────────────────────┘  │   │
+│  │  ┌─────────────┐  ┌─────────────┐                             │   │
+│  │  │ Health      │  │ Cost       │                             │   │
+│  │  │ Aggregator  │  │ Tracker    │                             │   │
+│  │  └─────────────┘  └─────────────┘                             │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                HOT-RELOAD MODEL SERVER (v77.1)                │   │
-│  │  • Multi-backend support (vLLM, llama.cpp, MLX, Transformers)│   │
-│  │  • Zero-downtime model swaps                                  │   │
-│  │  • LRU cache + semantic response caching                      │   │
-│  │  • Priority request queue                                     │   │
+│  │         HOT-RELOAD MODEL SERVER (v77.1)                      │   │
+│  │  • Multi-backend: vLLM, llama.cpp, MLX, Transformers        │   │
+│  │  • Zero-downtime model swaps via file watcher                │   │
+│  │  • LRU cache with memory-aware eviction                      │   │
+│  │  • Priority request queue for SLA compliance                 │   │
+│  │  • Semantic response caching (hash-based deduplication)      │   │
+│  │  • Circuit breaker for backend failure protection            │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │            ADVANCED TRAINING ENGINE (v76.0)                   │   │
+│  │      ADVANCED TRAINING ENGINE (v76.0-v80.0)                   │   │
 │  │                                                                │   │
 │  │   Experience Buffer → Data Selector → Training Router         │   │
 │  │                               │                                │   │
-│  │       ┌───────────────────────┼───────────────────────┐        │   │
-│  │       │                       │                       │        │   │
-│  │       ▼                       ▼                       ▼        │   │
+│  │   ┌───────────────────────────┼───────────────────────────┐   │   │
+│  │   │                           │                           │   │
+│  │   ▼                           ▼                           ▼   │   │
 │  │   DPO Trainer          RLHF Pipeline        Constitutional AI │   │
 │  │   • Preference         • PPO Algorithm       • Self-supervised│   │
 │  │     Learning           • Reward Modeling     • Safety         │   │
 │  │   • Memory Efficient   • Value Functions     • Alignment      │   │
 │  │                                                                │   │
+│  │   Curriculum Learning  Meta-Learning        World Models     │   │
+│  │   • Progressive        • MAML/Reptile       • Latent dynamics │   │
+│  │     difficulty         • Few-shot learning   • Planning        │   │
+│  │   • Adaptive           • Task adaptation     • Counterfactual │   │
+│  │     scheduling                                 reasoning       │   │
+│  │                                                                │   │
+│  │   Causal Reasoning    FSDP Training        Federated Learning│   │
+│  │   • SCMs              • Multi-GPU/Node      • Cross-repo      │   │
+│  │   • Do-calculus       • Gradient sharding   • Byzantine-robust│   │
+│  │   • Causal discovery  • Memory efficient    • Privacy-preserving│   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │           ASYNC INFRASTRUCTURE (v76.1)                        │   │
-│  │  • CircuitBreaker    • Backpressure    • DeadLetterQueue     │   │
-│  │  • Bulkhead          • HealthMonitor   • AdaptiveRateLimiter  │   │
-│  │  • TimeoutPolicy     • MetricsCollector • AsyncRetry          │   │
+│  │    ASYNC INFRASTRUCTURE (v76.1, v92.0)                        │   │
+│  │  • CircuitBreaker      • Backpressure      • DeadLetterQueue │   │
+│  │  • Bulkhead            • HealthMonitor     • AdaptiveRateLimiter│   │
+│  │  • TimeoutPolicy       • MetricsCollector  • AsyncRetry       │   │
+│  │  • StructuredTaskGroup • ConnectionPool     • AsyncBarrier     │   │
+│  │  • AsyncContextGroup   • AsyncLatch        • ScatterGather    │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │              TRINITY ORCHESTRATOR (v75.0)                     │   │
-│  │  • Multi-repo heartbeat monitoring                            │   │
-│  │  • Command routing with load balancing                        │   │
-│  │  • State reconciliation                                       │   │
-│  │  • Dead Letter Queue for failed commands                      │   │
-│  │  • Atomic file I/O (v73.0)                                    │   │
+│  │         TRINITY ORCHESTRATOR (v75.0)                           │   │
+│  │  • Multi-repo heartbeat monitoring (JARVIS, Prime, Reactor)  │   │
+│  │  • Command routing with intelligent load balancing            │   │
+│  │  • State reconciliation across distributed system             │   │
+│  │  • Dead Letter Queue for failed commands with auto-retry      │   │
+│  │  • Atomic file I/O (zero-corruption operations)              │   │
+│  │  • Circuit breakers for fault tolerance                       │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                EVENT STREAMING (v10.3)                        │   │
-│  │  • WebSocket real-time events                                 │   │
-│  │  • Redis pub/sub (optional)                                   │   │
-│  │  • Safety audit trail                                         │   │
+│  │    ONLINE LEARNING & DATA VERSIONING (v91.0)                  │   │
+│  │  • Prioritized experience replay with importance sampling     │   │
+│  │  • Elastic Weight Consolidation (EWC) - prevents forgetting  │   │
+│  │  • Concept Drift Detection (Page-Hinkley test)                │   │
+│  │  • Data Versioning: Content-addressed storage (DVC compatible)│   │
+│  │  • Lineage tracking and reproducibility                       │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │    DISTRIBUTED TRAINING (v91.0)                               │   │
+│  │  • Multi-VM coordination with gradient compression            │   │
+│  │  • GCP Spot VM checkpointing with predictive preemption       │   │
+│  │  • Dynamic resource allocation with cost-aware decisions      │   │
+│  │  • Gradient checksum validation                               │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │         EVENT STREAMING (v10.3)                               │   │
+│  │  • WebSocket real-time events with priority queues            │   │
+│  │  • Redis pub/sub (optional) for scale                          │   │
+│  │  • Safety audit trail with kill switch                        │   │
 │  │  • Cost tracking & budget alerts                              │   │
+│  │  • Multi-transport: WebSocket, file-watching, Redis            │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │         ▼                       ▼                      ▼             │
 │  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐      │
 │  │  MLForge C++ │      │  Cloud SQL   │      │ GCP Storage  │      │
 │  │   (Optional) │      │  (Events DB) │      │(Checkpoints) │      │
+│  │  pybind11    │      │  PostgreSQL  │      │  GCS Bucket  │      │
 │  └──────────────┘      └──────────────┘      └──────────────┘      │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
@@ -450,8 +533,10 @@ print(f"Reactor: {health['reactor'].status}")
 
 ### Unified Supervisor (One-Command Startup)
 
+The unified supervisor (`run_supervisor.py`) is the **single entry point** for starting the entire AGI OS ecosystem. It automatically discovers, starts, and coordinates JARVIS, JARVIS Prime, and Reactor Core.
+
 ```bash
-# Start entire AGI OS ecosystem
+# Start entire AGI OS ecosystem (recommended)
 python3 run_supervisor.py
 
 # With specific components
@@ -459,33 +544,516 @@ python3 run_supervisor.py --components jarvis,prime,reactor
 
 # Development mode (verbose logging)
 python3 run_supervisor.py --dev --log-level DEBUG
+
+# Custom ports
+python3 run_supervisor.py --api-port 8003 --serving-port 8001 --jprime-port 8000
+
+# Disable specific features
+python3 run_supervisor.py --no-online-learning --no-distributed
+
+# GCP Spot VM mode
+python3 run_supervisor.py --gcp-project my-project --checkpoint-bucket my-bucket
+```
+
+**What the Supervisor Does:**
+
+1. **Component Discovery**: Automatically finds JARVIS, JARVIS Prime, and Reactor Core repos
+2. **Health Monitoring**: Continuous health checks with automatic recovery
+3. **Event Bridge**: Sets up real-time event streaming between components
+4. **Trinity Orchestration**: Initializes multi-repo coordination
+5. **Service Startup**: Starts all Reactor Core services (API, Model Server, Training, etc.)
+6. **Experience Collection**: Continuous learning from JARVIS interactions
+7. **Graceful Shutdown**: Clean shutdown of all components on Ctrl+C
+
+**Startup Phases:**
+
+```
+Phase 1: Initialize Trinity Orchestrator
+Phase 2: Initialize Event Bridge
+Phase 3: Discover Components
+Phase 4: Start Reactor Core Services
+Phase 5: Initialize v91.0 Advanced Services
+Phase 6: Start JARVIS (Body)
+Phase 7: Start J-Prime (Mind)
+Phase 8: Start Background Tasks
+Phase 9: Wait for Component Health
+```
+
+**Output Example:**
+
+```
+======================================================================
+           AGI OS UNIFIED SUPERVISOR - PROJECT TRINITY
+======================================================================
+
+[Phase 1] Initializing Trinity Orchestrator...
+[OK] Trinity Orchestrator running
+
+[Phase 2] Initializing Event Bridge...
+[OK] Event Bridge running
+
+[Phase 3] Discovering components...
+  Found JARVIS at /path/to/JARVIS-AI-Agent
+  Found J-Prime at /path/to/jarvis-prime
+  Reactor Core at /path/to/reactor-core
+
+[Phase 4] Starting Reactor Core services...
+  [OK] Telemetry Collector started
+  [OK] Model Registry initialized (5 models)
+  [OK] Health Aggregator started
+  [OK] Scheduler started (daily/weekly training)
+  [OK] Model Server started
+
+[Phase 5] Initializing v91.0 Advanced Services...
+  [OK] Online Learning Engine started
+  [OK] Distributed Coordinator started
+  [OK] Data Version Controller started
+  [OK] Spot VM Checkpointer started
+
+[Phase 6] Starting JARVIS (Body)...
+[OK] JARVIS started (PID: 12345)
+
+[Phase 7] Starting J-Prime (Mind)...
+[OK] J-Prime started (PID: 12346)
+
+[Phase 8] Starting background services...
+[OK] Health monitoring started
+[OK] Experience collection started
+[OK] Event processing started
+
+[Phase 9] Waiting for component health...
+======================================================================
+            AGI OS READY - All Systems Operational
+======================================================================
+
+Component Status:
+  JARVIS:      ✅ Running (http://localhost:8000)
+  J-Prime:     ✅ Running (http://localhost:8001)
+  Reactor API: ✅ Running (http://localhost:8003)
+  Model Server: ✅ Running (http://localhost:8004)
+
+Background Services:
+  Health Monitor:      ✅ Active
+  Experience Collector: ✅ Active (0 experiences collected)
+  Event Processor:     ✅ Active
+  Trinity Experience Receiver: ✅ Active
+
+Press Ctrl+C to shutdown gracefully...
 ```
 
 ---
 
 ## 🔬 Advanced Features
 
-### Advanced Training Methods (v76.0)
+### Advanced Training Methods (v76.0-v80.0)
 
-Comprehensive documentation for DPO, RLHF, Constitutional AI, Curriculum Learning with code examples for memory management, experience replay, and multi-GPU training.
+#### DPO (Direct Preference Optimization)
 
-### Async Infrastructure (v76.1)
+Train models on preference pairs without reward models:
 
-Production-ready async patterns including circuit breakers, backpressure management, dead letter queues, health monitoring, and adaptive rate limiting.
+```python
+from reactor_core.training.advanced_training import DPOTrainer, DPOConfig
 
-### API Server & Telemetry (v77.0)
+config = DPOConfig(
+    model_name="llama-2-7b",
+    beta=0.1,  # KL divergence penalty
+    learning_rate=5e-7,
+    max_length=512,
+)
 
-FastAPI server with telemetry collection, Night Shift scheduling, model registry, health aggregation, and real-time WebSocket streaming.
+trainer = DPOTrainer(config)
+await trainer.train(
+    preference_dataset=PreferenceDataset(
+        chosen_responses=chosen_data,
+        rejected_responses=rejected_data,
+    ),
+    num_epochs=3,
+)
+```
 
-### Model Serving & Hot Reload (v77.1)
+**Variants Supported:**
+- Standard DPO
+- IPO (Identity Preference Optimization)
+- KTO (Kahneman-Tversky Optimization)
+- ORPO (Odds Ratio Preference Optimization)
 
-Zero-downtime model serving with hot-reload, multi-backend support (vLLM, llama.cpp, MLX, Transformers), LRU caching, and semantic response caching.
+#### RLHF (Reinforcement Learning from Human Feedback)
 
-### Trinity Orchestrator (v75.0)
+Full PPO pipeline with reward modeling:
 
-Multi-repo coordination with heartbeat monitoring, command routing, state reconciliation, dead letter queue, and atomic file I/O.
+```python
+from reactor_core.training.advanced_training import RLHFTrainer, RLHFConfig
 
-*(See full documentation in sections below)*
+config = RLHFConfig(
+    model_name="llama-2-7b",
+    reward_model_name="reward-model",
+    ppo_config={
+        "clip_epsilon": 0.2,
+        "value_coef": 0.1,
+        "entropy_coef": 0.01,
+    },
+)
+
+trainer = RLHFTrainer(config)
+await trainer.train(
+    preference_dataset=preference_data,
+    num_epochs=3,
+)
+```
+
+#### Curriculum Learning (v79.0)
+
+Progressive difficulty scheduling for faster convergence:
+
+```python
+from reactor_core.training.curriculum_learning import CurriculumLearner
+
+curriculum = CurriculumLearner(
+    model=model,
+    dataset=dataset,
+    difficulty_metric="perplexity",
+    progression_strategy="exponential",  # or "linear", "adaptive"
+)
+
+# Automatic difficulty progression
+await curriculum.train(num_epochs=10)
+```
+
+**Benefits:** 30-50% faster convergence, better generalization
+
+#### Meta-Learning (v79.0)
+
+Few-shot learning with MAML, Reptile, Meta-SGD:
+
+```python
+from reactor_core.training.meta_learning import MAMLTrainer
+
+maml = MAMLTrainer(
+    model=model,
+    inner_lr=0.01,
+    outer_lr=0.001,
+    adaptation_steps=5,
+)
+
+# Learn to learn from few examples
+await maml.meta_train(
+    tasks=task_distribution,
+    meta_batch_size=4,
+    num_meta_iterations=1000,
+)
+```
+
+#### World Model Training (v80.0)
+
+Learn latent dynamics for planning and counterfactual reasoning:
+
+```python
+from reactor_core.training.world_model_training import WorldModelTrainer
+
+world_model = WorldModelTrainer(
+    latent_dim=512,
+    action_dim=128,
+    reward_dim=1,
+)
+
+await world_model.train(
+    trajectories=trajectory_data,
+    num_epochs=100,
+)
+
+# Counterfactual reasoning: "What if I had done X?"
+counterfactual = await world_model.imagine_rollout(
+    initial_state=state,
+    alternative_action=action,
+    horizon=10,
+)
+```
+
+#### Causal Reasoning (v80.0)
+
+Understand cause-effect relationships:
+
+```python
+from reactor_core.training.causal_reasoning import CausalReasoner
+
+reasoner = CausalReasoner(
+    model=model,
+    causal_graph=graph,
+)
+
+# Do-calculus: P(Y | do(X))
+interventional_prob = await reasoner.interventional_inference(
+    intervention={"X": value},
+    query="Y",
+)
+
+# Causal discovery
+discovered_graph = await reasoner.discover_causality(data)
+```
+
+### Async Infrastructure (v76.1, v92.0)
+
+#### Structured Concurrency (v92.0+)
+
+Python 3.11+ compatible structured concurrency with TaskGroup:
+
+```python
+from reactor_core.utils.async_helpers import StructuredTaskGroup, run_in_task_group
+
+# Structured task group with automatic error handling
+async with StructuredTaskGroup(
+    name="training_pipeline",
+    max_concurrent=5,
+    cancel_on_error=True,
+    timeout_seconds=3600.0,
+) as tg:
+    tg.create_task(load_data(), name="data_loading")
+    tg.create_task(preprocess_data(), name="preprocessing")
+    tg.create_task(train_model(), name="training")
+    tg.create_task(validate_model(), name="validation")
+
+# Get results
+results = tg.results
+for result in results:
+    if result.success:
+        print(f"{result.name}: {result.result}")
+    else:
+        print(f"{result.name}: {result.exception}")
+
+# Convenience function
+results = await run_in_task_group(
+    [fetch_url(url) for url in urls],
+    names=[f"fetch_{i}" for i in range(len(urls))],
+    max_concurrent=10,
+)
+```
+
+#### Connection Pooling (v92.0+)
+
+Efficient HTTP and Redis connection management:
+
+```python
+from reactor_core.config.unified_config import (
+    HTTPConnectionPool,
+    RedisConnectionPool,
+    ConnectionPoolConfig,
+)
+
+# HTTP connection pool
+pool = await HTTPConnectionPool.get_instance("api_client")
+async with pool.request("GET", "https://api.example.com/data") as response:
+    data = await response.json()
+
+# Redis connection pool
+redis_pool = await RedisConnectionPool.get_instance()
+client = await redis_pool.get_client(host="localhost", port=6379)
+await client.set("key", "value")
+```
+
+**Features:**
+- Singleton pattern per configuration
+- Automatic session lifecycle management
+- Connection reuse with keepalive
+- Configurable pool sizes via environment variables
+
+#### Circuit Breaker
+
+Automatic failure detection and recovery:
+
+```python
+from reactor_core.utils.async_helpers import CircuitBreaker
+
+breaker = CircuitBreaker(
+    failure_threshold=5,
+    recovery_timeout=60.0,
+    half_open_max_calls=3,
+)
+
+@breaker.protect
+async def risky_operation():
+    # This will be protected by circuit breaker
+    return await external_api_call()
+
+# Circuit states: CLOSED → OPEN → HALF_OPEN → CLOSED
+```
+
+#### Backpressure Control
+
+Prevents memory exhaustion under high load:
+
+```python
+from reactor_core.utils.async_helpers import BackpressureController
+
+controller = BackpressureController(
+    max_queue_size=1000,
+    queue_full_strategy="reject",  # or "block", "drop_oldest"
+)
+
+async def process_item(item):
+    await controller.acquire()
+    try:
+        await process(item)
+    finally:
+        controller.release()
+```
+
+#### Dead Letter Queue
+
+Failed operation tracking and automatic retry:
+
+```python
+from reactor_core.utils.async_helpers import DeadLetterQueue
+
+dlq = DeadLetterQueue(
+    name="training_operations",
+    persist_path=Path("/tmp/dlq"),
+    auto_retry_interval=300.0,  # Retry every 5 minutes
+)
+
+# Register operation for retry
+dlq.register_operation("publish_model_ready", publish_model_ready_func)
+
+# Add failed operation
+await dlq.add(
+    operation="publish_model_ready",
+    args=(model_name, model_path),
+    kwargs={},
+    exception=exception,
+)
+
+# Automatic retry with exponential backoff
+```
+
+### Online Learning & Data Versioning (v91.0)
+
+#### Prioritized Experience Replay
+
+Learn continuously from JARVIS interactions:
+
+```python
+from reactor_core.training.online_learning import OnlineLearningEngine
+
+engine = OnlineLearningEngine(
+    buffer_size=100000,
+    importance_sampling=True,
+    ewc_lambda=100.0,  # Elastic Weight Consolidation
+)
+
+# Add experiences from JARVIS
+await engine.add_experience({
+    "user_input": "Hello",
+    "assistant_output": "Hi there!",
+    "feedback": "positive",
+})
+
+# Trigger incremental update
+await engine.incremental_update(
+    model=model,
+    batch_size=32,
+    num_steps=100,
+)
+```
+
+#### Concept Drift Detection
+
+Automatic model adaptation when data distribution changes:
+
+```python
+from reactor_core.training.online_learning import DriftDetector
+
+detector = DriftDetector(
+    threshold=0.1,
+    window_size=1000,
+    test_type="page_hinkley",  # or "adwin", "kswin"
+)
+
+# Monitor for drift
+drift_detected = await detector.check_drift(
+    current_batch=recent_data,
+    reference_batch=historical_data,
+)
+
+if drift_detected:
+    # Trigger model retraining
+    await retrain_model()
+```
+
+#### Data Versioning
+
+Content-addressed storage with lineage tracking:
+
+```python
+from reactor_core.data.versioning import DataVersionController
+
+controller = DataVersionController(
+    version_store_path=Path("/data/versions"),
+)
+
+# Version a dataset
+version = await controller.create_version(
+    dataset_path=Path("/data/train.jsonl"),
+    metadata={"source": "jarvis_interactions", "date": "2025-01-15"},
+)
+
+# Get version lineage
+lineage = await controller.get_lineage(version.id)
+print(f"Version {version.id} derived from {lineage.parent_id}")
+
+# Reproduce exact dataset
+dataset = await controller.load_version(version.id)
+```
+
+### Distributed Training (v91.0)
+
+#### Multi-VM Coordination
+
+Train across multiple GCP Spot VMs with gradient compression:
+
+```python
+from reactor_core.training.distributed_coordinator import DistributedCoordinator
+
+coordinator = DistributedCoordinator(
+    num_workers=8,
+    gradient_compression="fp16",  # or "int8", "sparse"
+    checkpoint_interval=300,  # seconds
+)
+
+# Start distributed training
+await coordinator.start_training(
+    model=model,
+    dataset=dataset,
+    num_epochs=10,
+)
+
+# Automatic checkpoint/resume on VM preemption
+```
+
+#### GCP Spot VM Checkpointing
+
+Predictive preemption detection and automatic resume:
+
+```python
+from reactor_core.gcp.checkpointer import SpotVMCheckpointer
+
+checkpointer = SpotVMCheckpointer(
+    gcs_bucket="my-checkpoints",
+    checkpoint_interval=300,
+    enable_preemption_prediction=True,
+)
+
+# Automatic checkpointing during training
+async with checkpointer.protect_training():
+    await train_model()
+
+# Resume from latest checkpoint
+await checkpointer.resume_training()
+```
+
+**Preemption Signals Monitored:**
+- GCP metadata API warnings
+- System load spikes
+- Network latency increases
+- Memory pressure indicators
 
 ---
 
@@ -545,7 +1113,328 @@ Multi-repo coordination with heartbeat monitoring, command routing, state reconc
 
 ---
 
+## ⚙️ Configuration Guide
+
+### Environment Variables
+
+JARVIS Reactor uses environment variables for all configuration (zero hardcoding):
+
+```bash
+# Path Configuration (XDG-compliant defaults)
+export JARVIS_EVENTS_DIR="/custom/path/events"
+export TRINITY_EVENTS_DIR="/custom/path/trinity/events"
+export EXPERIENCE_QUEUE_DIR="/custom/path/experience_queue"
+export MODEL_REGISTRY_PATH="/custom/path/models"
+export DATA_VERSION_PATH="/custom/path/data_versions"
+
+# API Configuration
+export AGI_API_PORT=8003
+export AGI_SERVING_PORT=8001
+export AGI_JPRIME_PORT=8000
+
+# Connection Pooling
+export HTTP_POOL_SIZE=100
+export HTTP_POOL_PER_HOST=10
+export HTTP_KEEPALIVE_TIMEOUT=30.0
+export REDIS_POOL_SIZE=10
+
+# Training Configuration
+export REACTOR_EXPERIENCE_BUFFER_THRESHOLD=100
+export REACTOR_AUTO_TRAINING_THRESHOLD=1000
+export REACTOR_CHECKPOINT_INTERVAL=300
+
+# GCP Configuration
+export GCP_PROJECT_ID="my-project"
+export GCP_CHECKPOINT_BUCKET="my-checkpoints"
+export GCP_SPOT_VM_ENABLED=true
+
+# Feature Flags
+export REACTOR_ENABLE_ONLINE_LEARNING=true
+export REACTOR_ENABLE_DISTRIBUTED_TRAINING=true
+export REACTOR_ENABLE_DATA_VERSIONING=true
+```
+
+### Configuration Files
+
+Configuration is loaded in this priority order:
+1. Environment variables (highest priority)
+2. `~/.jarvis/reactor/config.json` (user config)
+3. `reactor_core/config/default_config.json` (defaults)
+
+Example config file:
+
+```json
+{
+  "api": {
+    "port": 8003,
+    "host": "0.0.0.0"
+  },
+  "training": {
+    "default_model": "llama-2-7b",
+    "use_lora": true,
+    "lora_rank": 16
+  },
+  "serving": {
+    "max_cached_models": 5,
+    "enable_hot_reload": true,
+    "default_backend": "auto"
+  },
+  "trinity": {
+    "heartbeat_interval": 5.0,
+    "health_check_timeout": 10.0
+  }
+}
+```
+
+### Dynamic Path Resolution
+
+All paths are resolved dynamically with XDG compliance:
+
+1. **Environment Variable** (if set)
+2. **base_config.resolve_path()** (if available)
+3. **XDG_DATA_HOME/jarvis/** (fallback)
+
+No hardcoded `Path.home()` calls - fully portable across systems.
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+#### Issue: Components fail to start
+
+**Symptoms:** `run_supervisor.py` shows component failures
+
+**Solutions:**
+```bash
+# Check component paths
+python3 run_supervisor.py --dev --log-level DEBUG
+
+# Verify component health
+curl http://localhost:8003/health
+
+# Check logs
+tail -f ~/.jarvis/reactor/logs/supervisor.log
+```
+
+#### Issue: Training fails with OOM
+
+**Symptoms:** Out of memory errors during training
+
+**Solutions:**
+```python
+# Enable gradient checkpointing
+config = TrainingConfig(
+    gradient_checkpointing=True,
+    use_qlora=True,  # 4-bit quantization
+    cpu_offload=True,  # Offload to CPU
+)
+
+# Use smaller batch size
+config.batch_size = 1
+config.gradient_accumulation_steps = 8
+```
+
+#### Issue: Model server not hot-reloading
+
+**Symptoms:** Model updates don't appear in server
+
+**Solutions:**
+```python
+# Verify file watcher is enabled
+config = ModelServerConfig(
+    enable_hot_reload=True,
+    watch_directories=["/path/to/models"],
+)
+
+# Check file permissions
+ls -la /path/to/models
+
+# Verify model format
+# Server supports: .gguf, .safetensors, .bin
+```
+
+#### Issue: Cross-repo events not working
+
+**Symptoms:** Events not flowing between JARVIS, Prime, Reactor
+
+**Solutions:**
+```bash
+# Check event bridge status
+curl http://localhost:8003/api/v1/events/status
+
+# Verify event directories exist
+ls -la ~/.jarvis/events/
+ls -la ~/.jarvis/trinity/events/
+
+# Check WebSocket connection
+# Open browser console: ws://localhost:8003/ws
+```
+
+#### Issue: Distributed training hangs
+
+**Symptoms:** Training stuck at barrier synchronization
+
+**Solutions:**
+```python
+# Check network connectivity
+await coordinator.check_connectivity()
+
+# Verify all workers are healthy
+health = await coordinator.get_worker_health()
+
+# Enable gradient checksum validation
+coordinator.enable_gradient_verification = True
+```
+
+### Debug Mode
+
+Enable comprehensive debugging:
+
+```bash
+# Set debug environment
+export REACTOR_DEBUG=true
+export REACTOR_LOG_LEVEL=DEBUG
+
+# Run with debug flags
+python3 run_supervisor.py --dev --log-level DEBUG
+
+# Check debug logs
+tail -f ~/.jarvis/reactor/logs/debug.log
+```
+
+## 🛠️ Development Guide
+
+### Setting Up Development Environment
+
+```bash
+# Clone repository
+git clone --recursive https://github.com/drussell23/JARVIS-Reactor.git
+cd JARVIS-Reactor
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install development dependencies
+pip install -e ".[dev]"
+
+# Install pre-commit hooks
+pre-commit install
+
+# Run tests
+pytest tests/
+
+# Run linting
+black reactor_core/
+ruff check reactor_core/
+```
+
+### Code Structure
+
+```
+reactor_core/
+├── training/          # Training methods and pipelines
+├── serving/           # Model serving infrastructure
+├── api/              # REST API endpoints
+├── orchestration/    # Trinity coordination
+├── integration/      # Cross-repo integration
+├── utils/            # Utilities (async_helpers, etc.)
+├── config/           # Configuration management
+├── data/             # Data processing and versioning
+├── eval/             # Model evaluation
+└── gcp/              # GCP-specific features
+```
+
+### Adding New Features
+
+1. **Create feature branch:**
+   ```bash
+   git checkout -b feature/my-feature
+   ```
+
+2. **Follow code style:**
+   - Use `black` for formatting
+   - Follow type hints (use `mypy`)
+   - Add docstrings (Google style)
+
+3. **Write tests:**
+   ```python
+   # tests/test_my_feature.py
+   import pytest
+   from reactor_core.my_module import MyFeature
+   
+   @pytest.mark.asyncio
+   async def test_my_feature():
+       feature = MyFeature()
+       result = await feature.do_something()
+       assert result is not None
+   ```
+
+4. **Update documentation:**
+   - Add to README.md
+   - Update API docs
+   - Add examples
+
+5. **Submit PR:**
+   - Ensure all tests pass
+   - Update version in `__init__.py`
+   - Add to CHANGELOG.md
+
+### Testing
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_training.py
+
+# Run with coverage
+pytest --cov=reactor_core --cov-report=html
+
+# Run integration tests
+pytest tests/integration/ -v
+```
+
+### Code Quality
+
+```bash
+# Format code
+black reactor_core/
+
+# Lint code
+ruff check reactor_core/
+
+# Type checking
+mypy reactor_core/
+
+# Security scanning
+bandit -r reactor_core/
+```
+
 ## 📈 Version History
+
+### **v92.0** - Reliability & Robustness (2025-01-15)
+- **Structured Concurrency**: Python 3.11+ TaskGroup patterns for robust async operations
+- **Connection Pooling**: Efficient HTTP/Redis connection management with automatic lifecycle
+- **Dynamic Path Resolution**: Zero hardcoding, XDG-compliant paths, environment-driven config
+- **Atomic File Writes**: Prevents checkpoint corruption from partial writes
+- **Circuit Breaker Pattern**: Protects external service calls with auto-recovery
+- **Backpressure Control**: Prevents memory exhaustion under high load
+- **Proper Async Patterns**: Deadlock-free async/await with timeouts
+- **Gradient Verification**: Checksum validation for distributed training
+- **Memory Pressure Awareness**: Adaptive behavior under resource constraints
+- **Unified Error Handling**: Centralized error classification and routing
+
+### **v91.0** - Advanced Learning & Distributed Training (2025-01-10)
+- **Online/Incremental Learning**: Prioritized experience replay with importance sampling
+- **Elastic Weight Consolidation (EWC)**: Prevents catastrophic forgetting during updates
+- **Concept Drift Detection**: Page-Hinkley test for automatic model adaptation
+- **Data Versioning**: Content-addressed storage with lineage tracking (DVC compatible)
+- **GCP Spot VM Checkpointing**: Predictive preemption with multi-signal detection
+- **Distributed Training**: Multi-VM coordination with gradient compression
+- **Dynamic Resource Allocation**: Auto-scaling with cost-aware decisions
+- **MLForge C++ Bindings**: High-performance matrix/neural ops with pybind11
 
 ### **v77.1** - Model Serving & Hot Reload (2025-01-07)
 - Hot-reload model server with zero-downtime updates (1,545 lines)
@@ -573,6 +1462,18 @@ Multi-repo coordination with heartbeat monitoring, command routing, state reconc
 - Memory manager with dynamic batch sizing
 - Advanced evaluation suite (1,536 lines)
 
+### **v80.0** - World Models & Causal Reasoning (2024-12-20)
+- World model training with latent dynamics and planning
+- Causal reasoning with SCMs and do-calculus
+- Advanced data preprocessing with quality gates
+- Synthetic data generation (3-10x augmentation)
+- Active learning for efficient labeling
+
+### **v79.0** - Curriculum & Meta-Learning (2024-12-15)
+- Curriculum learning with progressive difficulty
+- Meta-learning (MAML, Reptile, Meta-SGD)
+- Dependency injection framework
+
 ### **v75.0** - Trinity Dead Letter Queue (2024-12-25)
 - DLQ for failed/expired commands
 - Automatic retry with exponential backoff
@@ -593,14 +1494,172 @@ Multi-repo coordination with heartbeat monitoring, command routing, state reconc
 
 ---
 
-## 🔗 Links
+## 📚 API Documentation
 
-- **GitHub**: https://github.com/drussell23/JARVIS-Reactor
+### REST API Endpoints
+
+Once the API server is running (`python3 run_supervisor.py`), access:
+
+- **API Base URL**: `http://localhost:8003`
+- **Interactive Docs**: `http://localhost:8003/docs` (Swagger UI)
+- **ReDoc**: `http://localhost:8003/redoc`
+- **Health Check**: `http://localhost:8003/health`
+
+### Key Endpoints
+
+#### Training
+
+```bash
+# Trigger training
+POST /api/v1/training/trigger
+{
+  "model_name": "llama-2-7b",
+  "training_type": "dpo",
+  "config": {
+    "num_epochs": 3,
+    "batch_size": 4
+  }
+}
+
+# Get training status
+GET /api/v1/training/status/{job_id}
+
+# Cancel training
+POST /api/v1/training/cancel/{job_id}
+```
+
+#### Model Registry
+
+```bash
+# List models
+GET /api/v1/models
+
+# Get model info
+GET /api/v1/models/{model_id}
+
+# Register model
+POST /api/v1/models/register
+{
+  "model_id": "my-model-v1",
+  "model_path": "/path/to/model",
+  "metadata": {...}
+}
+```
+
+#### Scheduler
+
+```bash
+# Schedule job
+POST /api/v1/scheduler/schedule
+{
+  "name": "nightly_training",
+  "schedule_type": "cron",
+  "cron_expression": "0 2 * * *",
+  "job_config": {...}
+}
+
+# List scheduled jobs
+GET /api/v1/scheduler/jobs
+```
+
+#### Telemetry
+
+```bash
+# Submit telemetry
+POST /api/v1/telemetry/submit
+{
+  "event_type": "interaction",
+  "data": {...}
+}
+
+# Query metrics
+GET /api/v1/telemetry/metrics?start_time=...&end_time=...
+```
+
+### WebSocket Events
+
+Connect to `ws://localhost:8003/ws` for real-time events:
+
+```javascript
+const ws = new WebSocket('ws://localhost:8003/ws');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Event:', data.type, data.payload);
+};
+
+// Subscribe to training events
+ws.send(JSON.stringify({
+  type: 'subscribe',
+  channels: ['training:progress', 'training:complete']
+}));
+```
+
+### Model Server API
+
+Model server runs on port 8001 (configurable):
+
+```bash
+# Inference
+POST http://localhost:8001/predict
+{
+  "prompt": "What is machine learning?",
+  "model_id": "llama-2-7b",
+  "max_tokens": 256,
+  "temperature": 0.7
+}
+
+# List loaded models
+GET http://localhost:8001/models
+
+# Load model
+POST http://localhost:8001/models/load
+{
+  "model_id": "my-model",
+  "model_path": "/path/to/model",
+  "backend": "vllm"
+}
+```
+
+## 🔗 Links & Resources
+
+### Repositories
+
+- **JARVIS Reactor (This Repo)**: https://github.com/drussell23/JARVIS-Reactor
 - **MLForge C++ Core**: https://github.com/drussell23/MLForge
-- **JARVIS-AI-Agent**: https://github.com/drussell23/JARVIS-AI-Agent
-- **JARVIS Prime**: https://github.com/drussell23/jarvis-prime
+- **JARVIS-AI-Agent (Body)**: https://github.com/drussell23/JARVIS-AI-Agent
+- **JARVIS Prime (Mind)**: https://github.com/drussell23/jarvis-prime
 
----
+### Documentation
+
+- **Architecture Docs**: See `ARCHITECTURE_ADVANCED.md`
+- **Trinity Integration**: See `TRINITY_INTEGRATION_COMPLETE.md`
+- **Version History**: See `CHANGELOG.md` (if available)
+
+### Community
+
+- **Issues**: https://github.com/drussell23/JARVIS-Reactor/issues
+- **Discussions**: https://github.com/drussell23/JARVIS-Reactor/discussions
+
+## 🤝 Contributing
+
+We welcome contributions! Please see our contributing guidelines:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes following our code style
+4. Add tests for new features
+5. Update documentation
+6. Commit your changes (`git commit -m 'Add amazing feature'`)
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
+
+### Code Style
+
+- **Formatting**: Black (line length 100)
+- **Linting**: Ruff
+- **Type Hints**: Required for all functions
+- **Docstrings**: Google style
 
 ## 📄 License
 
@@ -608,4 +1667,18 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 ---
 
-**Built with ❤️ for the JARVIS AGI Ecosystem**
+## 🙏 Acknowledgments
+
+Built with ❤️ for the JARVIS AGI Ecosystem
+
+**Special Thanks:**
+- PyTorch team for the excellent ML framework
+- Hugging Face for transformers and PEFT
+- FastAPI for the amazing async web framework
+- All contributors and users of the JARVIS ecosystem
+
+---
+
+**Version**: 2.10.0 (v92.0)  
+**Last Updated**: January 2025  
+**Status**: ✅ Production Ready

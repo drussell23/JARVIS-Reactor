@@ -112,6 +112,41 @@ from reactor_core.integration.event_bridge import (
     create_event_bridge,
 )
 
+# v93.0: Advanced async patterns for structured concurrency
+try:
+    from reactor_core.utils.async_helpers import (
+        StructuredTaskGroup,
+        TaskResult,
+        TaskGroupError,
+        run_in_task_group,
+        scatter_gather,
+        GracefulShutdown,
+        DeadLetterQueue,
+        CircuitBreaker as AsyncCircuitBreaker,
+        CircuitBreakerConfig as AsyncCircuitBreakerConfig,
+        BackpressureController,
+        BackpressureConfig,
+        BackpressureStrategy,
+        HealthMonitor,
+        HealthStatus,
+        MetricsCollector,
+    )
+    HAS_STRUCTURED_CONCURRENCY = True
+except ImportError as e:
+    HAS_STRUCTURED_CONCURRENCY = False
+    StructuredTaskGroup = None
+
+# v93.0: Connection pooling
+try:
+    from reactor_core.config.unified_config import (
+        HTTPConnectionPool,
+        RedisConnectionPool,
+        ConnectionPoolConfig,
+    )
+    HAS_CONNECTION_POOLING = True
+except ImportError:
+    HAS_CONNECTION_POOLING = False
+
 logger = logging.getLogger(__name__)
 
 # v91.0 Advanced Module Imports
@@ -914,6 +949,19 @@ class AGISupervisor:
 
         # Background tasks
         self._tasks: List[asyncio.Task] = []
+        self._task_group: Optional[StructuredTaskGroup] = None
+
+        # v93.0: Advanced concurrency controls
+        self._training_lock = asyncio.Lock()  # Prevent concurrent training triggers
+        self._training_in_progress = False
+        self._graceful_shutdown: Optional[GracefulShutdown] = None
+        self._dead_letter_queue: Optional[DeadLetterQueue] = None
+        self._backpressure: Optional[BackpressureController] = None
+        self._health_monitor: Optional[HealthMonitor] = None
+        self._metrics_collector: Optional[MetricsCollector] = None
+
+        # v93.0: Trace ID for distributed tracing
+        self._trace_id = f"supervisor-{int(time.time() * 1000)}"
 
         # Health checker and self-healer
         self._health_checker = ComponentHealthChecker()
@@ -986,6 +1034,10 @@ class AGISupervisor:
             await self._event_bridge.start()
             logger.info("[OK] Event Bridge running")
 
+            # Phase 2.5: Initialize v93.0 Advanced Features
+            logger.info("[Phase 2.5] Initializing v93.0 Advanced Features...")
+            await self._initialize_v93_features()
+
             # Phase 3: Discover and register components
             logger.info("[Phase 3] Discovering components...")
             await self._discover_components()
@@ -1032,19 +1084,49 @@ class AGISupervisor:
             return False
 
     async def stop(self) -> None:
-        """Gracefully stop all components."""
+        """Gracefully stop all components using structured shutdown."""
         logger.info("")
         logger.info("Initiating graceful shutdown...")
         self._running = False
         self._shutdown_event.set()
 
+        # v93.0: Use GracefulShutdown if available
+        if self._graceful_shutdown:
+            try:
+                results = await self._graceful_shutdown.execute()
+                for name, status in results.items():
+                    if status == "success":
+                        logger.info(f"  [OK] {name} stopped gracefully")
+                    else:
+                        logger.warning(f"  [WARN] {name}: {status}")
+            except Exception as e:
+                logger.warning(f"Graceful shutdown error: {e}")
+
         # Cancel background tasks
         for task in self._tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
 
         # Wait for tasks to complete
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        # v93.0: Stop Dead Letter Queue
+        if self._dead_letter_queue:
+            try:
+                await self._dead_letter_queue.stop_auto_retry()
+                logger.info("  [OK] Dead Letter Queue stopped")
+            except Exception as e:
+                logger.debug(f"DLQ stop error: {e}")
+
+        # v93.0: Clean up connection pools
+        if HAS_CONNECTION_POOLING:
+            try:
+                await HTTPConnectionPool.close_all()
+                await RedisConnectionPool.close_instance()
+                logger.info("  [OK] Connection pools closed")
+            except Exception as e:
+                logger.debug(f"Connection pool cleanup error: {e}")
 
         # Stop v101.0 services first
         if self._experience_receiver:
@@ -1334,6 +1416,97 @@ class AGISupervisor:
         # Scout (optional)
         if self.config.enable_scout:
             logger.info("  [OK] Scout ingestion ready")
+
+    async def _initialize_v93_features(self) -> None:
+        """Initialize v93.0 Advanced Features for reliability and observability."""
+        # === Version Compatibility Check ===
+        try:
+            from reactor_core.config.unified_config import (
+                VersionNegotiator,
+                get_degradation_manager,
+                setup_signal_handlers,
+                start_config_file_watcher,
+            )
+
+            # Setup signal handlers for config hot-reload
+            setup_signal_handlers()
+            logger.info("  [OK] Signal handlers registered (SIGHUP for hot-reload)")
+
+            # Start config file watcher
+            await start_config_file_watcher()
+            logger.info("  [OK] Config file watcher started")
+
+            # Check version compatibility with other services
+            negotiator = VersionNegotiator()
+            our_version = negotiator.get_our_version()
+            logger.info(f"  [OK] Reactor Core version {our_version.version}")
+
+            # Check compatibility (non-blocking)
+            try:
+                compat_results = await asyncio.wait_for(
+                    negotiator.check_compatibility(),
+                    timeout=10.0,
+                )
+
+                degradation_mgr = get_degradation_manager()
+                for service, result in compat_results.items():
+                    if result.get("reachable"):
+                        version = result.get("version", "unknown")
+                        if result.get("compatible"):
+                            degraded = result.get("degraded_features", [])
+                            if degraded:
+                                logger.info(f"  [OK] {service} v{version} compatible (degraded: {degraded})")
+                                for feature in degraded:
+                                    degradation_mgr.set_degraded(
+                                        f"{service}_{feature}",
+                                        reason=f"Version mismatch with {service}",
+                                    )
+                            else:
+                                logger.info(f"  [OK] {service} v{version} fully compatible")
+                        else:
+                            logger.warning(f"  [WARN] {service} v{version} incompatible")
+                            degradation_mgr.set_degraded(
+                                service,
+                                reason=f"Incompatible version {version}",
+                                fallback_behavior="Limited functionality",
+                            )
+                    else:
+                        logger.debug(f"  [--] {service} not reachable (will retry)")
+
+            except asyncio.TimeoutError:
+                logger.debug("  Version check timed out, continuing...")
+            except Exception as e:
+                logger.debug(f"  Version check error: {e}")
+
+        except ImportError as e:
+            logger.debug(f"v93.0 features not available: {e}")
+
+        # === Distributed Tracing Setup ===
+        try:
+            from reactor_core.integration.trinity_publisher import set_trace_id
+            set_trace_id(self._trace_id)
+            logger.info(f"  [OK] Distributed tracing initialized (trace_id={self._trace_id[:12]}...)")
+        except ImportError:
+            logger.debug("Distributed tracing not available")
+
+        # === Graceful Degradation Manager ===
+        try:
+            from reactor_core.config.unified_config import get_degradation_manager
+            degradation_mgr = get_degradation_manager()
+
+            # Register recovery callbacks
+            degradation_mgr.register_recovery_callback(
+                "jarvis_agent",
+                lambda: logger.info("JARVIS Agent recovered"),
+            )
+            degradation_mgr.register_recovery_callback(
+                "jarvis_prime",
+                lambda: logger.info("JARVIS Prime recovered"),
+            )
+
+            logger.info("  [OK] Graceful degradation manager ready")
+        except ImportError:
+            logger.debug("Graceful degradation not available")
 
     async def _initialize_v91_services(self) -> None:
         """Initialize v91.0 Advanced Services for enhanced training and learning."""
@@ -1694,16 +1867,88 @@ class AGISupervisor:
         return False
 
     async def _start_background_tasks(self) -> None:
-        """Start background monitoring and processing tasks."""
-        # Health monitoring
-        self._tasks.append(asyncio.create_task(self._health_monitor_loop()))
+        """Start background monitoring and processing tasks with structured concurrency."""
+        # v93.0: Initialize advanced concurrency components
+        if HAS_STRUCTURED_CONCURRENCY:
+            # Initialize graceful shutdown coordinator
+            self._graceful_shutdown = GracefulShutdown(timeout_per_component=30.0)
 
-        # Experience collection (continuous learning)
-        if self.config.experience_collection:
-            self._tasks.append(asyncio.create_task(self._experience_collection_loop()))
+            # Initialize dead letter queue for failed operations
+            try:
+                from reactor_core.config.base_config import resolve_path
+                dlq_path = resolve_path("dlq", env_var="REACTOR_DLQ_PATH", subdir="dlq")
+                self._dead_letter_queue = DeadLetterQueue(
+                    name="supervisor_dlq",
+                    persist_path=dlq_path / "supervisor_dlq.json",
+                    auto_retry_interval=60.0,
+                )
+                await self._dead_letter_queue.start_auto_retry()
+                logger.info("[OK] Dead Letter Queue initialized")
+            except Exception as e:
+                logger.debug(f"DLQ initialization failed: {e}")
 
-        # Event processing
-        self._tasks.append(asyncio.create_task(self._event_processing_loop()))
+            # Initialize backpressure controller
+            self._backpressure = BackpressureController(
+                BackpressureConfig(
+                    strategy=BackpressureStrategy.ADAPTIVE,
+                    high_water_mark=0.8,
+                    low_water_mark=0.5,
+                    max_queue_size=1000,
+                )
+            )
+
+            # Initialize metrics collector
+            self._metrics_collector = MetricsCollector()
+
+        # Use StructuredTaskGroup if available, fallback to create_task
+        if HAS_STRUCTURED_CONCURRENCY and StructuredTaskGroup is not None:
+            # Start tasks in a structured task group for proper lifecycle management
+            async def run_background_tasks() -> None:
+                """Run all background tasks in a structured group."""
+                async with StructuredTaskGroup(
+                    name="supervisor_background",
+                    cancel_on_error=False,  # Don't cancel all if one fails
+                    max_concurrent=None,
+                ) as tg:
+                    self._task_group = tg
+
+                    # Core monitoring tasks
+                    tg.create_task(self._health_monitor_loop(), name="health_monitor")
+                    tg.create_task(self._event_processing_loop(), name="event_processing")
+
+                    # Experience collection (continuous learning)
+                    if self.config.experience_collection:
+                        tg.create_task(self._experience_collection_loop(), name="experience_collection")
+
+                    # Metrics reporting
+                    if self._metrics_collector:
+                        tg.create_task(self._metrics_reporting_loop(), name="metrics_reporting")
+
+                    # Keep task group alive until shutdown
+                    while self._running:
+                        await asyncio.sleep(1.0)
+
+            # Create the task group runner
+            task_group_task = asyncio.create_task(
+                run_background_tasks(),
+                name="structured_task_group_runner"
+            )
+            self._tasks.append(task_group_task)
+
+            # Register with graceful shutdown
+            if self._graceful_shutdown:
+                self._graceful_shutdown.register(
+                    "background_tasks",
+                    self._cancel_background_tasks,
+                    priority=10,  # Cancel tasks early in shutdown
+                )
+        else:
+            # Fallback to legacy create_task pattern
+            logger.debug("Using legacy task creation (StructuredTaskGroup not available)")
+            self._tasks.append(asyncio.create_task(self._health_monitor_loop()))
+            if self.config.experience_collection:
+                self._tasks.append(asyncio.create_task(self._experience_collection_loop()))
+            self._tasks.append(asyncio.create_task(self._event_processing_loop()))
 
         # v101.0: Start Trinity Experience Receiver (closes the Trinity Loop)
         try:
@@ -1714,6 +1959,29 @@ class AGISupervisor:
             logger.debug("Trinity Experience Receiver not available")
         except Exception as e:
             logger.warning(f"Trinity Experience Receiver failed to start: {e}")
+
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel all background tasks gracefully."""
+        if self._task_group:
+            # StructuredTaskGroup handles cancellation
+            pass
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+
+    async def _metrics_reporting_loop(self) -> None:
+        """Periodically report metrics."""
+        while self._running:
+            try:
+                if self._metrics_collector and self._telemetry:
+                    metrics = self._metrics_collector.get_all_metrics()
+                    await self._telemetry.record_event("supervisor_metrics", metrics)
+
+                await asyncio.sleep(60.0)  # Report every minute
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Metrics reporting error: {e}")
 
     async def _health_monitor_loop(self) -> None:
         """Monitor component health and handle failures."""
@@ -1803,30 +2071,13 @@ class AGISupervisor:
                                             {
                                                 "reason": "experience_threshold",
                                                 "experience_count": self._stats["experiences_collected"],
+                                                "trace_id": self._trace_id,
                                             }
                                         )
 
-                                    # Trigger real training via unified pipeline
-                                    try:
-                                        from reactor_core.training.unified_pipeline import get_unified_trainer_async
-                                        trainer = await get_unified_trainer_async()
-                                        # Pass collected experiences to trainer
-                                        await trainer.add_experiences(experience_buffer, flush=True)
-                                        # Schedule training as background task with proper error handling
-                                        training_task = asyncio.create_task(
-                                            trainer.run_training_cycle(),
-                                            name="auto_training_cycle"
-                                        )
-                                        training_task.add_done_callback(
-                                            lambda t: logger.error(f"Training failed: {t.exception()}")
-                                            if t.exception() else logger.info("Training completed")
-                                        )
-                                        experience_buffer.clear()
-                                        logger.info("Training job queued with collected experiences")
-                                    except ImportError:
-                                        logger.warning("Unified trainer not available for auto-training")
-                                    except Exception as e:
-                                        logger.error(f"Auto-training failed: {e}")
+                                    # v93.0: Use training lock to prevent concurrent training
+                                    await self._trigger_training_with_lock(experience_buffer.copy())
+                                    experience_buffer.clear()
 
                             processed_files.add(file_key)
 
@@ -1844,6 +2095,131 @@ class AGISupervisor:
             except Exception as e:
                 logger.error(f"Experience collection error: {e}")
                 await asyncio.sleep(10.0)
+
+    async def _trigger_training_with_lock(self, experiences: List[dict]) -> bool:
+        """
+        Trigger training with proper locking to prevent race conditions.
+
+        Uses an asyncio.Lock to ensure only one training job runs at a time.
+        If training is already in progress, the experiences are queued for
+        the next training cycle via the Dead Letter Queue.
+
+        Args:
+            experiences: List of experience dictionaries to train on.
+
+        Returns:
+            True if training was triggered, False if queued or skipped.
+        """
+        # Quick check without lock
+        if self._training_in_progress:
+            logger.info("Training already in progress, queueing experiences")
+            if self._dead_letter_queue:
+                await self._dead_letter_queue.add(
+                    operation="training",
+                    args=(),
+                    kwargs={"experiences": experiences},
+                    exception=RuntimeError("Training in progress"),
+                    metadata={"queued_at": time.time(), "experience_count": len(experiences)},
+                )
+            return False
+
+        # Try to acquire lock with timeout
+        try:
+            acquired = await asyncio.wait_for(
+                self._training_lock.acquire(),
+                timeout=5.0,
+            )
+            if not acquired:
+                logger.warning("Could not acquire training lock")
+                return False
+        except asyncio.TimeoutError:
+            logger.warning("Training lock acquisition timed out")
+            return False
+
+        try:
+            # Double-check after acquiring lock
+            if self._training_in_progress:
+                return False
+
+            self._training_in_progress = True
+            self._stats["trainings_triggered"] += 1
+
+            # Track metrics
+            if self._metrics_collector:
+                self._metrics_collector.increment("trainings_triggered")
+
+            logger.info(f"Triggering training with {len(experiences)} experiences (trace_id={self._trace_id})")
+
+            try:
+                from reactor_core.training.unified_pipeline import get_unified_trainer_async
+                trainer = await get_unified_trainer_async()
+
+                # Pass collected experiences to trainer
+                await trainer.add_experiences(experiences, flush=True)
+
+                # Run training with timeout using StructuredTaskGroup if available
+                if HAS_STRUCTURED_CONCURRENCY and StructuredTaskGroup is not None:
+                    async with StructuredTaskGroup(
+                        name="auto_training",
+                        cancel_on_error=True,
+                        timeout_seconds=3600.0,  # 1 hour max
+                    ) as tg:
+                        tg.create_task(
+                            self._run_training_with_cleanup(trainer),
+                            name="training_cycle"
+                        )
+
+                    logger.info("Training completed via StructuredTaskGroup")
+                else:
+                    # Fallback: fire-and-forget with callback
+                    training_task = asyncio.create_task(
+                        self._run_training_with_cleanup(trainer),
+                        name="auto_training_cycle"
+                    )
+                    training_task.add_done_callback(self._on_training_complete)
+                    logger.info("Training job queued (legacy mode)")
+
+                return True
+
+            except ImportError:
+                logger.warning("Unified trainer not available for auto-training")
+                return False
+            except Exception as e:
+                logger.error(f"Auto-training failed: {e}")
+                # Track failure in metrics
+                if self._metrics_collector:
+                    self._metrics_collector.increment("training_failures")
+                return False
+
+        finally:
+            self._training_in_progress = False
+            self._training_lock.release()
+
+    async def _run_training_with_cleanup(self, trainer) -> None:
+        """Run training cycle with proper cleanup and error handling."""
+        try:
+            await trainer.run_training_cycle()
+            logger.info("Training cycle completed successfully")
+
+            if self._metrics_collector:
+                self._metrics_collector.increment("trainings_completed")
+
+        except Exception as e:
+            logger.error(f"Training cycle failed: {e}")
+            if self._metrics_collector:
+                self._metrics_collector.increment("training_failures")
+            raise
+
+    def _on_training_complete(self, task: asyncio.Task) -> None:
+        """Callback when training task completes (legacy mode)."""
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"Training failed: {exc}")
+            else:
+                logger.info("Training completed successfully")
+        except asyncio.CancelledError:
+            logger.info("Training was cancelled")
 
     async def _event_processing_loop(self) -> None:
         """Process events from the event bridge."""
