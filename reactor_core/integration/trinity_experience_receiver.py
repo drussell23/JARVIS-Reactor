@@ -22,7 +22,7 @@ Architecture:
                                         └────────────────────────┘
 
 Author: Trinity System
-Version: 1.0.0
+Version: 1.1.0
 """
 from __future__ import annotations
 
@@ -38,19 +38,45 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger("TrinityExperienceReceiver")
 
-# Configuration (environment-driven, no hardcoding)
-TRINITY_EVENTS_DIR = Path(os.getenv(
-    "TRINITY_EVENTS_DIR",
-    str(Path.home() / ".jarvis" / "trinity" / "events")
-))
-JARVIS_EVENTS_DIR = Path(os.getenv(
-    "JARVIS_EVENTS_DIR",
-    str(Path.home() / ".jarvis" / "events")
-))
-EXPERIENCE_QUEUE_DIR = Path(os.getenv(
-    "EXPERIENCE_QUEUE_DIR",
-    str(Path.home() / ".jarvis" / "experience_queue")
-))
+
+def _get_dynamic_path(name: str, env_var: str, subdir: str) -> Path:
+    """
+    Get a dynamically resolved path using base_config if available.
+
+    Falls back to environment variable or XDG-compliant default.
+    """
+    # First check environment variable
+    env_value = os.getenv(env_var)
+    if env_value:
+        path = Path(env_value)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # Try to use base_config's path resolver
+    try:
+        from reactor_core.config.base_config import resolve_path
+        return resolve_path(name, env_var=env_var, subdir=subdir)
+    except ImportError:
+        pass
+
+    # XDG-compliant fallback
+    xdg_data_home = os.getenv("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    base_path = Path(xdg_data_home) / "jarvis"
+    path = base_path / subdir if subdir else base_path
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# Configuration (fully dynamic path resolution - no hardcoded paths)
+TRINITY_EVENTS_DIR = _get_dynamic_path(
+    "trinity_events", "TRINITY_EVENTS_DIR", "trinity/events"
+)
+JARVIS_EVENTS_DIR = _get_dynamic_path(
+    "jarvis_events", "JARVIS_EVENTS_DIR", "events"
+)
+EXPERIENCE_QUEUE_DIR = _get_dynamic_path(
+    "experience_queue", "EXPERIENCE_QUEUE_DIR", "experience_queue"
+)
 
 # Polling intervals
 FILE_POLL_INTERVAL = float(os.getenv("EXPERIENCE_FILE_POLL_INTERVAL", "5.0"))
@@ -279,9 +305,14 @@ class TrinityExperienceReceiver:
     async def _process_file(self, file_path: Path) -> None:
         """Process a single event file."""
         try:
-            # Read file
-            loop = asyncio.get_event_loop()
-            content = await loop.run_in_executor(None, file_path.read_text)
+            # Read file using asyncio.to_thread (Python 3.9+) or run_in_executor
+            try:
+                content = await asyncio.to_thread(file_path.read_text)
+            except AttributeError:
+                # Fallback for Python < 3.9
+                loop = asyncio.get_running_loop()
+                content = await loop.run_in_executor(None, file_path.read_text)
+
             event = json.loads(content)
 
             # Check if this is an experience-related event
@@ -291,7 +322,12 @@ class TrinityExperienceReceiver:
                 await self._process_event(event)
 
                 # Delete processed file
-                await loop.run_in_executor(None, file_path.unlink)
+                try:
+                    await asyncio.to_thread(file_path.unlink)
+                except AttributeError:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, file_path.unlink)
+
                 self._metrics.files_processed += 1
                 self.logger.debug(f"Processed and deleted: {file_path.name}")
 

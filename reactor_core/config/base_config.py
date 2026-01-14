@@ -4,8 +4,13 @@ Base configuration system for Night Shift Training Engine.
 Features:
 - Dataclass-based configuration with type hints
 - YAML file loading with environment variable interpolation
-- Dynamic config reloading
+- Dynamic config reloading with hot-reload support
 - Validation and defaults
+- XDG Base Directory Specification compliance
+- Service discovery with health-aware endpoints
+- Thread-safe singleton with proper async locking
+
+v2.0 - Advanced Dynamic Configuration
 """
 
 from __future__ import annotations
@@ -13,19 +18,26 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import signal
+import threading
+import weakref
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
+from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
+    ClassVar,
     Dict,
     List,
+    Literal,
     Optional,
-    TypeVar,
+    Set,
     Type,
+    TypeVar,
     Union,
-    Callable,
-    Awaitable,
 )
 import logging
 
@@ -33,9 +45,237 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="BaseConfig")
 
-# Singleton config instance
+# Singleton config instance with proper locking
 _config_instance: Optional["NightShiftConfig"] = None
 _config_lock = asyncio.Lock()
+_config_thread_lock = threading.Lock()
+
+# Configuration change callbacks
+_config_callbacks: List[Callable[[str, Any, Any], None]] = []
+
+
+# ============================================================================
+# DYNAMIC PATH RESOLUTION (XDG Compliant)
+# ============================================================================
+
+class PathResolver:
+    """
+    Intelligent path resolution with XDG compliance and fallbacks.
+
+    Resolution order:
+    1. Explicit environment variable
+    2. XDG Base Directory Specification
+    3. Platform-specific defaults
+    4. Fallback to ~/.jarvis (backwards compatibility)
+    """
+
+    _cache: ClassVar[Dict[str, Path]] = {}
+
+    @classmethod
+    def resolve(
+        cls,
+        name: str,
+        env_var: Optional[str] = None,
+        xdg_type: Literal["data", "config", "cache", "state", "runtime"] = "data",
+        subdir: str = "",
+        create: bool = True,
+    ) -> Path:
+        """
+        Resolve a path dynamically - NO HARDCODING!
+
+        Args:
+            name: Human-readable name for logging
+            env_var: Environment variable to check first
+            xdg_type: XDG base directory type
+            subdir: Subdirectory under base path
+            create: Create directory if it doesn't exist
+
+        Returns:
+            Resolved absolute path
+        """
+        cache_key = f"{name}:{env_var}:{xdg_type}:{subdir}"
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+
+        path: Optional[Path] = None
+
+        # 1. Check explicit environment variable
+        if env_var:
+            env_value = os.environ.get(env_var)
+            if env_value:
+                path = Path(env_value).expanduser().resolve()
+                logger.debug(f"[PathResolver] {name}: env {env_var} = {path}")
+
+        # 2. Try XDG directories
+        if path is None:
+            xdg_base = cls._get_xdg_base(xdg_type)
+            if xdg_base:
+                path = xdg_base / "reactor-core"
+                if subdir:
+                    path = path / subdir
+                logger.debug(f"[PathResolver] {name}: XDG {xdg_type} = {path}")
+
+        # 3. Fallback to ~/.jarvis (backwards compatibility)
+        if path is None:
+            path = Path.home() / ".jarvis"
+            if subdir:
+                path = path / subdir
+            logger.debug(f"[PathResolver] {name}: fallback = {path}")
+
+        # Ensure directory exists
+        if create:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"[PathResolver] Could not create {path}: {e}")
+
+        cls._cache[cache_key] = path
+        return path
+
+    @classmethod
+    def _get_xdg_base(cls, xdg_type: str) -> Optional[Path]:
+        """Get XDG base directory."""
+        home = Path.home()
+
+        xdg_vars = {
+            "data": ("XDG_DATA_HOME", home / ".local" / "share"),
+            "config": ("XDG_CONFIG_HOME", home / ".config"),
+            "cache": ("XDG_CACHE_HOME", home / ".cache"),
+            "state": ("XDG_STATE_HOME", home / ".local" / "state"),
+            "runtime": ("XDG_RUNTIME_DIR", Path(f"/run/user/{os.getuid()}") if hasattr(os, 'getuid') else None),
+        }
+
+        if xdg_type in xdg_vars:
+            env_var, default = xdg_vars[xdg_type]
+            env_value = os.environ.get(env_var)
+            if env_value:
+                return Path(env_value)
+            return default
+        return None
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        """Clear path resolution cache."""
+        cls._cache.clear()
+
+
+def resolve_path(
+    name: str,
+    env_var: Optional[str] = None,
+    xdg_type: Literal["data", "config", "cache", "state", "runtime"] = "data",
+    subdir: str = "",
+) -> Path:
+    """
+    Convenience function for dynamic path resolution.
+
+    USE THIS INSTEAD OF HARDCODED PATHS!
+
+    Example:
+        # Instead of: Path.home() / ".jarvis" / "logs"
+        # Use: resolve_path("logs", env_var="REACTOR_LOG_DIR", xdg_type="state", subdir="logs")
+    """
+    return PathResolver.resolve(name, env_var, xdg_type, subdir)
+
+
+# ============================================================================
+# SERVICE ENDPOINT DISCOVERY
+# ============================================================================
+
+@dataclass
+class ServiceEndpoint:
+    """Dynamic service endpoint with health awareness."""
+    name: str
+    host: str
+    port: int
+    protocol: str = "http"
+    health_path: str = "/health"
+    timeout_seconds: float = 5.0
+
+    # Health state (updated by health checks)
+    is_healthy: bool = False
+    last_check: Optional[datetime] = None
+    consecutive_failures: int = 0
+    latency_ms: Optional[float] = None
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.protocol}://{self.host}:{self.port}"
+
+    @property
+    def health_url(self) -> str:
+        return f"{self.base_url}{self.health_path}"
+
+    @property
+    def ws_url(self) -> str:
+        ws_proto = "wss" if self.protocol == "https" else "ws"
+        return f"{ws_proto}://{self.host}:{self.port}/ws"
+
+    @classmethod
+    def from_env(
+        cls,
+        name: str,
+        host_var: str,
+        port_var: str,
+        default_host: str = "localhost",
+        default_port: int = 8080,
+        **kwargs,
+    ) -> "ServiceEndpoint":
+        """Create endpoint from environment variables."""
+        host = os.environ.get(host_var, default_host)
+        port_str = os.environ.get(port_var, str(default_port))
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = default_port
+
+        return cls(name=name, host=host, port=port, **kwargs)
+
+    async def check_health(self) -> bool:
+        """Check endpoint health with latency measurement."""
+        import time
+        try:
+            import aiohttp
+            start = time.monotonic()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.health_url,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
+                ) as response:
+                    self.latency_ms = (time.monotonic() - start) * 1000
+                    self.is_healthy = response.status == 200
+                    self.consecutive_failures = 0 if self.is_healthy else self.consecutive_failures + 1
+                    self.last_check = datetime.now()
+                    return self.is_healthy
+        except Exception as e:
+            self.is_healthy = False
+            self.consecutive_failures += 1
+            self.last_check = datetime.now()
+            logger.debug(f"[ServiceEndpoint] Health check failed for {self.name}: {e}")
+            return False
+
+
+# ============================================================================
+# CONFIGURATION CALLBACKS FOR HOT-RELOAD
+# ============================================================================
+
+def register_config_callback(callback: Callable[[str, Any, Any], None]) -> None:
+    """Register a callback for configuration changes."""
+    _config_callbacks.append(callback)
+
+
+def unregister_config_callback(callback: Callable[[str, Any, Any], None]) -> None:
+    """Unregister a configuration change callback."""
+    if callback in _config_callbacks:
+        _config_callbacks.remove(callback)
+
+
+def _notify_config_change(key: str, old_value: Any, new_value: Any) -> None:
+    """Notify all callbacks of a configuration change."""
+    for callback in _config_callbacks:
+        try:
+            callback(key, old_value, new_value)
+        except Exception as e:
+            logger.error(f"[Config] Callback error: {e}")
 
 
 def _interpolate_env_vars(value: Any) -> Any:
@@ -210,16 +450,18 @@ class BaseConfig:
 class IngestionConfig(BaseConfig):
     """Configuration for data ingestion from JARVIS logs."""
 
-    # Source paths
+    # Source paths - DYNAMIC RESOLUTION
     jarvis_logs_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_JARVIS_LOGS", "~/.jarvis/logs")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "jarvis_logs", env_var="NIGHTSHIFT_JARVIS_LOGS",
+            xdg_type="state", subdir="logs"
+        )
     )
     jarvis_data_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_JARVIS_DATA", "~/.jarvis/data")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "jarvis_data", env_var="NIGHTSHIFT_JARVIS_DATA",
+            xdg_type="data", subdir="data"
+        )
     )
 
     # Processing settings
@@ -304,22 +546,24 @@ class TrainingConfig(BaseConfig):
         default_factory=lambda: int(os.getenv("NIGHTSHIFT_MAX_SEQ_LEN", "2048"))
     )
 
-    # Checkpointing
+    # Checkpointing - DYNAMIC RESOLUTION
     checkpoint_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_CHECKPOINT_DIR", "~/.jarvis/training/checkpoints")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "checkpoints", env_var="NIGHTSHIFT_CHECKPOINT_DIR",
+            xdg_type="data", subdir="training/checkpoints"
+        )
     )
     save_steps: int = 500
     eval_steps: int = 500
     max_checkpoints: int = 3
     resume_from_checkpoint: bool = True
 
-    # Output
+    # Output - DYNAMIC RESOLUTION
     output_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_OUTPUT_DIR", "~/.jarvis/training/output")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "training_output", env_var="NIGHTSHIFT_OUTPUT_DIR",
+            xdg_type="data", subdir="training/output"
+        )
     )
 
     # Distributed training
@@ -397,11 +641,12 @@ class QuantizationConfig(BaseConfig):
         default_factory=lambda: os.getenv("NIGHTSHIFT_GGUF_QUANT", "Q4_K_M")
     )
 
-    # Output paths
+    # Output paths - DYNAMIC RESOLUTION
     output_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_QUANT_OUTPUT", "~/.jarvis/models/quantized")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "quantized_models", env_var="NIGHTSHIFT_QUANT_OUTPUT",
+            xdg_type="data", subdir="models/quantized"
+        )
     )
 
     # llama.cpp settings
@@ -448,11 +693,12 @@ class EvalConfig(BaseConfig):
     # Previous model for comparison
     previous_model_path: Optional[Path] = None
 
-    # Output
+    # Output - DYNAMIC RESOLUTION
     eval_output_dir: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_EVAL_OUTPUT", "~/.jarvis/training/eval")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "eval_output", env_var="NIGHTSHIFT_EVAL_OUTPUT",
+            xdg_type="data", subdir="training/eval"
+        )
     )
 
 
@@ -468,11 +714,12 @@ class OrchestrationConfig(BaseConfig):
         default_factory=lambda: os.getenv("NIGHTSHIFT_TIMEZONE", "America/Los_Angeles")
     )
 
-    # State management
+    # State management - DYNAMIC RESOLUTION
     state_file: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_STATE_FILE", "~/.jarvis/training/pipeline_state.json")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "state", env_var="NIGHTSHIFT_STATE_FILE",
+            xdg_type="state", subdir="training"
+        ) / "pipeline_state.json"
     )
 
     # Recovery settings
@@ -500,19 +747,91 @@ class OrchestrationConfig(BaseConfig):
     )
     gcs_prefix: str = "nightshift/models"
 
-    # Model registry
+    # Model registry - DYNAMIC RESOLUTION
     model_registry_path: Path = field(
-        default_factory=lambda: Path(
-            os.getenv("NIGHTSHIFT_REGISTRY", "~/.jarvis/models/registry.json")
-        ).expanduser()
+        default_factory=lambda: resolve_path(
+            "registry", env_var="NIGHTSHIFT_REGISTRY",
+            xdg_type="data", subdir="models"
+        ) / "registry.json"
     )
     max_model_versions: int = 5
+
+
+# ============================================================================
+# SERVICE ENDPOINTS CONFIGURATION
+# ============================================================================
+
+@dataclass
+class ServicesConfig(BaseConfig):
+    """Configuration for all service endpoints - NO HARDCODED PORTS!"""
+
+    # JARVIS Body
+    jarvis_host: str = field(
+        default_factory=lambda: os.getenv("JARVIS_HOST", "localhost")
+    )
+    jarvis_port: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PORT", "8000"))
+    )
+
+    # JARVIS Prime
+    jprime_host: str = field(
+        default_factory=lambda: os.getenv("JARVIS_PRIME_HOST", "localhost")
+    )
+    jprime_port: int = field(
+        default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8002"))
+    )
+
+    # Reactor Core
+    reactor_host: str = field(
+        default_factory=lambda: os.getenv("REACTOR_HOST", "0.0.0.0")
+    )
+    reactor_port: int = field(
+        default_factory=lambda: int(os.getenv("REACTOR_PORT", "8080"))
+    )
+
+    # Redis
+    redis_host: str = field(
+        default_factory=lambda: os.getenv("REDIS_HOST", "localhost")
+    )
+    redis_port: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_PORT", "6379"))
+    )
+
+    def get_jarvis_endpoint(self) -> ServiceEndpoint:
+        """Get JARVIS Body service endpoint."""
+        return ServiceEndpoint(
+            name="jarvis",
+            host=self.jarvis_host,
+            port=self.jarvis_port,
+            health_path="/health/ping",
+        )
+
+    def get_jprime_endpoint(self) -> ServiceEndpoint:
+        """Get JARVIS Prime service endpoint."""
+        return ServiceEndpoint(
+            name="jprime",
+            host=self.jprime_host,
+            port=self.jprime_port,
+            health_path="/health",
+        )
+
+    def get_reactor_endpoint(self) -> ServiceEndpoint:
+        """Get Reactor Core service endpoint."""
+        return ServiceEndpoint(
+            name="reactor",
+            host=self.reactor_host,
+            port=self.reactor_port,
+            health_path="/health",
+        )
 
 
 @dataclass
 class NightShiftConfig(BaseConfig):
     """
     Master configuration combining all Night Shift components.
+
+    ALL VALUES ARE DYNAMICALLY CONFIGURABLE via environment variables.
+    NO HARDCODING - use resolve_path() for paths and ServicesConfig for ports.
     """
 
     # Component configs
@@ -522,12 +841,32 @@ class NightShiftConfig(BaseConfig):
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     orchestration: OrchestrationConfig = field(default_factory=OrchestrationConfig)
+    services: ServicesConfig = field(default_factory=ServicesConfig)
 
     # Global settings
     run_id: Optional[str] = None
     dry_run: bool = False
     verbose: bool = field(
         default_factory=lambda: os.getenv("NIGHTSHIFT_VERBOSE", "false").lower() == "true"
+    )
+
+    # Feature flags (all configurable via env)
+    enable_metrics: bool = field(
+        default_factory=lambda: os.getenv("REACTOR_ENABLE_METRICS", "true").lower() == "true"
+    )
+    enable_tracing: bool = field(
+        default_factory=lambda: os.getenv("REACTOR_ENABLE_TRACING", "true").lower() == "true"
+    )
+    enable_hot_reload: bool = field(
+        default_factory=lambda: os.getenv("REACTOR_ENABLE_HOT_RELOAD", "true").lower() == "true"
+    )
+
+    # Debug
+    debug: bool = field(
+        default_factory=lambda: os.getenv("REACTOR_DEBUG", "false").lower() == "true"
+    )
+    log_level: str = field(
+        default_factory=lambda: os.getenv("REACTOR_LOG_LEVEL", "INFO")
     )
 
     @classmethod
@@ -637,6 +976,109 @@ async def load_config(
         return _config_instance
 
 
-def get_config() -> Optional[NightShiftConfig]:
-    """Get cached config synchronously. Returns None if not loaded."""
+def get_config() -> NightShiftConfig:
+    """
+    Get cached config synchronously (thread-safe).
+
+    Returns default config if not yet loaded.
+    """
+    global _config_instance
+
+    if _config_instance is not None:
+        return _config_instance
+
+    # Thread-safe lazy initialization
+    with _config_thread_lock:
+        if _config_instance is None:
+            _config_instance = NightShiftConfig()
+            logger.info("[Config] Default configuration loaded")
+
     return _config_instance
+
+
+def get_config_value(key: str, default: Any = None) -> Any:
+    """Get a specific config value by dot-notation key."""
+    config = get_config()
+    parts = key.split(".")
+
+    value = config
+    for part in parts:
+        if hasattr(value, part):
+            value = getattr(value, part)
+        elif isinstance(value, dict) and part in value:
+            value = value[part]
+        else:
+            return default
+
+    return value
+
+
+async def reload_config() -> NightShiftConfig:
+    """
+    Reload configuration from sources (hot-reload).
+
+    Notifies all registered callbacks of changes.
+    """
+    global _config_instance
+
+    async with _config_lock:
+        old_config = _config_instance
+        _config_instance = NightShiftConfig()
+
+        if old_config:
+            _notify_config_change("config", old_config, _config_instance)
+
+        logger.info("[Config] Configuration reloaded")
+        return _config_instance
+
+
+def setup_signal_handlers() -> None:
+    """
+    Setup signal handlers for hot-reload.
+
+    SIGHUP triggers configuration reload.
+    """
+    if hasattr(signal, 'SIGHUP'):
+        def handle_sighup(signum, frame):
+            logger.info("[Config] SIGHUP received, scheduling config reload")
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(reload_config())
+            except RuntimeError:
+                # No running loop, can't reload asynchronously
+                pass
+
+        signal.signal(signal.SIGHUP, handle_sighup)
+        logger.debug("[Config] Registered SIGHUP handler for hot-reload")
+
+
+# ============================================================================
+# MODULE EXPORTS
+# ============================================================================
+
+__all__ = [
+    # Path resolution
+    "PathResolver",
+    "resolve_path",
+    # Service endpoints
+    "ServiceEndpoint",
+    # Config classes
+    "BaseConfig",
+    "IngestionConfig",
+    "TrainingConfig",
+    "DistillationConfig",
+    "QuantizationConfig",
+    "EvalConfig",
+    "OrchestrationConfig",
+    "ServicesConfig",
+    "NightShiftConfig",
+    # Config functions
+    "load_config",
+    "get_config",
+    "get_config_value",
+    "reload_config",
+    "setup_signal_handlers",
+    # Callbacks
+    "register_config_callback",
+    "unregister_config_callback",
+]

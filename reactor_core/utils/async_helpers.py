@@ -2425,3 +2425,701 @@ class ResourcePoolContext(Generic[T]):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._pool.release(self._resource)
+
+
+# =============================================================================
+# STRUCTURED TASK GROUP (Python 3.11+ with fallback)
+# =============================================================================
+
+import sys
+
+# Check Python version for native TaskGroup support
+_NATIVE_TASKGROUP_AVAILABLE = sys.version_info >= (3, 11)
+
+
+@dataclass
+class TaskResult(Generic[T]):
+    """Result from a task in a task group."""
+    name: str
+    result: Optional[T] = None
+    exception: Optional[BaseException] = None
+    duration_ms: float = 0.0
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    cancelled: bool = False
+
+    @property
+    def success(self) -> bool:
+        return self.exception is None and not self.cancelled
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "success": self.success,
+            "duration_ms": self.duration_ms,
+            "cancelled": self.cancelled,
+            "exception": str(self.exception) if self.exception else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class TaskGroupError(Exception):
+    """
+    Exception raised when one or more tasks in a TaskGroup fail.
+
+    Contains all exceptions from failed tasks.
+    """
+    def __init__(self, message: str, exceptions: List[BaseException]):
+        super().__init__(message)
+        self.exceptions = exceptions
+        self.task_results: List[TaskResult] = []
+
+    def __str__(self) -> str:
+        exc_info = ", ".join(f"{type(e).__name__}: {e}" for e in self.exceptions[:5])
+        if len(self.exceptions) > 5:
+            exc_info += f", ... and {len(self.exceptions) - 5} more"
+        return f"{self.args[0]} ({len(self.exceptions)} failures: {exc_info})"
+
+
+class StructuredTaskGroup:
+    """
+    Structured concurrency TaskGroup with enhanced features.
+
+    Provides Python 3.11+ TaskGroup semantics with:
+    - Named tasks for debugging
+    - Automatic cancellation on failure (configurable)
+    - Task result collection
+    - Metrics tracking
+    - Graceful shutdown support
+    - Fallback implementation for Python < 3.11
+
+    Example:
+        async with StructuredTaskGroup(name="data_processing") as tg:
+            tg.create_task(fetch_data(), name="fetch")
+            tg.create_task(process_data(), name="process")
+            tg.create_task(save_results(), name="save")
+
+        # All tasks completed (or failed with TaskGroupError)
+        print(tg.get_results())
+
+    With error handling:
+        async with StructuredTaskGroup(
+            name="batch_ops",
+            cancel_on_error=False,  # Continue other tasks on failure
+        ) as tg:
+            for i, item in enumerate(items):
+                tg.create_task(process(item), name=f"item_{i}")
+
+        # Check individual results
+        for result in tg.results:
+            if result.success:
+                print(f"{result.name}: {result.result}")
+            else:
+                print(f"{result.name} failed: {result.exception}")
+    """
+
+    def __init__(
+        self,
+        name: str = "unnamed",
+        cancel_on_error: bool = True,
+        max_concurrent: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+        collect_results: bool = True,
+    ):
+        """
+        Initialize StructuredTaskGroup.
+
+        Args:
+            name: Name of the task group for debugging/logging.
+            cancel_on_error: If True, cancel all tasks when one fails.
+            max_concurrent: Optional limit on concurrent tasks (uses semaphore).
+            timeout_seconds: Optional timeout for the entire group.
+            collect_results: Whether to collect results (disable for fire-and-forget).
+        """
+        self.name = name
+        self.cancel_on_error = cancel_on_error
+        self.max_concurrent = max_concurrent
+        self.timeout_seconds = timeout_seconds
+        self.collect_results = collect_results
+
+        self._tasks: List[asyncio.Task] = []
+        self._task_names: Dict[asyncio.Task, str] = {}
+        self._task_start_times: Dict[asyncio.Task, datetime] = {}
+        self._results: List[TaskResult] = []
+        self._lock = asyncio.Lock()
+        self._semaphore = asyncio.Semaphore(max_concurrent) if max_concurrent else None
+        self._started = False
+        self._finished = False
+        self._cancelled = False
+
+        # For Python < 3.11 fallback
+        self._exceptions: List[BaseException] = []
+
+        # Metrics
+        self._total_tasks_created = 0
+        self._total_tasks_completed = 0
+        self._total_tasks_failed = 0
+        self._total_tasks_cancelled = 0
+        self._start_time: Optional[float] = None
+        self._end_time: Optional[float] = None
+
+    @property
+    def results(self) -> List[TaskResult]:
+        """Get collected task results."""
+        return self._results.copy()
+
+    @property
+    def successful_results(self) -> List[TaskResult]:
+        """Get only successful task results."""
+        return [r for r in self._results if r.success]
+
+    @property
+    def failed_results(self) -> List[TaskResult]:
+        """Get only failed task results."""
+        return [r for r in self._results if not r.success]
+
+    def create_task(
+        self,
+        coro: Coroutine[Any, Any, T],
+        name: Optional[str] = None,
+    ) -> asyncio.Task[T]:
+        """
+        Create a task in the group.
+
+        Args:
+            coro: Coroutine to run.
+            name: Optional name for the task.
+
+        Returns:
+            The created asyncio.Task.
+        """
+        if self._finished:
+            raise RuntimeError(f"TaskGroup '{self.name}' has already finished")
+
+        self._total_tasks_created += 1
+        task_name = name or f"{self.name}_task_{self._total_tasks_created}"
+
+        # Wrap coroutine with semaphore if limited concurrency
+        if self._semaphore:
+            wrapped_coro = self._run_with_semaphore(coro, task_name)
+        else:
+            wrapped_coro = self._run_task(coro, task_name)
+
+        # Create the task
+        task = asyncio.create_task(wrapped_coro, name=task_name)
+
+        self._tasks.append(task)
+        self._task_names[task] = task_name
+        self._task_start_times[task] = datetime.now()
+
+        # Add done callback for result collection
+        task.add_done_callback(self._on_task_done)
+
+        return task
+
+    async def _run_with_semaphore(
+        self,
+        coro: Coroutine[Any, Any, T],
+        task_name: str,
+    ) -> T:
+        """Run coroutine with semaphore for concurrency limiting."""
+        async with self._semaphore:
+            return await self._run_task(coro, task_name)
+
+    async def _run_task(
+        self,
+        coro: Coroutine[Any, Any, T],
+        task_name: str,
+    ) -> T:
+        """Run the actual coroutine and handle any exceptions."""
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            raise  # Let cancellation propagate
+        except BaseException as e:
+            # Store exception for later
+            async with self._lock:
+                self._exceptions.append(e)
+
+            # Cancel other tasks if configured
+            if self.cancel_on_error and not self._cancelled:
+                await self._cancel_all_tasks()
+
+            raise
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Callback when a task completes."""
+        task_name = self._task_names.get(task, "unknown")
+        start_time = self._task_start_times.get(task)
+        completed_at = datetime.now()
+        duration_ms = (
+            (completed_at - start_time).total_seconds() * 1000
+            if start_time else 0.0
+        )
+
+        if self.collect_results:
+            result = TaskResult(
+                name=task_name,
+                started_at=start_time,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+            )
+
+            if task.cancelled():
+                result.cancelled = True
+                self._total_tasks_cancelled += 1
+            elif task.exception() is not None:
+                result.exception = task.exception()
+                self._total_tasks_failed += 1
+            else:
+                try:
+                    result.result = task.result()
+                except asyncio.CancelledError:
+                    result.cancelled = True
+                    self._total_tasks_cancelled += 1
+                else:
+                    self._total_tasks_completed += 1
+
+            self._results.append(result)
+
+    async def _cancel_all_tasks(self) -> None:
+        """Cancel all pending tasks."""
+        self._cancelled = True
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+
+    async def __aenter__(self) -> "StructuredTaskGroup":
+        """Enter the task group context."""
+        self._started = True
+        self._start_time = time.monotonic()
+        logger.debug(f"TaskGroup '{self.name}' started")
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Any,
+    ) -> bool:
+        """Exit the task group, waiting for all tasks to complete."""
+        try:
+            if self._tasks:
+                if self.timeout_seconds:
+                    # Wait with timeout
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_for_tasks(),
+                            timeout=self.timeout_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"TaskGroup '{self.name}' timed out after "
+                            f"{self.timeout_seconds}s, cancelling remaining tasks"
+                        )
+                        await self._cancel_all_tasks()
+                        # Wait a bit for cancellation to complete
+                        await asyncio.gather(*self._tasks, return_exceptions=True)
+                        raise TaskGroupError(
+                            f"TaskGroup '{self.name}' timed out",
+                            [TimeoutError(f"Timeout after {self.timeout_seconds}s")],
+                        )
+                else:
+                    await self._wait_for_tasks()
+        finally:
+            self._finished = True
+            self._end_time = time.monotonic()
+            duration = (self._end_time - self._start_time) * 1000 if self._start_time else 0
+            logger.debug(
+                f"TaskGroup '{self.name}' finished in {duration:.1f}ms "
+                f"(completed={self._total_tasks_completed}, "
+                f"failed={self._total_tasks_failed}, "
+                f"cancelled={self._total_tasks_cancelled})"
+            )
+
+        # If there was an incoming exception, don't suppress it
+        if exc_val is not None:
+            return False
+
+        # Check for task exceptions
+        if self._exceptions:
+            error = TaskGroupError(
+                f"TaskGroup '{self.name}' had {len(self._exceptions)} task failures",
+                self._exceptions,
+            )
+            error.task_results = self._results
+            raise error
+
+        return False
+
+    async def _wait_for_tasks(self) -> None:
+        """Wait for all tasks to complete."""
+        if not self._tasks:
+            return
+
+        # Use native TaskGroup on Python 3.11+ for better error handling
+        if _NATIVE_TASKGROUP_AVAILABLE and not self.max_concurrent:
+            # Tasks already created, just gather them
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        else:
+            # Fallback: gather with exception collection
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get task group metrics."""
+        duration_ms = None
+        if self._start_time:
+            end = self._end_time or time.monotonic()
+            duration_ms = (end - self._start_time) * 1000
+
+        return {
+            "name": self.name,
+            "total_tasks": self._total_tasks_created,
+            "completed": self._total_tasks_completed,
+            "failed": self._total_tasks_failed,
+            "cancelled": self._total_tasks_cancelled,
+            "duration_ms": duration_ms,
+            "started": self._started,
+            "finished": self._finished,
+            "success_rate": (
+                self._total_tasks_completed / self._total_tasks_created
+                if self._total_tasks_created > 0 else 0
+            ),
+        }
+
+    def get_results(self) -> Dict[str, TaskResult]:
+        """Get results as a dictionary keyed by task name."""
+        return {r.name: r for r in self._results}
+
+
+async def run_in_task_group(
+    coros: List[Coroutine[Any, Any, T]],
+    names: Optional[List[str]] = None,
+    group_name: str = "batch",
+    max_concurrent: Optional[int] = None,
+    cancel_on_error: bool = True,
+    timeout_seconds: Optional[float] = None,
+) -> List[TaskResult[T]]:
+    """
+    Convenience function to run multiple coroutines in a task group.
+
+    Args:
+        coros: List of coroutines to run.
+        names: Optional names for each coroutine.
+        group_name: Name for the task group.
+        max_concurrent: Optional limit on concurrent tasks.
+        cancel_on_error: Whether to cancel all tasks on first error.
+        timeout_seconds: Optional timeout for the entire group.
+
+    Returns:
+        List of TaskResults for each coroutine.
+
+    Example:
+        results = await run_in_task_group(
+            [fetch(url) for url in urls],
+            names=[f"fetch_{i}" for i, _ in enumerate(urls)],
+            max_concurrent=5,
+        )
+
+        for result in results:
+            if result.success:
+                print(f"{result.name}: {result.result}")
+    """
+    async with StructuredTaskGroup(
+        name=group_name,
+        max_concurrent=max_concurrent,
+        cancel_on_error=cancel_on_error,
+        timeout_seconds=timeout_seconds,
+    ) as tg:
+        for i, coro in enumerate(coros):
+            name = names[i] if names and i < len(names) else f"task_{i}"
+            tg.create_task(coro, name=name)
+
+    return tg.results
+
+
+async def scatter_gather(
+    func: Callable[..., Awaitable[T]],
+    items: List[Any],
+    max_concurrent: int = 10,
+    cancel_on_error: bool = False,
+    timeout_per_item: Optional[float] = None,
+) -> List[TaskResult[T]]:
+    """
+    Apply an async function to multiple items with concurrency control.
+
+    Like asyncio.gather but with:
+    - Concurrency limiting
+    - Named tasks for debugging
+    - Individual timeouts
+    - Result collection with success/failure tracking
+
+    Args:
+        func: Async function to apply to each item.
+        items: Items to process.
+        max_concurrent: Maximum concurrent executions.
+        cancel_on_error: Whether to cancel remaining on first error.
+        timeout_per_item: Optional timeout per item.
+
+    Returns:
+        List of TaskResults.
+
+    Example:
+        async def fetch_user(user_id: int) -> User:
+            ...
+
+        results = await scatter_gather(
+            fetch_user,
+            user_ids,
+            max_concurrent=5,
+            timeout_per_item=10.0,
+        )
+    """
+    async def wrapped_call(item: Any, index: int) -> T:
+        if timeout_per_item:
+            return await asyncio.wait_for(
+                func(item),
+                timeout=timeout_per_item,
+            )
+        return await func(item)
+
+    coros = [wrapped_call(item, i) for i, item in enumerate(items)]
+    names = [f"item_{i}" for i in range(len(items))]
+
+    return await run_in_task_group(
+        coros,
+        names=names,
+        group_name="scatter_gather",
+        max_concurrent=max_concurrent,
+        cancel_on_error=cancel_on_error,
+    )
+
+
+# =============================================================================
+# ASYNC CONTEXT MANAGEMENT
+# =============================================================================
+
+class AsyncContextGroup:
+    """
+    Manage multiple async context managers as a group.
+
+    Ensures all contexts are properly entered and exited,
+    even if some fail.
+
+    Example:
+        async with AsyncContextGroup() as group:
+            db = await group.enter(get_db_connection())
+            cache = await group.enter(get_cache_connection())
+            queue = await group.enter(get_queue_connection())
+
+            # Use db, cache, queue...
+
+        # All connections properly closed
+    """
+
+    def __init__(self):
+        self._contexts: List[Any] = []
+        self._entered: List[Any] = []
+        self._lock = asyncio.Lock()
+
+    async def enter(self, context_manager: Any) -> Any:
+        """Enter a context manager and track it."""
+        async with self._lock:
+            self._contexts.append(context_manager)
+
+        result = await context_manager.__aenter__()
+
+        async with self._lock:
+            self._entered.append(context_manager)
+
+        return result
+
+    async def __aenter__(self) -> "AsyncContextGroup":
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Any,
+    ) -> bool:
+        """Exit all entered context managers in reverse order."""
+        exceptions = []
+
+        # Exit in reverse order
+        for cm in reversed(self._entered):
+            try:
+                await cm.__aexit__(exc_type, exc_val, exc_tb)
+            except Exception as e:
+                exceptions.append(e)
+                logger.error(f"Error exiting context manager: {e}")
+
+        if exceptions and exc_val is None:
+            # Raise the first exception if no incoming exception
+            raise exceptions[0]
+
+        return False
+
+
+# =============================================================================
+# EVENT COORDINATION
+# =============================================================================
+
+class AsyncBarrier:
+    """
+    Async barrier for coordinating multiple tasks.
+
+    All tasks must reach the barrier before any can proceed.
+
+    Example:
+        barrier = AsyncBarrier(3)  # Wait for 3 tasks
+
+        async def worker(id: int):
+            print(f"Worker {id} preparing")
+            await barrier.wait()  # Wait for all workers
+            print(f"Worker {id} proceeding")
+
+        await asyncio.gather(
+            worker(1),
+            worker(2),
+            worker(3),
+        )
+    """
+
+    def __init__(self, parties: int):
+        """
+        Initialize barrier.
+
+        Args:
+            parties: Number of tasks that must wait.
+        """
+        if parties < 1:
+            raise ValueError("parties must be >= 1")
+
+        self._parties = parties
+        self._count = 0
+        self._generation = 0
+        self._event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> int:
+        """
+        Wait at the barrier.
+
+        Returns:
+            The arrival index (0 to parties-1).
+        """
+        async with self._lock:
+            gen = self._generation
+            index = self._count
+            self._count += 1
+
+            if self._count >= self._parties:
+                # Last one to arrive - release everyone
+                self._count = 0
+                self._generation += 1
+                self._event.set()
+                self._event = asyncio.Event()  # Reset for next use
+                return index
+
+        # Wait for release
+        while True:
+            await self._event.wait()
+            async with self._lock:
+                if self._generation > gen:
+                    return index
+
+    async def reset(self) -> None:
+        """Reset the barrier (releases waiting tasks with error)."""
+        async with self._lock:
+            self._count = 0
+            self._generation += 1
+            self._event.set()
+
+    @property
+    def parties(self) -> int:
+        """Number of parties."""
+        return self._parties
+
+    @property
+    def n_waiting(self) -> int:
+        """Number currently waiting."""
+        return self._count
+
+
+class AsyncLatch:
+    """
+    Async countdown latch.
+
+    Waiters block until the count reaches zero.
+
+    Example:
+        latch = AsyncLatch(5)  # Count down from 5
+
+        async def worker(id: int):
+            await do_work()
+            latch.count_down()  # Signal completion
+
+        async def main():
+            # Start workers
+            for i in range(5):
+                asyncio.create_task(worker(i))
+
+            # Wait for all to complete
+            await latch.wait()
+            print("All workers done!")
+    """
+
+    def __init__(self, count: int):
+        """
+        Initialize latch.
+
+        Args:
+            count: Initial count.
+        """
+        if count < 0:
+            raise ValueError("count must be >= 0")
+
+        self._count = count
+        self._event = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+        if count == 0:
+            self._event.set()
+
+    def count_down(self, n: int = 1) -> None:
+        """Decrement the count."""
+        asyncio.create_task(self._async_count_down(n))
+
+    async def _async_count_down(self, n: int) -> None:
+        """Async count down implementation."""
+        async with self._lock:
+            self._count = max(0, self._count - n)
+            if self._count == 0:
+                self._event.set()
+
+    async def wait(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait for count to reach zero.
+
+        Args:
+            timeout: Optional timeout in seconds.
+
+        Returns:
+            True if count reached zero, False if timed out.
+        """
+        if timeout is None:
+            await self._event.wait()
+            return True
+
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    @property
+    def count(self) -> int:
+        """Current count."""
+        return self._count

@@ -399,20 +399,41 @@ class UnifiedTrainingPipeline:
             logger.debug("No valid experiences to add")
             return len(self._experience_buffer)
 
-        # Thread-safe buffer append
+        # Thread-safe buffer append with proper race condition prevention
+        should_flush = False
         async with self._experience_lock:
             self._experience_buffer.extend(valid_experiences)
             buffer_size = len(self._experience_buffer)
 
+            # Check threshold while still holding the lock to prevent race
+            if flush and buffer_size >= self._buffer_flush_threshold:
+                should_flush = True
+
         logger.info(f"[Pipeline] Added {len(valid_experiences)} experiences (buffer: {buffer_size})")
 
-        # Check if we should trigger training
-        if flush and buffer_size >= self._buffer_flush_threshold:
+        # Trigger training outside the lock but after checking
+        if should_flush:
             logger.info(f"[Pipeline] Buffer threshold reached ({buffer_size}), scheduling training")
-            # Schedule training in background (don't await to avoid blocking)
-            asyncio.create_task(self._flush_experiences_to_training())
+            # Use asyncio.create_task with proper error handling
+            task = asyncio.create_task(
+                self._flush_experiences_to_training(),
+                name="experience_flush_training"
+            )
+            # Add done callback to log errors
+            task.add_done_callback(self._handle_flush_task_result)
 
         return buffer_size
+
+    def _handle_flush_task_result(self, task: asyncio.Task) -> None:
+        """Handle completion of flush task, logging any errors."""
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(f"[Pipeline] Flush task failed: {exc}")
+        except asyncio.CancelledError:
+            logger.debug("[Pipeline] Flush task was cancelled")
+        except asyncio.InvalidStateError:
+            pass  # Task not done yet
 
     async def get_buffered_experiences(self) -> List[Dict[str, Any]]:
         """

@@ -744,15 +744,17 @@ class SupervisorConfig:
     enable_scout: bool = False
     enable_api: bool = True
 
-    # Network ports
-    api_port: int = 8003
-    serving_port: int = 8001
-    jprime_port: int = 8000
+    # Network ports - ALL CONFIGURABLE VIA ENVIRONMENT
+    api_port: int = field(default_factory=lambda: int(os.environ.get("AGI_API_PORT", "8003")))
+    serving_port: int = field(default_factory=lambda: int(os.environ.get("AGI_SERVING_PORT", "8001")))
+    jprime_port: int = field(default_factory=lambda: int(os.environ.get("AGI_JPRIME_PORT", "8000")))
 
-    # Trinity coordination
-    trinity_dir: Path = field(default_factory=lambda: Path.home() / ".jarvis" / "trinity")
-    heartbeat_interval: float = 5.0
-    health_check_interval: float = 10.0
+    # Trinity coordination - DYNAMIC PATH RESOLUTION
+    trinity_dir: Path = field(default_factory=lambda: Path(
+        os.environ.get("TRINITY_DIR", str(Path.home() / ".jarvis" / "trinity"))
+    ))
+    heartbeat_interval: float = field(default_factory=lambda: float(os.environ.get("AGI_HEARTBEAT_INTERVAL", "5.0")))
+    health_check_interval: float = field(default_factory=lambda: float(os.environ.get("AGI_HEALTH_CHECK_INTERVAL", "10.0")))
 
     # Continuous learning
     experience_collection: bool = True
@@ -1225,9 +1227,9 @@ class AGISupervisor:
                         await self._telemetry.record_event("training_scheduled", {"job_id": job_id})
                     # Trigger actual training via unified pipeline
                     try:
-                        from reactor_core.training.unified_pipeline import get_unified_trainer
-                        trainer = await get_unified_trainer()
-                        await trainer.train_async()
+                        from reactor_core.training.unified_pipeline import get_unified_trainer_async
+                        trainer = await get_unified_trainer_async()
+                        await trainer.run_training_cycle()
                     except Exception as e:
                         logger.error(f"Scheduled training failed: {e}")
 
@@ -1806,11 +1808,19 @@ class AGISupervisor:
 
                                     # Trigger real training via unified pipeline
                                     try:
-                                        from reactor_core.training.unified_pipeline import get_unified_trainer
-                                        trainer = await get_unified_trainer()
+                                        from reactor_core.training.unified_pipeline import get_unified_trainer_async
+                                        trainer = await get_unified_trainer_async()
                                         # Pass collected experiences to trainer
-                                        await trainer.add_experiences(experience_buffer)
-                                        asyncio.create_task(trainer.train_async())
+                                        await trainer.add_experiences(experience_buffer, flush=True)
+                                        # Schedule training as background task with proper error handling
+                                        training_task = asyncio.create_task(
+                                            trainer.run_training_cycle(),
+                                            name="auto_training_cycle"
+                                        )
+                                        training_task.add_done_callback(
+                                            lambda t: logger.error(f"Training failed: {t.exception()}")
+                                            if t.exception() else logger.info("Training completed")
+                                        )
                                         experience_buffer.clear()
                                         logger.info("Training job queued with collected experiences")
                                     except ImportError:
@@ -2058,10 +2068,16 @@ Examples:
     parser.add_argument("--jarvis-path", type=Path, help="Path to JARVIS repository")
     parser.add_argument("--jprime-path", type=Path, help="Path to J-Prime repository")
 
-    # Ports
-    parser.add_argument("--api-port", type=int, default=8003, help="API server port")
-    parser.add_argument("--serving-port", type=int, default=8001, help="Model serving port")
-    parser.add_argument("--jprime-port", type=int, default=8000, help="J-Prime server port")
+    # Ports - defaults from environment variables
+    parser.add_argument("--api-port", type=int,
+                        default=int(os.environ.get("AGI_API_PORT", "8003")),
+                        help="API server port (env: AGI_API_PORT)")
+    parser.add_argument("--serving-port", type=int,
+                        default=int(os.environ.get("AGI_SERVING_PORT", "8001")),
+                        help="Model serving port (env: AGI_SERVING_PORT)")
+    parser.add_argument("--jprime-port", type=int,
+                        default=int(os.environ.get("AGI_JPRIME_PORT", "8000")),
+                        help="J-Prime server port (env: AGI_JPRIME_PORT)")
 
     # Logging
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

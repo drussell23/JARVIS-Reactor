@@ -12,6 +12,7 @@ Features:
 - Service endpoint management
 - Shared secrets management
 - Runtime configuration updates via Redis/file
+- Connection pooling for HTTP and Redis clients
 """
 
 from __future__ import annotations
@@ -21,13 +22,17 @@ import json
 import logging
 import os
 import socket
+import weakref
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, TypeVar
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class ServiceType(Enum):
@@ -76,6 +81,294 @@ class ServiceEndpoint:
     def ws_url(self) -> str:
         ws_protocol = "wss" if self.protocol == "https" else "ws"
         return f"{ws_protocol}://{self.host}:{self.port}/ws"
+
+
+# =============================================================================
+# CONNECTION POOLING
+# =============================================================================
+
+@dataclass
+class ConnectionPoolConfig:
+    """Configuration for connection pools."""
+    # HTTP connection pool settings
+    http_pool_size: int = field(
+        default_factory=lambda: int(os.getenv("HTTP_POOL_SIZE", "100"))
+    )
+    http_pool_per_host: int = field(
+        default_factory=lambda: int(os.getenv("HTTP_POOL_PER_HOST", "10"))
+    )
+    http_keepalive_timeout: float = field(
+        default_factory=lambda: float(os.getenv("HTTP_KEEPALIVE_TIMEOUT", "30.0"))
+    )
+    http_connect_timeout: float = field(
+        default_factory=lambda: float(os.getenv("HTTP_CONNECT_TIMEOUT", "10.0"))
+    )
+    http_read_timeout: float = field(
+        default_factory=lambda: float(os.getenv("HTTP_READ_TIMEOUT", "30.0"))
+    )
+
+    # Redis connection pool settings
+    redis_pool_size: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_POOL_SIZE", "10"))
+    )
+    redis_pool_min_size: int = field(
+        default_factory=lambda: int(os.getenv("REDIS_POOL_MIN_SIZE", "2"))
+    )
+
+
+class HTTPConnectionPool:
+    """
+    Managed HTTP connection pool using aiohttp.
+
+    Features:
+    - Singleton pattern per configuration
+    - Automatic session lifecycle management
+    - Connection reuse and keepalive
+    - Thread-safe initialization
+    """
+
+    _instances: Dict[str, "HTTPConnectionPool"] = {}
+    _lock: asyncio.Lock = None
+
+    def __init__(self, config: Optional[ConnectionPoolConfig] = None):
+        self.config = config or ConnectionPoolConfig()
+        self._session: Optional[Any] = None  # aiohttp.ClientSession
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    @classmethod
+    async def get_instance(
+        cls,
+        name: str = "default",
+        config: Optional[ConnectionPoolConfig] = None,
+    ) -> "HTTPConnectionPool":
+        """Get or create a named connection pool instance."""
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+
+        async with cls._lock:
+            if name not in cls._instances:
+                cls._instances[name] = cls(config)
+            return cls._instances[name]
+
+    async def _ensure_session(self) -> Any:
+        """Ensure the session is initialized."""
+        if self._session is None or self._session.closed:
+            async with self._init_lock:
+                if self._session is None or self._session.closed:
+                    await self._create_session()
+        return self._session
+
+    async def _create_session(self) -> None:
+        """Create a new aiohttp session with connection pooling."""
+        try:
+            import aiohttp
+
+            # Configure connection pool
+            connector = aiohttp.TCPConnector(
+                limit=self.config.http_pool_size,
+                limit_per_host=self.config.http_pool_per_host,
+                keepalive_timeout=self.config.http_keepalive_timeout,
+                enable_cleanup_closed=True,
+                force_close=False,
+            )
+
+            # Configure timeout
+            timeout = aiohttp.ClientTimeout(
+                connect=self.config.http_connect_timeout,
+                total=self.config.http_read_timeout,
+            )
+
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
+            self._initialized = True
+            logger.debug("HTTP connection pool created")
+
+        except ImportError:
+            logger.warning("aiohttp not available, HTTP pool disabled")
+            self._session = None
+
+    async def get(
+        self,
+        url: str,
+        **kwargs,
+    ) -> Any:
+        """Make a GET request using the pooled session."""
+        session = await self._ensure_session()
+        if session is None:
+            raise RuntimeError("HTTP session not available")
+        return await session.get(url, **kwargs)
+
+    async def post(
+        self,
+        url: str,
+        **kwargs,
+    ) -> Any:
+        """Make a POST request using the pooled session."""
+        session = await self._ensure_session()
+        if session is None:
+            raise RuntimeError("HTTP session not available")
+        return await session.post(url, **kwargs)
+
+    @asynccontextmanager
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs,
+    ) -> AsyncIterator[Any]:
+        """Context manager for making requests with automatic cleanup."""
+        session = await self._ensure_session()
+        if session is None:
+            raise RuntimeError("HTTP session not available")
+
+        async with session.request(method, url, **kwargs) as response:
+            yield response
+
+    async def close(self) -> None:
+        """Close the session and release connections."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+            self._initialized = False
+            logger.debug("HTTP connection pool closed")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get connection pool statistics."""
+        if self._session is None:
+            return {"status": "not_initialized"}
+
+        connector = self._session.connector
+        if connector is None:
+            return {"status": "no_connector"}
+
+        return {
+            "status": "active",
+            "limit": connector.limit,
+            "limit_per_host": connector.limit_per_host,
+        }
+
+    @classmethod
+    async def close_all(cls) -> None:
+        """Close all pool instances."""
+        if cls._lock is None:
+            return
+
+        async with cls._lock:
+            for name, pool in list(cls._instances.items()):
+                try:
+                    await pool.close()
+                except Exception as e:
+                    logger.warning(f"Error closing pool {name}: {e}")
+            cls._instances.clear()
+
+
+class RedisConnectionPool:
+    """
+    Managed Redis connection pool.
+
+    Features:
+    - Lazy initialization
+    - Connection reuse
+    - Automatic reconnection
+    """
+
+    _instance: Optional["RedisConnectionPool"] = None
+    _lock: asyncio.Lock = None
+
+    def __init__(self, config: Optional[ConnectionPoolConfig] = None):
+        self.config = config or ConnectionPoolConfig()
+        self._pool = None
+        self._redis = None
+        self._initialized = False
+        self._init_lock = asyncio.Lock()
+
+    @classmethod
+    async def get_instance(
+        cls,
+        config: Optional[ConnectionPoolConfig] = None,
+    ) -> "RedisConnectionPool":
+        """Get the singleton Redis pool instance."""
+        if cls._lock is None:
+            cls._lock = asyncio.Lock()
+
+        async with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls(config)
+            return cls._instance
+
+    async def _ensure_pool(self, host: str = "localhost", port: int = 6379) -> Any:
+        """Ensure the Redis pool is initialized."""
+        if self._pool is None:
+            async with self._init_lock:
+                if self._pool is None:
+                    await self._create_pool(host, port)
+        return self._pool
+
+    async def _create_pool(self, host: str, port: int) -> None:
+        """Create a Redis connection pool."""
+        try:
+            import redis.asyncio as redis
+
+            self._pool = redis.ConnectionPool(
+                host=host,
+                port=port,
+                max_connections=self.config.redis_pool_size,
+                decode_responses=True,
+            )
+            self._redis = redis.Redis(connection_pool=self._pool)
+            self._initialized = True
+            logger.debug(f"Redis connection pool created ({host}:{port})")
+
+        except ImportError:
+            logger.warning("redis library not available, Redis pool disabled")
+            self._pool = None
+            self._redis = None
+
+    async def get_client(
+        self,
+        host: str = "localhost",
+        port: int = 6379,
+    ) -> Any:
+        """Get a Redis client from the pool."""
+        await self._ensure_pool(host, port)
+        if self._redis is None:
+            raise RuntimeError("Redis not available")
+        return self._redis
+
+    async def close(self) -> None:
+        """Close the Redis pool."""
+        if self._redis:
+            await self._redis.close()
+            self._redis = None
+        if self._pool:
+            await self._pool.disconnect()
+            self._pool = None
+        self._initialized = False
+        logger.debug("Redis connection pool closed")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get Redis pool statistics."""
+        if self._pool is None:
+            return {"status": "not_initialized"}
+
+        return {
+            "status": "active",
+            "max_connections": self.config.redis_pool_size,
+        }
+
+    @classmethod
+    async def close_instance(cls) -> None:
+        """Close the singleton instance."""
+        if cls._lock is None:
+            return
+
+        async with cls._lock:
+            if cls._instance:
+                await cls._instance.close()
+                cls._instance = None
 
 
 @dataclass
@@ -274,33 +567,66 @@ class UnifiedConfig:
         self,
         service_type: ServiceType,
     ) -> bool:
-        """Check if a service is available."""
-        import aiohttp
-
+        """Check if a service is available using connection pool."""
         endpoint = self.services.get(service_type)
         if not endpoint:
             return False
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    endpoint.health_url,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as response:
-                    endpoint.is_available = response.status == 200
-                    endpoint.last_check = datetime.now()
-                    return endpoint.is_available
-        except Exception:
+            # Use connection pool for efficient connection reuse
+            pool = await HTTPConnectionPool.get_instance("unified_config")
+
+            async with pool.request("GET", endpoint.health_url) as response:
+                endpoint.is_available = response.status == 200
+                endpoint.last_check = datetime.now()
+                return endpoint.is_available
+
+        except Exception as e:
+            logger.debug(f"Health check failed for {service_type.value}: {e}")
             endpoint.is_available = False
             endpoint.last_check = datetime.now()
             return False
 
     async def check_all_services(self) -> Dict[ServiceType, bool]:
-        """Check health of all services."""
+        """Check health of all services concurrently."""
+        # Use asyncio.gather for concurrent health checks
+        service_types = list(self.services.keys())
+
+        async def check_single(stype: ServiceType) -> tuple:
+            result = await self.check_service_health(stype)
+            return (stype, result)
+
+        tasks = [check_single(stype) for stype in service_types]
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
         results = {}
-        for service_type in self.services.keys():
-            results[service_type] = await self.check_service_health(service_type)
+        for item in results_list:
+            if isinstance(item, tuple):
+                stype, result = item
+                results[stype] = result
+            else:
+                # Exception occurred
+                logger.warning(f"Health check exception: {item}")
+
         return results
+
+    async def get_redis_client(self) -> Any:
+        """Get a Redis client from the connection pool."""
+        redis_endpoint = self.services.get(ServiceType.REDIS)
+        if not redis_endpoint:
+            raise RuntimeError("Redis service not configured")
+
+        pool = await RedisConnectionPool.get_instance()
+        return await pool.get_client(
+            host=redis_endpoint.host,
+            port=redis_endpoint.port,
+        )
+
+    async def cleanup_pools(self) -> None:
+        """Cleanup all connection pools (call on shutdown)."""
+        await HTTPConnectionPool.close_all()
+        await RedisConnectionPool.close_instance()
+        logger.info("Connection pools cleaned up")
 
     def add_config_callback(
         self,
@@ -404,6 +730,9 @@ __all__ = [
     "ServiceEndpoint",
     "RepoConfig",
     "Environment",
+    "ConnectionPoolConfig",
+    "HTTPConnectionPool",
+    "RedisConnectionPool",
     "get_config",
     "reset_config",
 ]

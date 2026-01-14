@@ -742,6 +742,36 @@ class EventBridge:
         )
 
 
+def _get_default_events_dir() -> Path:
+    """
+    Get the default events directory using dynamic path resolution.
+
+    Priority:
+    1. JARVIS_EVENTS_DIR environment variable
+    2. base_config's resolve_path (if available)
+    3. XDG_DATA_HOME/jarvis/events
+    """
+    # Check environment variable first
+    env_value = os.getenv("JARVIS_EVENTS_DIR")
+    if env_value:
+        path = Path(env_value)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    # Try base_config's path resolver
+    try:
+        from reactor_core.config.base_config import resolve_path
+        return resolve_path("jarvis_events", env_var="JARVIS_EVENTS_DIR", subdir="events")
+    except ImportError:
+        pass
+
+    # XDG-compliant fallback
+    xdg_data_home = os.getenv("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    path = Path(xdg_data_home) / "jarvis" / "events"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def create_event_bridge(
     source: EventSource,
     events_dir: Optional[Path] = None,
@@ -752,7 +782,7 @@ def create_event_bridge(
 
     Args:
         source: The source identifier for this service
-        events_dir: Directory for file-based events (default: ~/.jarvis/events)
+        events_dir: Directory for file-based events (uses dynamic resolution if None)
         websocket_url: Optional WebSocket URL for real-time sync
 
     Returns:
@@ -762,10 +792,7 @@ def create_event_bridge(
 
     # File transport (always enabled as fallback)
     if events_dir is None:
-        events_dir = Path(os.getenv(
-            "JARVIS_EVENTS_DIR",
-            Path.home() / ".jarvis" / "events"
-        ))
+        events_dir = _get_default_events_dir()
 
     transports.append(FileTransport(events_dir, source))
 

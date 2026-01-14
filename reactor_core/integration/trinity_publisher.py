@@ -70,28 +70,72 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION - DYNAMIC PATH RESOLUTION
 # =============================================================================
 
 def _get_events_dir() -> Path:
-    """Get the events directory, creating if needed."""
-    events_dir = Path(os.environ.get(
-        "REACTOR_EVENTS_DIR",
-        str(Path.home() / ".jarvis" / "reactor" / "events")
-    ))
-    events_dir.mkdir(parents=True, exist_ok=True)
+    """Get the events directory using dynamic path resolution."""
+    try:
+        from reactor_core.config.base_config import resolve_path
+        events_dir = resolve_path(
+            "reactor_events",
+            env_var="REACTOR_EVENTS_DIR",
+            xdg_type="data",
+            subdir="reactor/events"
+        )
+    except ImportError:
+        # Fallback if config not available
+        events_dir = Path(os.environ.get(
+            "REACTOR_EVENTS_DIR",
+            str(Path.home() / ".jarvis" / "reactor" / "events")
+        ))
+        events_dir.mkdir(parents=True, exist_ok=True)
     return events_dir
 
 
 def _is_publishing_enabled() -> bool:
     """Check if event publishing is enabled."""
     return os.environ.get("REACTOR_EVENTS_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+def _validate_model_path(model_path: str) -> Path:
+    """
+    Validate and resolve model path.
+
+    Args:
+        model_path: Path string to validate
+
+    Returns:
+        Resolved absolute Path
+
+    Raises:
+        FileNotFoundError: If path doesn't exist
+        ValueError: If path is invalid
+    """
+    path = Path(model_path).expanduser().resolve()
+
+    # If not absolute, try to resolve relative to common model directories
+    if not path.is_absolute():
+        candidates = [
+            Path.home() / ".jarvis" / "models" / model_path,
+            Path.home() / ".jarvis" / "training" / "output" / model_path,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                path = candidate
+                break
+
+    if not path.exists():
+        logger.warning(f"[TRINITY] Model path does not exist: {path}")
+        # Don't raise - path might be created later
+
+    return path
 
 
 # =============================================================================
@@ -309,7 +353,7 @@ async def publish_training_failed(
 
 async def publish_model_ready(
     model_name: str,
-    model_path: str,
+    model_path: Union[str, Path],
     capabilities: Optional[List[str]] = None,
     model_type: str = "llm",
     metadata: Optional[Dict[str, Any]] = None,
@@ -330,11 +374,14 @@ async def publish_model_ready(
     Returns:
         True if published successfully
     """
+    # Validate and resolve path
+    validated_path = _validate_model_path(str(model_path))
+
     event = ReactorEvent(
         event_type=ReactorEventType.MODEL_UPDATED,
         payload={
             "model_name": model_name,
-            "model_path": str(model_path),
+            "model_path": str(validated_path),  # Use validated absolute path
             "model_type": model_type,
             "capabilities": capabilities or ["text_generation"],
             "metadata": metadata or {},
@@ -345,8 +392,41 @@ async def publish_model_ready(
 
 
 # =============================================================================
-# SYNC WRAPPERS (for non-async code)
+# SYNC WRAPPERS (for non-async code) - FIXED: No deprecated asyncio patterns
 # =============================================================================
+
+def _run_async_in_sync(coro) -> Any:
+    """
+    Safely run async coroutine from sync context.
+
+    Handles all edge cases:
+    - No running loop: use asyncio.run()
+    - Running loop in same thread: schedule and return True (fire-and-forget)
+    - Running loop in different thread: use run_coroutine_threadsafe()
+    """
+    import threading
+
+    try:
+        # Try to get the running loop
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop - safe to use asyncio.run()
+        return asyncio.run(coro)
+
+    # There's a running loop - check if we're in the same thread
+    if threading.current_thread() is threading.main_thread():
+        # Same thread - schedule as task (fire-and-forget)
+        asyncio.create_task(coro)
+        return True
+    else:
+        # Different thread - use thread-safe method
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout=30.0)
+        except Exception as e:
+            logger.error(f"[TRINITY] Sync wrapper error: {e}")
+            return False
+
 
 def publish_training_started_sync(
     model_name: str,
@@ -354,17 +434,7 @@ def publish_training_started_sync(
     run_id: Optional[str] = None,
 ) -> bool:
     """Sync wrapper for publish_training_started."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Schedule coroutine without blocking
-            asyncio.ensure_future(publish_training_started(model_name, config, run_id))
-            return True
-        else:
-            return loop.run_until_complete(publish_training_started(model_name, config, run_id))
-    except RuntimeError:
-        # No event loop - create one
-        return asyncio.run(publish_training_started(model_name, config, run_id))
+    return _run_async_in_sync(publish_training_started(model_name, config, run_id))
 
 
 def publish_training_complete_sync(
@@ -375,21 +445,9 @@ def publish_training_complete_sync(
     training_time_seconds: Optional[float] = None,
 ) -> bool:
     """Sync wrapper for publish_training_complete."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(publish_training_complete(
-                model_name, model_path, metrics, total_steps, training_time_seconds
-            ))
-            return True
-        else:
-            return loop.run_until_complete(publish_training_complete(
-                model_name, model_path, metrics, total_steps, training_time_seconds
-            ))
-    except RuntimeError:
-        return asyncio.run(publish_training_complete(
-            model_name, model_path, metrics, total_steps, training_time_seconds
-        ))
+    return _run_async_in_sync(publish_training_complete(
+        model_name, model_path, metrics, total_steps, training_time_seconds
+    ))
 
 
 def publish_model_ready_sync(
@@ -400,21 +458,9 @@ def publish_model_ready_sync(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Sync wrapper for publish_model_ready."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(publish_model_ready(
-                model_name, model_path, capabilities, model_type, metadata
-            ))
-            return True
-        else:
-            return loop.run_until_complete(publish_model_ready(
-                model_name, model_path, capabilities, model_type, metadata
-            ))
-    except RuntimeError:
-        return asyncio.run(publish_model_ready(
-            model_name, model_path, capabilities, model_type, metadata
-        ))
+    return _run_async_in_sync(publish_model_ready(
+        model_name, model_path, capabilities, model_type, metadata
+    ))
 
 
 # =============================================================================
