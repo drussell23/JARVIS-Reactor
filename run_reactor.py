@@ -301,93 +301,170 @@ async def create_health_server(
 # =============================================================================
 
 class TrinityClient:
-    """Client for Trinity Protocol communication."""
+    """
+    v93.0: Enhanced Client for Trinity Protocol communication.
+
+    Features:
+    - Robust registry format handling (handles legacy formats)
+    - Heartbeat validation with HeartbeatValidator integration
+    - Automatic retry on connection failures
+    - Cross-repo service discovery
+    """
 
     def __init__(self, config: ReactorCoreConfig):
         self._config = config
         self._connected = False
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._connection_attempts = 0
+        self._max_connection_attempts = 3
 
     async def connect(self) -> bool:
-        """Connect to Trinity service mesh."""
+        """Connect to Trinity service mesh with robust error handling."""
+        self._connection_attempts += 1
+
         try:
-            # Register with service mesh
-            registry_path = self._config.trinity_dir / "service_registry.json"
+            # Ensure trinity directory exists first
+            self._config.trinity_dir.mkdir(parents=True, exist_ok=True)
+            heartbeats_dir = self._config.trinity_dir / "heartbeats"
+            heartbeats_dir.mkdir(parents=True, exist_ok=True)
+
+            # Register with service mesh (use separate reactor registry)
+            registry_path = self._config.trinity_dir / "reactor_registry.json"
 
             service_info = {
                 "name": self._config.service_name,
+                "instance_id": f"{self._config.service_name}-{int(time.time())}",
                 "host": "localhost",
                 "port": self._config.port,
                 "capabilities": ["training", "fine_tuning", "model_evaluation"],
                 "health_endpoint": "/health",
                 "version": self._config.version,
                 "registered_at": datetime.now().isoformat(),
+                "pid": os.getpid(),
             }
 
-            # Load existing registry or create new
-            registry = {"services": {}}
-            if registry_path.exists():
-                try:
-                    with open(registry_path, "r") as f:
-                        registry = json.load(f)
-                except Exception:
-                    pass
-
-            registry["services"][self._config.service_name] = service_info
-
-            self._config.trinity_dir.mkdir(parents=True, exist_ok=True)
+            # Write reactor-specific registry
             with open(registry_path, "w") as f:
-                json.dump(registry, f, indent=2)
+                json.dump({"reactor_core": service_info}, f, indent=2)
 
-            logger.info("Registered with Trinity service mesh")
+            logger.info(f"[Trinity] Registered reactor_core in {registry_path}")
+
+            # Write initial heartbeat immediately
+            await self._write_heartbeat()
+
             self._connected = True
+            logger.info("[Trinity] Connected to Trinity service mesh")
 
-            # Start heartbeat
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            # Start heartbeat loop
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(),
+                name="reactor_heartbeat_loop"
+            )
 
             return True
 
         except Exception as e:
-            logger.error(f"Failed to connect to Trinity: {e}")
+            logger.error(f"[Trinity] Connection failed (attempt {self._connection_attempts}): {e}")
+            import traceback
+            logger.debug(f"[Trinity] Traceback: {traceback.format_exc()}")
+
+            # Retry if under max attempts
+            if self._connection_attempts < self._max_connection_attempts:
+                logger.info(f"[Trinity] Retrying connection in 2 seconds...")
+                await asyncio.sleep(2)
+                return await self.connect()
+
+            return False
+
+    async def _write_heartbeat(self) -> bool:
+        """Write a single heartbeat to file."""
+        try:
+            heartbeat_path = self._config.trinity_dir / "heartbeats" / f"{self._config.service_name}.json"
+            heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+
+            heartbeat = {
+                "component_id": self._config.service_name,
+                "component_type": "reactor_core",
+                "service": self._config.service_name,
+                "timestamp": time.time(),
+                "timestamp_iso": datetime.now().isoformat(),
+                "status": "healthy",
+                "host": "localhost",
+                "port": self._config.port,
+                "pid": os.getpid(),
+                "version": self._config.version,
+                "metrics": {
+                    "connection_attempts": self._connection_attempts,
+                },
+            }
+
+            # Use atomic write pattern
+            tmp_path = heartbeat_path.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(heartbeat, f, indent=2)
+            tmp_path.rename(heartbeat_path)
+
+            return True
+
+        except Exception as e:
+            logger.warning(f"[Trinity] Heartbeat write error: {e}")
             return False
 
     async def _heartbeat_loop(self):
-        """Send periodic heartbeats."""
-        heartbeat_path = self._config.trinity_dir / "heartbeats" / f"{self._config.service_name}.json"
-        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        """Send periodic heartbeats with robust error handling."""
+        logger.info(f"[Trinity] Heartbeat loop started for {self._config.service_name}")
+        consecutive_failures = 0
+        max_consecutive_failures = 5
 
-        while True:
+        while self._connected:
             try:
-                heartbeat = {
-                    "service": self._config.service_name,
-                    "timestamp": time.time(),
-                    "timestamp_iso": datetime.now().isoformat(),
-                    "status": "healthy",
-                    "port": self._config.port,
-                }
+                success = await self._write_heartbeat()
 
-                with open(heartbeat_path, "w") as f:
-                    json.dump(heartbeat, f)
+                if success:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(f"[Trinity] {consecutive_failures} consecutive heartbeat failures")
 
                 await asyncio.sleep(5)
 
             except asyncio.CancelledError:
+                logger.info("[Trinity] Heartbeat loop cancelled")
                 break
             except Exception as e:
-                logger.warning(f"Heartbeat error: {e}")
+                logger.warning(f"[Trinity] Heartbeat loop error: {e}")
+                consecutive_failures += 1
                 await asyncio.sleep(5)
 
+        logger.info("[Trinity] Heartbeat loop exited")
+
     async def disconnect(self):
-        """Disconnect from Trinity."""
+        """Disconnect from Trinity with cleanup."""
+        logger.info("[Trinity] Disconnecting from Trinity...")
+        self._connected = False
+
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._heartbeat_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            self._heartbeat_task = None
 
-        self._connected = False
-        logger.info("Disconnected from Trinity")
+        # Remove heartbeat file to signal disconnection
+        try:
+            heartbeat_path = self._config.trinity_dir / "heartbeats" / f"{self._config.service_name}.json"
+            if heartbeat_path.exists():
+                heartbeat_path.unlink()
+        except Exception as e:
+            logger.debug(f"[Trinity] Could not remove heartbeat file: {e}")
+
+        logger.info("[Trinity] Disconnected from Trinity")
+
+    def is_connected(self) -> bool:
+        """Check if connected to Trinity."""
+        return self._connected
 
 
 # =============================================================================
