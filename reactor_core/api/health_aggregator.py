@@ -103,6 +103,13 @@ class HealthConfig:
     # SLA
     SLA_TARGET_UPTIME = float(os.getenv("HEALTH_SLA_TARGET", "99.9"))  # 99.9%
 
+    # Startup-aware configuration (v93.4)
+    STARTUP_GRACE_PERIOD = float(os.getenv("TRINITY_STARTUP_GRACE_PERIOD", "120.0"))
+    STARTUP_UNHEALTHY_MULTIPLIER = float(os.getenv("HEALTH_STARTUP_THRESHOLD_MULTIPLIER", "5.0"))
+    STARTUP_CHECK_INTERVAL = float(os.getenv("HEALTH_STARTUP_CHECK_INTERVAL", "10.0"))
+    CIRCUIT_HALF_OPEN_SECONDS = float(os.getenv("HEALTH_CIRCUIT_HALF_OPEN", "30.0"))
+    STARTUP_CIRCUIT_HALF_OPEN_SECONDS = float(os.getenv("HEALTH_STARTUP_CIRCUIT_HALF_OPEN", "10.0"))
+
 
 # ============================================================================
 # Data Models
@@ -249,6 +256,8 @@ class ComponentChecker:
 
     Supports HTTP health endpoints with configurable timeout
     and circuit breaker pattern.
+
+    v93.4: Startup-aware circuit breaker and failure thresholds.
     """
 
     def __init__(
@@ -256,35 +265,61 @@ class ComponentChecker:
         component: str,
         health_url: str,
         timeout: float = HealthConfig.TIMEOUT_SECONDS,
+        aggregator_start_time: Optional[float] = None,
     ):
         self.component = component
         self.health_url = health_url
         self.timeout = timeout
+        self._aggregator_start_time = aggregator_start_time or time.time()
 
         # Circuit breaker state
         self._circuit_open = False
         self._circuit_opened_at: float = 0
-        self._circuit_half_open_after: float = 30.0  # Try again after 30s
 
         # Statistics
         self._consecutive_failures = 0
         self._latencies: Deque[float] = deque(maxlen=100)
 
+    def is_in_startup_phase(self) -> bool:
+        """Check if we're still in the startup grace period."""
+        return (time.time() - self._aggregator_start_time) < HealthConfig.STARTUP_GRACE_PERIOD
+
+    def get_circuit_half_open_seconds(self) -> float:
+        """Get circuit half-open timeout, shorter during startup for faster recovery."""
+        if self.is_in_startup_phase():
+            return HealthConfig.STARTUP_CIRCUIT_HALF_OPEN_SECONDS
+        return HealthConfig.CIRCUIT_HALF_OPEN_SECONDS
+
+    def get_unhealthy_threshold(self) -> int:
+        """Get unhealthy threshold, more lenient during startup."""
+        base_threshold = HealthConfig.UNHEALTHY_THRESHOLD
+        if self.is_in_startup_phase():
+            return int(base_threshold * HealthConfig.STARTUP_UNHEALTHY_MULTIPLIER)
+        return base_threshold
+
+    def update_aggregator_start_time(self, start_time: float):
+        """Update the aggregator start time for startup phase detection."""
+        self._aggregator_start_time = start_time
+
     async def check(self) -> HealthCheck:
         """Perform health check."""
         start_time = time.time()
 
-        # Check circuit breaker
+        # Check circuit breaker (v93.4: startup-aware half-open timeout)
         if self._circuit_open:
-            if time.time() - self._circuit_opened_at > self._circuit_half_open_after:
+            half_open_timeout = self.get_circuit_half_open_seconds()
+            if time.time() - self._circuit_opened_at > half_open_timeout:
                 # Half-open: try one request
-                pass
+                logger.debug(
+                    f"[Health] {self.component} circuit breaker half-open after {half_open_timeout}s"
+                    f" (startup_phase={self.is_in_startup_phase()})"
+                )
             else:
                 return HealthCheck(
                     component=self.component,
                     status=HealthStatus.UNHEALTHY,
                     latency_ms=0,
-                    error="Circuit breaker open",
+                    error=f"Circuit breaker open (retry in {half_open_timeout - (time.time() - self._circuit_opened_at):.1f}s)",
                 )
 
         try:
@@ -338,16 +373,32 @@ class ComponentChecker:
             return self._handle_failure(latency_ms, str(e))
 
     def _handle_failure(self, latency_ms: float, error: str) -> HealthCheck:
-        """Handle check failure."""
+        """Handle check failure (v93.4: startup-aware thresholds)."""
         self._consecutive_failures += 1
 
-        if self._consecutive_failures >= HealthConfig.UNHEALTHY_THRESHOLD:
+        # During startup, use more lenient threshold before opening circuit
+        threshold = self.get_unhealthy_threshold()
+        if self._consecutive_failures >= threshold:
             self._circuit_open = True
             self._circuit_opened_at = time.time()
+            logger.warning(
+                f"[Health] {self.component} circuit breaker opened after {self._consecutive_failures} failures "
+                f"(threshold={threshold}, startup_phase={self.is_in_startup_phase()})"
+            )
+
+        # During startup, mark as DEGRADED instead of UNHEALTHY for transient failures
+        if self.is_in_startup_phase() and self._consecutive_failures < threshold:
+            status = HealthStatus.DEGRADED
+            logger.debug(
+                f"[Health] {self.component} startup degraded: {error} "
+                f"(failures={self._consecutive_failures}/{threshold})"
+            )
+        else:
+            status = HealthStatus.UNHEALTHY
 
         return HealthCheck(
             component=self.component,
-            status=HealthStatus.UNHEALTHY,
+            status=status,
             latency_ms=latency_ms,
             error=error,
         )
@@ -700,14 +751,30 @@ class HealthAggregator:
 
     Coordinates health checks across all components and provides
     unified dashboard data.
+
+    v93.4: Startup-aware health checking with configurable grace periods.
     """
 
     def __init__(self):
-        # Component checkers
+        self._start_time = time.time()
+
+        # Component checkers (v93.4: pass start time for startup-aware checking)
         self._checkers: Dict[str, ComponentChecker] = {
-            "jarvis": ComponentChecker("jarvis", HealthConfig.JARVIS_HEALTH_URL),
-            "prime": ComponentChecker("prime", HealthConfig.PRIME_HEALTH_URL),
-            "reactor-core": ComponentChecker("reactor-core", HealthConfig.REACTOR_HEALTH_URL),
+            "jarvis": ComponentChecker(
+                "jarvis",
+                HealthConfig.JARVIS_HEALTH_URL,
+                aggregator_start_time=self._start_time,
+            ),
+            "prime": ComponentChecker(
+                "prime",
+                HealthConfig.PRIME_HEALTH_URL,
+                aggregator_start_time=self._start_time,
+            ),
+            "reactor-core": ComponentChecker(
+                "reactor-core",
+                HealthConfig.REACTOR_HEALTH_URL,
+                aggregator_start_time=self._start_time,
+            ),
         }
 
         # Component health state
@@ -723,12 +790,21 @@ class HealthAggregator:
         # State
         self._running = False
         self._check_task: Optional[asyncio.Task] = None
-        self._start_time = time.time()
 
         # Dashboard cache
         self._dashboard_cache: Optional[DashboardData] = None
         self._dashboard_cache_ttl: float = 5.0  # seconds
         self._dashboard_cache_time: float = 0
+
+    def is_in_startup_phase(self) -> bool:
+        """Check if the aggregator is still in the startup grace period."""
+        return (time.time() - self._start_time) < HealthConfig.STARTUP_GRACE_PERIOD
+
+    def get_check_interval(self) -> float:
+        """Get check interval, faster during startup for quicker recovery detection."""
+        if self.is_in_startup_phase():
+            return HealthConfig.STARTUP_CHECK_INTERVAL
+        return HealthConfig.CHECK_INTERVAL_SECONDS
 
     async def start(self):
         """Start health monitoring."""
@@ -737,9 +813,17 @@ class HealthAggregator:
 
         self._running = True
         self._start_time = time.time()
+
+        # Update all checkers with the new start time
+        for checker in self._checkers.values():
+            checker.update_aggregator_start_time(self._start_time)
+
         self._check_task = asyncio.create_task(self._check_loop())
 
-        logger.info("[Health] Aggregator started")
+        logger.info(
+            f"[Health] Aggregator started (startup_grace={HealthConfig.STARTUP_GRACE_PERIOD}s, "
+            f"startup_check_interval={HealthConfig.STARTUP_CHECK_INTERVAL}s)"
+        )
 
     async def stop(self):
         """Stop health monitoring."""
@@ -756,7 +840,11 @@ class HealthAggregator:
 
     def add_component(self, name: str, health_url: str):
         """Add a component to monitor."""
-        self._checkers[name] = ComponentChecker(name, health_url)
+        self._checkers[name] = ComponentChecker(
+            name,
+            health_url,
+            aggregator_start_time=self._start_time,
+        )
         self._components[name] = ComponentHealth(component=name)
 
     def remove_component(self, name: str):
@@ -769,11 +857,24 @@ class HealthAggregator:
         self._alerts.register_callback(callback)
 
     async def _check_loop(self):
-        """Main health check loop."""
+        """Main health check loop (v93.4: startup-aware dynamic intervals)."""
+        last_interval_log = 0
+
         while self._running:
             try:
                 await self._perform_checks()
-                await asyncio.sleep(HealthConfig.CHECK_INTERVAL_SECONDS)
+
+                # Use faster interval during startup for quicker recovery detection
+                interval = self.get_check_interval()
+
+                # Log interval changes (at most once per minute)
+                now = time.time()
+                if now - last_interval_log > 60:
+                    startup_status = "startup" if self.is_in_startup_phase() else "normal"
+                    logger.debug(f"[Health] Check interval: {interval}s ({startup_status} mode)")
+                    last_interval_log = now
+
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -919,15 +1020,25 @@ class HealthAggregator:
         return results
 
     async def get_stats(self) -> Dict[str, Any]:
-        """Get aggregator statistics."""
+        """Get aggregator statistics (v93.4: includes startup phase info)."""
+        uptime = time.time() - self._start_time
+        in_startup = self.is_in_startup_phase()
+
         return {
             "running": self._running,
-            "uptime_seconds": time.time() - self._start_time,
+            "uptime_seconds": uptime,
             "components_monitored": len(self._components),
-            "check_interval_seconds": HealthConfig.CHECK_INTERVAL_SECONDS,
+            "check_interval_seconds": self.get_check_interval(),
             "active_alerts": len(await self._alerts.get_active_alerts()),
+            "startup_phase": in_startup,
+            "startup_remaining_seconds": max(0, HealthConfig.STARTUP_GRACE_PERIOD - uptime) if in_startup else 0,
+            "startup_grace_period": HealthConfig.STARTUP_GRACE_PERIOD,
             "checkers": {
-                name: checker.get_stats()
+                name: {
+                    **checker.get_stats(),
+                    "startup_phase": checker.is_in_startup_phase(),
+                    "effective_unhealthy_threshold": checker.get_unhealthy_threshold(),
+                }
                 for name, checker in self._checkers.items()
             },
         }
