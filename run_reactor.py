@@ -50,9 +50,17 @@ import os
 import signal
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# v96.0: Process fingerprinting for enhanced service registry
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -64,6 +72,80 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("reactor.core")
+
+
+# =============================================================================
+# v96.0: PROCESS FINGERPRINTING FOR SERVICE REGISTRY
+# =============================================================================
+
+def _get_process_fingerprint() -> Dict[str, Any]:
+    """
+    v96.0: Capture process fingerprint for enhanced service registry.
+
+    This enables PID reuse detection and process identity validation.
+    If the same PID is reused by a different process (after a crash),
+    the fingerprint mismatch will detect this.
+
+    Returns:
+        Dictionary with process fingerprint data
+    """
+    fingerprint = {
+        "pid": os.getpid(),
+        "process_name": "",
+        "process_cmdline": "",
+        "process_exe_path": "",
+        "process_cwd": "",
+        "parent_pid": 0,
+        "parent_name": "",
+        "process_start_time": 0.0,
+    }
+
+    if PSUTIL_AVAILABLE:
+        try:
+            proc = psutil.Process()
+            fingerprint["process_name"] = proc.name()
+            fingerprint["process_cmdline"] = " ".join(proc.cmdline())
+            fingerprint["process_exe_path"] = proc.exe()
+            fingerprint["process_cwd"] = proc.cwd()
+            fingerprint["process_start_time"] = proc.create_time()
+
+            # Parent process info
+            parent = proc.parent()
+            if parent:
+                fingerprint["parent_pid"] = parent.pid
+                fingerprint["parent_name"] = parent.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, Exception) as e:
+            logger.debug(f"[v96.0] Process fingerprint capture partial: {e}")
+
+    return fingerprint
+
+
+def _get_machine_id() -> str:
+    """
+    v96.0: Get unique machine identifier for distributed environments.
+
+    This helps identify which machine owns a lock/registration when
+    multiple machines may have the same PID.
+    """
+    # Try various methods to get machine ID
+    machine_id_paths = [
+        "/etc/machine-id",           # Linux
+        "/var/lib/dbus/machine-id",  # Older Linux
+    ]
+
+    for path in machine_id_paths:
+        try:
+            if Path(path).exists():
+                return Path(path).read_text().strip()
+        except Exception:
+            pass
+
+    # Fallback: use hostname + some system info
+    try:
+        import platform
+        return f"{platform.node()}-{uuid.getnode()}"
+    except Exception:
+        return f"unknown-{uuid.uuid4().hex[:8]}"
 
 
 # =============================================================================
@@ -487,7 +569,13 @@ class ReactorCoreService:
         self._shutdown_event = asyncio.Event()
 
     async def start(self):
-        """Start the Reactor Core service."""
+        """
+        v95.0: Start the Reactor Core service with shared service registration.
+
+        Registers Reactor Core with the shared service registry at
+        ~/.jarvis/registry/services.json to enable TrinityIntegrator's
+        registration-aware verification.
+        """
         logger.info(f"Starting Reactor Core service {self._config.version}")
 
         # Load persisted jobs
@@ -499,6 +587,85 @@ class ReactorCoreService:
             self._state,
             self._job_manager,
         )
+
+        # v95.0: Register with shared service registry IMMEDIATELY after health server
+        # This is CRITICAL for TrinityIntegrator's registration-aware verification
+        try:
+            registry_dir = Path(os.getenv(
+                "JARVIS_REGISTRY_DIR",
+                str(Path.home() / ".jarvis" / "registry")
+            ))
+            registry_dir.mkdir(parents=True, exist_ok=True)
+            registry_file = registry_dir / "services.json"
+
+            # Read existing registry (atomic)
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    existing_services = json.loads(registry_file.read_text())
+                    if not isinstance(existing_services, dict):
+                        existing_services = {}
+                except (json.JSONDecodeError, Exception):
+                    existing_services = {}
+
+            # Register Reactor Core with v96.0 enhanced fields
+            # Capture process fingerprint for PID reuse detection
+            fingerprint = _get_process_fingerprint()
+            machine_id = _get_machine_id()
+
+            # Determine configured port vs actual port
+            configured_port = int(os.getenv("REACTOR_PORT", "8090"))
+            actual_port = self._config.port
+            is_fallback = actual_port != configured_port
+
+            existing_services["reactor_core"] = {
+                "service_name": "reactor_core",
+                "pid": os.getpid(),
+                "port": actual_port,
+                "host": self._config.host,
+                "health_endpoint": "/health",
+                "status": "starting",
+                "registered_at": time.time(),
+                "last_heartbeat": time.time(),
+                "metadata": {
+                    "version": self._config.version,
+                    "role": "training_pipeline",
+                    "trinity_enabled": self._config.trinity_enabled,
+                },
+                # v96.0: Port fallback tracking (Problem 17 fix)
+                "primary_port": configured_port,
+                "is_fallback_port": is_fallback,
+                "fallback_reason": f"Port {configured_port} unavailable" if is_fallback else "",
+                "ports_tried": [configured_port] if is_fallback else [],
+                "port_allocation_time": time.time(),
+                # v96.0: Process fingerprint for identity validation (Problem 18 fix)
+                "process_name": fingerprint["process_name"],
+                "process_cmdline": fingerprint["process_cmdline"],
+                "process_exe_path": fingerprint["process_exe_path"],
+                "process_cwd": fingerprint["process_cwd"],
+                "parent_pid": fingerprint["parent_pid"],
+                "parent_name": fingerprint["parent_name"],
+                "process_start_time": fingerprint["process_start_time"],
+                # v96.0: Machine ID for distributed environments
+                "machine_id": machine_id,
+            }
+
+            # Also register under alternate names for compatibility
+            existing_services["reactor-core"] = existing_services["reactor_core"]
+            existing_services["reactor"] = existing_services["reactor_core"]
+
+            # Write atomically using temp file + rename
+            temp_file = registry_file.with_suffix(".tmp")
+            temp_file.write_text(json.dumps(existing_services, indent=2))
+            temp_file.rename(registry_file)
+
+            fallback_msg = f" (fallback from {configured_port})" if is_fallback else ""
+            logger.info(
+                f"[v96.0] ✅ Registered with service registry: "
+                f"{registry_file} (port={actual_port}{fallback_msg}, pid={os.getpid()})"
+            )
+        except Exception as e:
+            logger.warning(f"[v95.0] Service registry registration failed (non-fatal): {e}")
 
         # Connect to Trinity if enabled
         if self._config.trinity_enabled:
@@ -530,8 +697,40 @@ class ReactorCoreService:
         await self._shutdown_event.wait()
 
     async def stop(self):
-        """Stop the Reactor Core service."""
+        """
+        v95.0: Stop the Reactor Core service with service deregistration.
+
+        Ensures Reactor Core is removed from the shared service registry
+        so TrinityIntegrator knows it's no longer available.
+        """
         logger.info("Stopping Reactor Core service...")
+
+        # v95.0: Deregister from shared service registry FIRST
+        try:
+            registry_dir = Path(os.getenv(
+                "JARVIS_REGISTRY_DIR",
+                str(Path.home() / ".jarvis" / "registry")
+            ))
+            registry_file = registry_dir / "services.json"
+
+            if registry_file.exists():
+                try:
+                    existing_services = json.loads(registry_file.read_text())
+                    if isinstance(existing_services, dict):
+                        # Remove all Reactor Core entries
+                        for name in ["reactor_core", "reactor-core", "reactor"]:
+                            existing_services.pop(name, None)
+
+                        # Write back atomically
+                        temp_file = registry_file.with_suffix(".tmp")
+                        temp_file.write_text(json.dumps(existing_services, indent=2))
+                        temp_file.rename(registry_file)
+
+                        logger.info("[v95.0] ✅ Deregistered from service registry")
+                except Exception as e:
+                    logger.debug(f"[v95.0] Service deregistration error: {e}")
+        except Exception as e:
+            logger.debug(f"[v95.0] Registry cleanup error: {e}")
 
         self._state["running"] = False
 
