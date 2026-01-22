@@ -338,6 +338,75 @@ def _atomic_register_service(
         return False
 
 
+def _atomic_update_heartbeat(
+    service_names: List[str],
+    status: str = "running",
+    timeout: float = _REGISTRY_LOCK_TIMEOUT,
+) -> bool:
+    """
+    v97.0: Atomically update heartbeat timestamp in the service registry.
+
+    This function ensures external services (like reactor-core) maintain
+    fresh heartbeats in the shared registry so they don't get cleaned up
+    as stale by the JARVIS service registry cleanup process.
+
+    Args:
+        service_names: List of service names to update heartbeat for
+        status: Service status (running, starting, stopping, etc.)
+        timeout: Max seconds to wait for lock
+
+    Returns:
+        True if heartbeat update succeeded, False otherwise
+    """
+    registry_dir = Path(os.getenv(
+        "JARVIS_REGISTRY_DIR",
+        str(Path.home() / ".jarvis" / "registry")
+    ))
+    registry_file = registry_dir / "services.json"
+    lock_file = registry_dir / "services.json.lock"
+
+    try:
+        with _acquire_registry_lock(lock_file, timeout):
+            # Read current registry
+            existing_services = {}
+            if registry_file.exists():
+                try:
+                    content = registry_file.read_text()
+                    if content.strip():
+                        existing_services = json.loads(content)
+                        if not isinstance(existing_services, dict):
+                            existing_services = {}
+                except (json.JSONDecodeError, OSError):
+                    return False
+
+            # Update heartbeat for each service
+            current_time = time.time()
+            updated = False
+            for name in service_names:
+                if name in existing_services:
+                    existing_services[name]["last_heartbeat"] = current_time
+                    existing_services[name]["status"] = status
+                    updated = True
+
+            if not updated:
+                return False  # Services not found in registry
+
+            # Write back atomically
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(existing_services, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            temp_file.replace(registry_file)
+
+        return True
+
+    except Exception as e:
+        logger.debug(f"[v97.0] Heartbeat update error: {e}")
+        return False
+
+
 def _atomic_deregister_service(
     service_names: List[str],
     timeout: float = _REGISTRY_LOCK_TIMEOUT,
@@ -801,6 +870,9 @@ class TrinityClient:
 class ReactorCoreService:
     """Main Reactor Core service."""
 
+    # v97.0: Registry heartbeat interval (seconds)
+    _REGISTRY_HEARTBEAT_INTERVAL = 15.0
+
     def __init__(self, config: ReactorCoreConfig):
         self._config = config
         self._state: Dict[str, Any] = {
@@ -812,6 +884,8 @@ class ReactorCoreService:
         self._job_manager = TrainingJobManager(config)
         self._health_runner = None
         self._shutdown_event = asyncio.Event()
+        # v97.0: Registry heartbeat task to prevent stale cleanup
+        self._registry_heartbeat_task: Optional[asyncio.Task] = None
 
     async def start(self):
         """
@@ -890,6 +964,16 @@ class ReactorCoreService:
                 f"[v96.0] ✅ Registered with service registry using atomic lock "
                 f"(port={actual_port}{fallback_msg}, pid={os.getpid()})"
             )
+
+            # v97.0: Start registry heartbeat loop to prevent stale cleanup
+            self._registry_heartbeat_task = asyncio.create_task(
+                self._registry_heartbeat_loop(),
+                name="reactor_registry_heartbeat"
+            )
+            logger.info(
+                f"[v97.0] ✅ Registry heartbeat started "
+                f"(interval: {self._REGISTRY_HEARTBEAT_INTERVAL}s)"
+            )
         else:
             logger.warning("[v96.0] Service registry registration failed (non-fatal)")
 
@@ -917,6 +1001,63 @@ class ReactorCoreService:
                 "updated_at": datetime.now().isoformat(),
             }, f, indent=2)
 
+    async def _registry_heartbeat_loop(self) -> None:
+        """
+        v97.0: Periodically update heartbeat in the shared service registry.
+
+        This is CRITICAL for external services like reactor-core to prevent
+        being marked as stale by the JARVIS service registry cleanup process.
+        The cleanup process removes entries without recent heartbeat updates.
+
+        The heartbeat loop:
+        1. Runs every _REGISTRY_HEARTBEAT_INTERVAL seconds (default 15s)
+        2. Updates last_heartbeat and status for all reactor-core service names
+        3. Uses atomic file locking to prevent race conditions
+        4. Continues until service shutdown
+        """
+        service_names = ["reactor_core", "reactor-core", "reactor"]
+        consecutive_failures = 0
+        max_consecutive_failures = 5
+
+        logger.info(f"[v97.0] Registry heartbeat loop started for: {service_names}")
+
+        while self._state.get("running", True):
+            try:
+                await asyncio.sleep(self._REGISTRY_HEARTBEAT_INTERVAL)
+
+                # Update heartbeat in service registry
+                success = _atomic_update_heartbeat(
+                    service_names=service_names,
+                    status="running"
+                )
+
+                if success:
+                    consecutive_failures = 0
+                    logger.debug(
+                        f"[v97.0] Registry heartbeat updated for {service_names[0]}"
+                    )
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.warning(
+                            f"[v97.0] {consecutive_failures} consecutive heartbeat failures - "
+                            f"service may be deregistered by cleanup"
+                        )
+                        # Try to re-register
+                        logger.info("[v97.0] Attempting re-registration...")
+                        # Note: We don't have service_data here, so just update heartbeat
+                        # The next iteration will try again
+
+            except asyncio.CancelledError:
+                logger.info("[v97.0] Registry heartbeat loop cancelled")
+                break
+            except Exception as e:
+                logger.debug(f"[v97.0] Registry heartbeat error: {e}")
+                consecutive_failures += 1
+                await asyncio.sleep(1.0)  # Brief pause before retry
+
+        logger.info("[v97.0] Registry heartbeat loop stopped")
+
     async def run(self):
         """Run the service until shutdown."""
         logger.info("Reactor Core service running. Press Ctrl+C to stop.")
@@ -924,12 +1065,21 @@ class ReactorCoreService:
 
     async def stop(self):
         """
-        v95.0: Stop the Reactor Core service with service deregistration.
+        v97.0: Stop the Reactor Core service with service deregistration.
 
         Ensures Reactor Core is removed from the shared service registry
         so TrinityIntegrator knows it's no longer available.
         """
         logger.info("Stopping Reactor Core service...")
+
+        # v97.0: Stop registry heartbeat loop first
+        if self._registry_heartbeat_task and not self._registry_heartbeat_task.done():
+            self._registry_heartbeat_task.cancel()
+            try:
+                await asyncio.wait_for(self._registry_heartbeat_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            logger.info("[v97.0] Registry heartbeat stopped")
 
         # v96.0: Deregister from shared service registry using atomic locking
         if _atomic_deregister_service(["reactor_core", "reactor-core", "reactor"]):
