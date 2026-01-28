@@ -1229,6 +1229,346 @@ def create_event_bridge(
     return EventBridge(source, transports)
 
 
+# =============================================================================
+# Cross-Repo Readiness Integration (v13.0 - Inline Readiness Tracking)
+# =============================================================================
+
+# Trinity readiness state directory
+TRINITY_STATE_DIR = Path.home() / ".jarvis" / "trinity" / "state"
+JARVIS_BODY_READINESS_FILE = TRINITY_STATE_DIR / "jarvis-body_readiness.json"
+READINESS_STALENESS_THRESHOLD = float(os.getenv("JARVIS_READINESS_STALENESS", "120.0"))  # 2 minutes
+
+
+@dataclass
+class JarvisBodyReadinessState:
+    """
+    Snapshot of JARVIS-AI-Agent (jarvis-body) readiness state from Trinity Protocol.
+
+    This allows Reactor Core to wait for jarvis-body to be fully ready before
+    starting training jobs or other operations that depend on it.
+    """
+    phase: str = "NOT_STARTED"
+    is_ready: bool = False
+    is_healthy: bool = False
+    ready_at: Optional[float] = None
+    started_at: Optional[float] = None
+    components: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    critical_components_ready: int = 0
+    total_critical_components: int = 0
+    timestamp: float = 0.0
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if state data is stale (older than threshold)."""
+        if self.timestamp == 0.0:
+            return True
+        return (time.time() - self.timestamp) > READINESS_STALENESS_THRESHOLD
+
+    @property
+    def startup_duration(self) -> Optional[float]:
+        """Get time from start to ready, if available."""
+        if self.ready_at and self.started_at:
+            return self.ready_at - self.started_at
+        return None
+
+    @classmethod
+    def from_state_file(cls) -> "JarvisBodyReadinessState":
+        """Load readiness state from Trinity Protocol shared state file."""
+        if not JARVIS_BODY_READINESS_FILE.exists():
+            return cls()
+
+        try:
+            with open(JARVIS_BODY_READINESS_FILE, "r") as f:
+                data = json.load(f)
+
+            return cls(
+                phase=data.get("phase", "NOT_STARTED"),
+                is_ready=data.get("is_ready", False),
+                is_healthy=data.get("is_healthy", False),
+                ready_at=data.get("ready_at"),
+                started_at=data.get("started_at"),
+                components=data.get("components", {}),
+                critical_components_ready=data.get("critical_components_ready", 0),
+                total_critical_components=data.get("total_critical_components", 0),
+                timestamp=data.get("timestamp", 0.0),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to read jarvis-body readiness state: {e}")
+            return cls()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "phase": self.phase,
+            "is_ready": self.is_ready,
+            "is_healthy": self.is_healthy,
+            "ready_at": self.ready_at,
+            "started_at": self.started_at,
+            "components": self.components,
+            "critical_components_ready": self.critical_components_ready,
+            "total_critical_components": self.total_critical_components,
+            "timestamp": self.timestamp,
+            "is_stale": self.is_stale,
+            "startup_duration": self.startup_duration,
+        }
+
+
+class JarvisBodyReadinessWatcher:
+    """
+    Watches jarvis-body readiness state for cross-repo coordination.
+
+    This enables Reactor Core training jobs and other operations to:
+    - Wait for jarvis-body to be ready before starting
+    - React to jarvis-body becoming unavailable
+    - Coordinate startup sequences across repos
+
+    Features:
+    - Async polling with configurable interval
+    - Callback registration for state changes
+    - Staleness detection (auto-mark unavailable if no updates)
+    - Integration with EventBridge for cross-repo events
+    """
+
+    def __init__(
+        self,
+        event_bridge: Optional[EventBridge] = None,
+        check_interval: float = 5.0,
+    ):
+        self.event_bridge = event_bridge
+        self.check_interval = check_interval
+
+        self._running = False
+        self._watch_task: Optional[asyncio.Task] = None
+        self._last_state: Optional[JarvisBodyReadinessState] = None
+        self._was_ready: bool = False
+
+        # Callbacks: (state, became_ready: bool, became_unavailable: bool)
+        self._state_change_callbacks: List[Callable[[JarvisBodyReadinessState, bool, bool], Any]] = []
+
+    def register_state_change_callback(
+        self,
+        callback: Callable[[JarvisBodyReadinessState, bool, bool], Any],
+    ) -> None:
+        """
+        Register callback for jarvis-body readiness state changes.
+
+        Args:
+            callback: Function(state, became_ready, became_unavailable) called on change
+        """
+        self._state_change_callbacks.append(callback)
+
+    async def start(self) -> None:
+        """Start watching jarvis-body readiness."""
+        if self._running:
+            return
+
+        self._running = True
+        self._watch_task = asyncio.create_task(self._watch_loop())
+        logger.info("JarvisBodyReadinessWatcher started")
+
+    async def stop(self) -> None:
+        """Stop watching jarvis-body readiness."""
+        self._running = False
+
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("JarvisBodyReadinessWatcher stopped")
+
+    async def _watch_loop(self) -> None:
+        """Main watching loop."""
+        while self._running:
+            try:
+                state = JarvisBodyReadinessState.from_state_file()
+
+                # Determine if state changed
+                is_now_ready = state.is_ready and not state.is_stale
+                became_ready = is_now_ready and not self._was_ready
+                became_unavailable = not is_now_ready and self._was_ready
+
+                if became_ready or became_unavailable:
+                    await self._handle_state_change(state, became_ready, became_unavailable)
+
+                self._last_state = state
+                self._was_ready = is_now_ready
+
+                await asyncio.sleep(self.check_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in jarvis-body readiness watch loop: {e}")
+                await asyncio.sleep(self.check_interval * 2)
+
+    async def _handle_state_change(
+        self,
+        state: JarvisBodyReadinessState,
+        became_ready: bool,
+        became_unavailable: bool,
+    ) -> None:
+        """Handle jarvis-body readiness state change."""
+        if became_ready:
+            logger.info(
+                f"jarvis-body became READY: phase={state.phase}, "
+                f"components={state.critical_components_ready}/{state.total_critical_components}"
+            )
+        elif became_unavailable:
+            reason = "stale" if state.is_stale else f"phase={state.phase}"
+            logger.warning(f"jarvis-body became UNAVAILABLE: {reason}")
+
+        # Emit event via EventBridge
+        if self.event_bridge:
+            try:
+                await self.event_bridge.publish(
+                    EventType.SERVICE_UP if became_ready else EventType.SERVICE_DOWN,
+                    {
+                        "service": "jarvis-body",
+                        "ready": state.is_ready,
+                        "healthy": state.is_healthy,
+                        "phase": state.phase,
+                        "stale": state.is_stale,
+                        "components_ready": state.critical_components_ready,
+                        "components_total": state.total_critical_components,
+                    },
+                    priority=2,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to emit jarvis-body state event: {e}")
+
+        # Call registered callbacks
+        for callback in self._state_change_callbacks:
+            try:
+                result = callback(state, became_ready, became_unavailable)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"Error in jarvis-body state change callback: {e}")
+
+    def is_jarvis_body_ready(self) -> bool:
+        """
+        Quick synchronous check if jarvis-body is ready.
+
+        Returns:
+            True if jarvis-body is ready and state is not stale
+        """
+        state = JarvisBodyReadinessState.from_state_file()
+        return state.is_ready and not state.is_stale
+
+    def get_current_state(self) -> JarvisBodyReadinessState:
+        """Get the current jarvis-body readiness state."""
+        return JarvisBodyReadinessState.from_state_file()
+
+    async def wait_for_jarvis_body(
+        self,
+        timeout: float = 120.0,
+        check_interval: float = 2.0,
+        require_healthy: bool = False,
+    ) -> bool:
+        """
+        Wait for jarvis-body to become ready.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check
+            require_healthy: If True, wait for HEALTHY phase (not just READY)
+
+        Returns:
+            True if jarvis-body became ready within timeout, False otherwise
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            state = JarvisBodyReadinessState.from_state_file()
+
+            if require_healthy:
+                if state.is_healthy and not state.is_stale:
+                    logger.info(f"jarvis-body is HEALTHY after {time.time() - start_time:.1f}s")
+                    return True
+            else:
+                if state.is_ready and not state.is_stale:
+                    logger.info(f"jarvis-body is READY after {time.time() - start_time:.1f}s")
+                    return True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"Timeout waiting for jarvis-body readiness after {timeout}s")
+        return False
+
+    async def get_component_status(self, component_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get status of a specific jarvis-body component.
+
+        Args:
+            component_name: Name of component (e.g., "websocket", "voice_biometric")
+
+        Returns:
+            Component status dict or None if not found
+        """
+        state = JarvisBodyReadinessState.from_state_file()
+        return state.components.get(component_name)
+
+    async def wait_for_component(
+        self,
+        component_name: str,
+        timeout: float = 60.0,
+        check_interval: float = 1.0,
+    ) -> bool:
+        """
+        Wait for a specific jarvis-body component to become ready.
+
+        Args:
+            component_name: Name of component to wait for
+            timeout: Maximum time to wait
+            check_interval: How often to check
+
+        Returns:
+            True if component became ready within timeout
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            state = JarvisBodyReadinessState.from_state_file()
+
+            if state.is_stale:
+                await asyncio.sleep(check_interval)
+                continue
+
+            component = state.components.get(component_name)
+            if component and component.get("is_ready", False):
+                logger.info(f"jarvis-body component '{component_name}' is ready")
+                return True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"Timeout waiting for jarvis-body component '{component_name}'")
+        return False
+
+
+async def check_jarvis_body_readiness() -> JarvisBodyReadinessState:
+    """
+    Convenience function to check jarvis-body readiness state.
+
+    Returns:
+        Current JarvisBodyReadinessState
+    """
+    return JarvisBodyReadinessState.from_state_file()
+
+
+def is_jarvis_body_ready_sync() -> bool:
+    """
+    Synchronous convenience function to check if jarvis-body is ready.
+
+    Returns:
+        True if jarvis-body is ready and state is not stale
+    """
+    state = JarvisBodyReadinessState.from_state_file()
+    return state.is_ready and not state.is_stale
+
+
 # Convenience exports
 __all__ = [
     "EventBridge",
@@ -1246,4 +1586,11 @@ __all__ = [
     "DOCKER_STATE_DIR",
     "DOCKER_STATE_FILE",
     "DOCKER_EVENTS_FILE",
+    # Cross-Repo Readiness Integration (v13.0)
+    "JarvisBodyReadinessState",
+    "JarvisBodyReadinessWatcher",
+    "check_jarvis_body_readiness",
+    "is_jarvis_body_ready_sync",
+    "TRINITY_STATE_DIR",
+    "JARVIS_BODY_READINESS_FILE",
 ]
