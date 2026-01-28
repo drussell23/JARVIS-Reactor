@@ -1548,6 +1548,349 @@ class JarvisBodyReadinessWatcher:
         return False
 
 
+# =============================================================================
+# Cloud Offload State Integration (v14.0)
+# =============================================================================
+
+CLOUD_OFFLOAD_STATE_FILE = TRINITY_STATE_DIR / "cloud_offload_state.json"
+CLOUD_OFFLOAD_STALENESS_THRESHOLD = 60.0  # Cloud state stale after 60s
+
+
+@dataclass
+class CloudOffloadState:
+    """
+    State of jarvis-body cloud offloading.
+
+    This reflects when jarvis-body activates cloud offloading due to
+    memory/CPU pressure, enabling other repos to route ML inference
+    to cloud endpoints.
+    """
+
+    cloud_offload_active: bool = False
+    cloud_ip: str = ""
+    reason: str = ""
+    triggered_at: float = 0.0
+    timestamp: float = 0.0
+    vm_name: str = ""
+    vm_zone: str = ""
+    prefer_cloud_run: bool = False
+    use_cloud_ml: bool = False
+    spot_vm_enabled: bool = False
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if state is stale (no updates for threshold period)."""
+        if self.timestamp == 0.0:
+            return True
+        return (time.time() - self.timestamp) > CLOUD_OFFLOAD_STALENESS_THRESHOLD
+
+    @property
+    def age_seconds(self) -> float:
+        """Get age of state in seconds."""
+        if self.timestamp == 0.0:
+            return float("inf")
+        return time.time() - self.timestamp
+
+    @property
+    def cloud_ml_endpoint(self) -> Optional[str]:
+        """Get cloud ML endpoint URL if available."""
+        if self.cloud_offload_active and self.cloud_ip:
+            return f"http://{self.cloud_ip}:8080"
+        return None
+
+    @classmethod
+    def from_state_file(cls) -> "CloudOffloadState":
+        """
+        Load cloud offload state from Trinity Protocol state file.
+
+        Returns:
+            CloudOffloadState (may have default values if file missing/invalid)
+        """
+        try:
+            if not CLOUD_OFFLOAD_STATE_FILE.exists():
+                return cls()
+
+            data = json.loads(CLOUD_OFFLOAD_STATE_FILE.read_text())
+            return cls(
+                cloud_offload_active=data.get("cloud_offload_active", False),
+                cloud_ip=data.get("cloud_ip", ""),
+                reason=data.get("reason", ""),
+                triggered_at=data.get("triggered_at", 0.0),
+                timestamp=data.get("timestamp", 0.0),
+                vm_name=data.get("vm_name", ""),
+                vm_zone=data.get("vm_zone", ""),
+                prefer_cloud_run=data.get("prefer_cloud_run", False),
+                use_cloud_ml=data.get("use_cloud_ml", False),
+                spot_vm_enabled=data.get("spot_vm_enabled", False),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to load cloud offload state: {e}")
+            return cls()
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary representation."""
+        return {
+            "cloud_offload_active": self.cloud_offload_active,
+            "cloud_ip": self.cloud_ip,
+            "reason": self.reason,
+            "triggered_at": self.triggered_at,
+            "timestamp": self.timestamp,
+            "vm_name": self.vm_name,
+            "vm_zone": self.vm_zone,
+            "prefer_cloud_run": self.prefer_cloud_run,
+            "use_cloud_ml": self.use_cloud_ml,
+            "spot_vm_enabled": self.spot_vm_enabled,
+            "is_stale": self.is_stale,
+            "age_seconds": self.age_seconds,
+            "cloud_ml_endpoint": self.cloud_ml_endpoint,
+        }
+
+
+class CloudOffloadWatcher:
+    """
+    Watches cloud offload state for training orchestration.
+
+    This enables Reactor Core to:
+    - Use cloud ML endpoints when jarvis-body is under pressure
+    - Route training data collection to cloud services
+    - Coordinate with cloud VM lifecycle
+
+    Features:
+    - Async polling with configurable interval
+    - Callback registration for state changes
+    - Automatic staleness detection
+    - Integration with EventBridge
+    """
+
+    def __init__(
+        self,
+        event_bridge: Optional[EventBridge] = None,
+        check_interval: float = 10.0,
+    ):
+        self.event_bridge = event_bridge
+        self.check_interval = check_interval
+
+        self._running = False
+        self._watch_task: Optional[asyncio.Task] = None
+        self._last_state: Optional[CloudOffloadState] = None
+        self._was_active: bool = False
+
+        # Callbacks: (state, became_active: bool, became_inactive: bool)
+        self._state_change_callbacks: List[Callable[[CloudOffloadState, bool, bool], Any]] = []
+
+    def register_state_change_callback(
+        self,
+        callback: Callable[[CloudOffloadState, bool, bool], Any],
+    ) -> None:
+        """
+        Register callback for cloud offload state changes.
+
+        Args:
+            callback: Function(state, became_active, became_inactive) called on change
+        """
+        self._state_change_callbacks.append(callback)
+
+    async def start(self) -> None:
+        """Start watching cloud offload state."""
+        if self._running:
+            return
+
+        self._running = True
+        self._watch_task = asyncio.create_task(self._watch_loop())
+        logger.info("[v14.0] CloudOffloadWatcher started")
+
+    async def stop(self) -> None:
+        """Stop watching cloud offload state."""
+        self._running = False
+
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("[v14.0] CloudOffloadWatcher stopped")
+
+    async def _watch_loop(self) -> None:
+        """Main watching loop."""
+        while self._running:
+            try:
+                state = CloudOffloadState.from_state_file()
+
+                # Determine if state changed
+                is_now_active = state.cloud_offload_active and not state.is_stale
+                became_active = is_now_active and not self._was_active
+                became_inactive = not is_now_active and self._was_active
+
+                if became_active or became_inactive:
+                    await self._handle_state_change(state, became_active, became_inactive)
+
+                self._last_state = state
+                self._was_active = is_now_active
+
+                await asyncio.sleep(self.check_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[v14.0] Error in cloud offload watch loop: {e}")
+                await asyncio.sleep(self.check_interval * 2)
+
+    async def _handle_state_change(
+        self,
+        state: CloudOffloadState,
+        became_active: bool,
+        became_inactive: bool,
+    ) -> None:
+        """Handle cloud offload state change."""
+        if became_active:
+            logger.info(
+                f"[v14.0] Cloud offloading ACTIVATED: reason='{state.reason}', "
+                f"endpoint={state.cloud_ml_endpoint}"
+            )
+        elif became_inactive:
+            logger.info("[v14.0] Cloud offloading DEACTIVATED - returning to local processing")
+
+        # Emit event via EventBridge
+        if self.event_bridge:
+            try:
+                event_type = EventType.RESOURCE_CREATED if became_active else EventType.RESOURCE_DESTROYED
+                await self.event_bridge.publish(
+                    event_type,
+                    {
+                        "resource_type": "cloud_offload",
+                        "active": state.cloud_offload_active,
+                        "cloud_ip": state.cloud_ip,
+                        "reason": state.reason,
+                        "vm_name": state.vm_name,
+                        "endpoint": state.cloud_ml_endpoint,
+                    },
+                    priority=2,
+                )
+            except Exception as e:
+                logger.warning(f"[v14.0] Failed to emit cloud offload event: {e}")
+
+        # Call registered callbacks
+        for callback in self._state_change_callbacks:
+            try:
+                result = callback(state, became_active, became_inactive)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"[v14.0] Error in cloud offload state change callback: {e}")
+
+    def is_cloud_offload_active(self) -> bool:
+        """
+        Quick synchronous check if cloud offloading is active.
+
+        Returns:
+            True if cloud offloading is active and state is not stale
+        """
+        state = CloudOffloadState.from_state_file()
+        return state.cloud_offload_active and not state.is_stale
+
+    def get_current_state(self) -> CloudOffloadState:
+        """Get the current cloud offload state."""
+        return CloudOffloadState.from_state_file()
+
+    def get_cloud_ml_endpoint(self) -> Optional[str]:
+        """
+        Get cloud ML endpoint if offloading is active.
+
+        Returns:
+            Cloud ML endpoint URL or None
+        """
+        state = CloudOffloadState.from_state_file()
+        if state.cloud_offload_active and not state.is_stale:
+            return state.cloud_ml_endpoint
+        return None
+
+    async def wait_for_cloud_ready(
+        self,
+        timeout: float = 120.0,
+        check_interval: float = 5.0,
+    ) -> bool:
+        """
+        Wait for cloud offloading to have a ready endpoint.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check
+
+        Returns:
+            True if cloud endpoint became available within timeout
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            state = CloudOffloadState.from_state_file()
+
+            if state.cloud_offload_active and state.cloud_ip and not state.is_stale:
+                logger.info(f"[v14.0] Cloud offload ready: {state.cloud_ml_endpoint}")
+                return True
+
+            await asyncio.sleep(check_interval)
+
+        logger.warning(f"[v14.0] Timeout waiting for cloud offload to be ready ({timeout}s)")
+        return False
+
+    async def should_use_cloud_inference(self) -> bool:
+        """
+        Determine if ML inference should use cloud endpoints.
+
+        Combines:
+        - Cloud offload state from jarvis-body
+        - Environment variable overrides
+
+        Returns:
+            True if cloud inference should be used
+        """
+        # Check environment override first
+        if os.environ.get("JARVIS_PREFER_CLOUD_RUN", "").lower() == "true":
+            return True
+
+        if os.environ.get("JARVIS_USE_CLOUD_ML", "").lower() == "true":
+            return True
+
+        # Check cloud offload state
+        return self.is_cloud_offload_active()
+
+
+async def check_cloud_offload_state() -> CloudOffloadState:
+    """
+    Convenience function to check cloud offload state.
+
+    Returns:
+        Current CloudOffloadState
+    """
+    return CloudOffloadState.from_state_file()
+
+
+def is_cloud_offload_active_sync() -> bool:
+    """
+    Synchronous convenience function to check if cloud offloading is active.
+
+    Returns:
+        True if cloud offloading is active and state is not stale
+    """
+    state = CloudOffloadState.from_state_file()
+    return state.cloud_offload_active and not state.is_stale
+
+
+def get_cloud_ml_endpoint_sync() -> Optional[str]:
+    """
+    Synchronous convenience function to get cloud ML endpoint.
+
+    Returns:
+        Cloud ML endpoint URL or None
+    """
+    state = CloudOffloadState.from_state_file()
+    if state.cloud_offload_active and not state.is_stale:
+        return state.cloud_ml_endpoint
+    return None
+
+
 async def check_jarvis_body_readiness() -> JarvisBodyReadinessState:
     """
     Convenience function to check jarvis-body readiness state.
@@ -1593,4 +1936,12 @@ __all__ = [
     "is_jarvis_body_ready_sync",
     "TRINITY_STATE_DIR",
     "JARVIS_BODY_READINESS_FILE",
+    # Cloud Offload State Integration (v14.0)
+    "CloudOffloadState",
+    "CloudOffloadWatcher",
+    "check_cloud_offload_state",
+    "is_cloud_offload_active_sync",
+    "get_cloud_ml_endpoint_sync",
+    "CLOUD_OFFLOAD_STATE_FILE",
+    "CLOUD_OFFLOAD_STALENESS_THRESHOLD",
 ]
