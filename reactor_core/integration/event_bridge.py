@@ -105,6 +105,21 @@ class EventType(Enum):
     REPO_DEPENDENCY_DETECTED = "repo_dependency_detected"  # New dependency detected
     REPO_CONTEXT_ENRICHED = "repo_context_enriched"     # Context was enriched with repo info
 
+    # Docker Infrastructure Events (v12.0 - Intelligent Self-Healing Integration)
+    DOCKER_STARTING = "docker_starting"
+    DOCKER_STARTED = "docker_started"
+    DOCKER_STOPPING = "docker_stopping"
+    DOCKER_STOPPED = "docker_stopped"
+    DOCKER_HEALTHY = "docker_healthy"
+    DOCKER_UNHEALTHY = "docker_unhealthy"
+    DOCKER_RECOVERING = "docker_recovering"
+    DOCKER_RECOVERED = "docker_recovered"
+    DOCKER_FAILED = "docker_failed"
+    DOCKER_TIMEOUT = "docker_timeout"
+    DOCKER_REQUEST_START = "docker_request_start"
+    DOCKER_REQUEST_STOP = "docker_request_stop"
+    DOCKER_HEALTH_CHECK = "docker_health_check"
+
     # PROJECT TRINITY events - Unified Cognitive Architecture
     # Surveillance commands (JARVIS Ghost Monitor Protocol)
     TRINITY_START_SURVEILLANCE = "trinity_start_surveillance"
@@ -742,6 +757,417 @@ class EventBridge:
         )
 
 
+# =============================================================================
+# Docker State Integration for Training Jobs (v12.0)
+# =============================================================================
+
+# Docker state directory (shared via Trinity Protocol)
+DOCKER_STATE_DIR = Path.home() / ".jarvis" / "trinity" / "docker"
+DOCKER_STATE_FILE = DOCKER_STATE_DIR / "state.json"
+DOCKER_EVENTS_FILE = DOCKER_STATE_DIR / "events.json"
+DOCKER_CHECK_INTERVAL = float(os.getenv("JARVIS_DOCKER_CHECK_INTERVAL", "15.0"))
+
+
+@dataclass
+class DockerStateSnapshot:
+    """Snapshot of Docker state from Trinity Protocol shared state."""
+    available: bool = False
+    status: str = "unknown"
+    health_score: float = 0.0
+    last_check: str = ""
+    recovery_in_progress: bool = False
+    current_level: str = "none"
+    error_message: str = ""
+
+    @classmethod
+    def from_state_file(cls) -> "DockerStateSnapshot":
+        """Load Docker state from shared Trinity state file."""
+        if not DOCKER_STATE_FILE.exists():
+            return cls()
+
+        try:
+            with open(DOCKER_STATE_FILE, "r") as f:
+                data = json.load(f)
+
+            return cls(
+                available=data.get("docker_available", False),
+                status=data.get("status", "unknown"),
+                health_score=data.get("health_score", 0.0),
+                last_check=data.get("last_update", ""),
+                recovery_in_progress=data.get("recovery_in_progress", False),
+                current_level=data.get("current_recovery_level", "none"),
+                error_message=data.get("error", ""),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to read Docker state file: {e}")
+            return cls()
+
+
+class DockerAwareTrainingScheduler:
+    """
+    Docker-aware training job scheduler for Reactor Core.
+
+    Features:
+    - Monitors Docker state via Trinity Protocol
+    - Pauses training when Docker becomes unavailable
+    - Resumes training when Docker recovers
+    - Adjusts resource allocation based on Docker health
+    - Emits events for training state changes
+    """
+
+    def __init__(
+        self,
+        event_bridge: EventBridge,
+        min_health_score: float = 0.7,
+        check_interval: float = DOCKER_CHECK_INTERVAL,
+    ):
+        self.event_bridge = event_bridge
+        self.min_health_score = min_health_score
+        self.check_interval = check_interval
+
+        self._running = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._docker_available = False
+        self._last_state: Optional[DockerStateSnapshot] = None
+        self._paused_jobs: Set[str] = set()
+        self._state_change_callbacks: List[Callable[[DockerStateSnapshot, bool], Any]] = []
+
+    def register_state_change_callback(
+        self,
+        callback: Callable[[DockerStateSnapshot, bool], Any],
+    ) -> None:
+        """Register callback for Docker state changes.
+
+        Args:
+            callback: Function(state, is_available) called on state change
+        """
+        self._state_change_callbacks.append(callback)
+
+    async def start(self) -> None:
+        """Start Docker state monitoring."""
+        if self._running:
+            return
+
+        self._running = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info("DockerAwareTrainingScheduler started")
+
+    async def stop(self) -> None:
+        """Stop Docker state monitoring."""
+        self._running = False
+
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("DockerAwareTrainingScheduler stopped")
+
+    async def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        while self._running:
+            try:
+                state = DockerStateSnapshot.from_state_file()
+                is_available = self._evaluate_availability(state)
+
+                # Check for state changes
+                if self._last_state is None or is_available != self._docker_available:
+                    await self._handle_state_change(state, is_available)
+
+                self._last_state = state
+                self._docker_available = is_available
+
+                await asyncio.sleep(self.check_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Docker monitor loop: {e}")
+                await asyncio.sleep(self.check_interval * 2)
+
+    def _evaluate_availability(self, state: DockerStateSnapshot) -> bool:
+        """Evaluate if Docker is available for training jobs."""
+        if not state.available:
+            return False
+
+        if state.recovery_in_progress:
+            return False
+
+        if state.health_score < self.min_health_score:
+            return False
+
+        return state.status in ("running", "healthy")
+
+    async def _handle_state_change(
+        self,
+        state: DockerStateSnapshot,
+        is_available: bool,
+    ) -> None:
+        """Handle Docker state change."""
+        logger.info(
+            f"Docker state changed: available={is_available}, "
+            f"status={state.status}, health={state.health_score:.2f}"
+        )
+
+        # Emit event
+        event_type = EventType.DOCKER_HEALTHY if is_available else EventType.DOCKER_UNHEALTHY
+        await self.event_bridge.publish(
+            event_type,
+            {
+                "available": is_available,
+                "status": state.status,
+                "health_score": state.health_score,
+                "recovery_in_progress": state.recovery_in_progress,
+            },
+        )
+
+        # Call registered callbacks
+        for callback in self._state_change_callbacks:
+            try:
+                result = callback(state, is_available)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as e:
+                logger.error(f"Error in state change callback: {e}")
+
+    def is_docker_available(self) -> bool:
+        """Check if Docker is currently available."""
+        return self._docker_available
+
+    def get_current_state(self) -> Optional[DockerStateSnapshot]:
+        """Get the current Docker state snapshot."""
+        return self._last_state
+
+    async def wait_for_docker(
+        self,
+        timeout: float = 300.0,
+        check_interval: float = 5.0,
+    ) -> bool:
+        """Wait for Docker to become available.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            check_interval: How often to check
+
+        Returns:
+            True if Docker became available, False if timeout
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            state = DockerStateSnapshot.from_state_file()
+            if self._evaluate_availability(state):
+                self._docker_available = True
+                self._last_state = state
+                return True
+
+            await asyncio.sleep(check_interval)
+
+        return False
+
+    async def request_docker_start(self) -> bool:
+        """Request Docker to be started via Trinity Protocol."""
+        try:
+            DOCKER_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+            request_file = DOCKER_STATE_DIR / "start_request.json"
+            request_data = {
+                "requester": "reactor_core",
+                "timestamp": datetime.now().isoformat(),
+                "reason": "training_job_pending",
+            }
+
+            # Atomic write
+            temp_file = request_file.with_suffix(".tmp")
+            with open(temp_file, "w") as f:
+                json.dump(request_data, f)
+            temp_file.rename(request_file)
+
+            # Emit event
+            await self.event_bridge.publish(
+                EventType.DOCKER_REQUEST_START,
+                request_data,
+            )
+
+            logger.info("Docker start request sent via Trinity Protocol")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to request Docker start: {e}")
+            return False
+
+    def mark_job_paused(self, job_id: str) -> None:
+        """Mark a training job as paused due to Docker unavailability."""
+        self._paused_jobs.add(job_id)
+        logger.info(f"Training job {job_id} marked as paused (Docker unavailable)")
+
+    def mark_job_resumed(self, job_id: str) -> None:
+        """Mark a training job as resumed after Docker recovery."""
+        self._paused_jobs.discard(job_id)
+        logger.info(f"Training job {job_id} marked as resumed (Docker available)")
+
+    def get_paused_jobs(self) -> Set[str]:
+        """Get set of paused job IDs."""
+        return self._paused_jobs.copy()
+
+    async def emit_training_docker_status(
+        self,
+        job_id: str,
+        status: str,  # "paused", "resumed", "waiting", "failed"
+        reason: str,
+    ) -> bool:
+        """Emit training job Docker status event."""
+        return await self.event_bridge.publish(
+            EventType.TRAINING_PROGRESS,
+            {
+                "job_id": job_id,
+                "docker_status": status,
+                "reason": reason,
+                "docker_available": self._docker_available,
+                "docker_health": self._last_state.health_score if self._last_state else 0.0,
+            },
+            metadata={"docker_related": True},
+        )
+
+
+class DockerEventWatcher:
+    """
+    Watches Docker events from Trinity Protocol for training job coordination.
+
+    Processes events from the shared Docker events file and dispatches
+    them to registered handlers.
+    """
+
+    def __init__(self, event_bridge: EventBridge):
+        self.event_bridge = event_bridge
+        self._running = False
+        self._watch_task: Optional[asyncio.Task] = None
+        self._last_event_id: str = ""
+        self._handlers: Dict[str, List[Callable]] = {}
+
+    def on_docker_event(self, event_type: str) -> Callable:
+        """Decorator to register Docker event handler."""
+        def decorator(func: Callable) -> Callable:
+            if event_type not in self._handlers:
+                self._handlers[event_type] = []
+            self._handlers[event_type].append(func)
+            return func
+        return decorator
+
+    async def start(self) -> None:
+        """Start watching Docker events."""
+        if self._running:
+            return
+
+        self._running = True
+        self._watch_task = asyncio.create_task(self._watch_loop())
+        logger.info("DockerEventWatcher started")
+
+    async def stop(self) -> None:
+        """Stop watching Docker events."""
+        self._running = False
+
+        if self._watch_task:
+            self._watch_task.cancel()
+            try:
+                await self._watch_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("DockerEventWatcher stopped")
+
+    async def _watch_loop(self) -> None:
+        """Main event watching loop."""
+        while self._running:
+            try:
+                if DOCKER_EVENTS_FILE.exists():
+                    events = await self._read_events()
+                    for event in events:
+                        await self._dispatch_event(event)
+
+                await asyncio.sleep(2.0)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in Docker event watch loop: {e}")
+                await asyncio.sleep(5.0)
+
+    async def _read_events(self) -> List[Dict[str, Any]]:
+        """Read new events from events file."""
+        try:
+            with open(DOCKER_EVENTS_FILE, "r") as f:
+                data = json.load(f)
+
+            events = data.get("events", [])
+
+            # Filter to new events only
+            new_events = []
+            found_last = self._last_event_id == ""
+
+            for event in events:
+                event_id = event.get("event_id", "")
+
+                if found_last:
+                    new_events.append(event)
+                elif event_id == self._last_event_id:
+                    found_last = True
+
+            if new_events and new_events[-1].get("event_id"):
+                self._last_event_id = new_events[-1]["event_id"]
+
+            return new_events
+
+        except Exception as e:
+            logger.warning(f"Failed to read Docker events: {e}")
+            return []
+
+    async def _dispatch_event(self, event: Dict[str, Any]) -> None:
+        """Dispatch a Docker event to handlers."""
+        event_type = event.get("event_type", "")
+
+        # Call type-specific handlers
+        if event_type in self._handlers:
+            for handler in self._handlers[event_type]:
+                try:
+                    result = handler(event)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as e:
+                    logger.error(f"Error in Docker event handler: {e}")
+
+        # Forward to event bridge as CrossRepoEvent
+        try:
+            bridge_event_type = self._map_docker_event_type(event_type)
+            if bridge_event_type:
+                await self.event_bridge.publish(
+                    bridge_event_type,
+                    event.get("payload", {}),
+                    metadata={"docker_event": True, "original_type": event_type},
+                )
+        except Exception as e:
+            logger.warning(f"Failed to forward Docker event to bridge: {e}")
+
+    def _map_docker_event_type(self, docker_type: str) -> Optional[EventType]:
+        """Map Docker event type string to EventType enum."""
+        mapping = {
+            "starting": EventType.DOCKER_STARTING,
+            "started": EventType.DOCKER_STARTED,
+            "stopping": EventType.DOCKER_STOPPING,
+            "stopped": EventType.DOCKER_STOPPED,
+            "healthy": EventType.DOCKER_HEALTHY,
+            "unhealthy": EventType.DOCKER_UNHEALTHY,
+            "recovering": EventType.DOCKER_RECOVERING,
+            "recovered": EventType.DOCKER_RECOVERED,
+            "failed": EventType.DOCKER_FAILED,
+            "timeout": EventType.DOCKER_TIMEOUT,
+            "health_check": EventType.DOCKER_HEALTH_CHECK,
+        }
+        return mapping.get(docker_type.lower())
+
+
 def _get_default_events_dir() -> Path:
     """
     Get the default events directory using dynamic path resolution.
@@ -813,4 +1239,11 @@ __all__ = [
     "EventSource",
     "EventType",
     "create_event_bridge",
+    # Docker Integration (v12.0)
+    "DockerStateSnapshot",
+    "DockerAwareTrainingScheduler",
+    "DockerEventWatcher",
+    "DOCKER_STATE_DIR",
+    "DOCKER_STATE_FILE",
+    "DOCKER_EVENTS_FILE",
 ]
