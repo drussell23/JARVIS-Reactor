@@ -612,12 +612,250 @@ class TrainingJobManager:
 # HEALTH SERVER
 # =============================================================================
 
+async def _wait_for_port_available(
+    host: str,
+    port: int,
+    timeout: float = 30.0,
+    check_interval: float = 1.0,
+) -> bool:
+    """
+    v118.0: Wait for a port to become available with intelligent retry.
+
+    Handles TCP TIME_WAIT state by waiting for the port to be released
+    instead of failing immediately. Uses SO_REUSEADDR to test availability.
+
+    Args:
+        host: Host to bind to
+        port: Port to check
+        timeout: Maximum time to wait in seconds
+        check_interval: Time between checks
+
+    Returns:
+        True if port is available, False if timeout exceeded
+    """
+    import socket
+    import time
+
+    start_time = time.time()
+    attempt = 0
+
+    while time.time() - start_time < timeout:
+        attempt += 1
+        try:
+            # Create a test socket with SO_REUSEADDR
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            # Try to enable SO_REUSEPORT if available (macOS/Linux)
+            if hasattr(socket, 'SO_REUSEPORT'):
+                try:
+                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass  # SO_REUSEPORT not supported on this platform
+
+            test_sock.settimeout(1.0)
+            test_sock.bind((host, port))
+            test_sock.close()
+
+            if attempt > 1:
+                elapsed = time.time() - start_time
+                logger.info(
+                    f"[v118.0] Port {port} became available after {elapsed:.1f}s "
+                    f"({attempt} attempts)"
+                )
+            return True
+
+        except OSError as e:
+            error_code = getattr(e, 'errno', None)
+            # EADDRINUSE (48 on macOS, 98 on Linux) or EADDRNOTAVAIL
+            if error_code in (48, 98, 99):
+                if attempt == 1:
+                    logger.info(
+                        f"[v118.0] Port {port} in use (likely TIME_WAIT), "
+                        f"waiting up to {timeout}s for release..."
+                    )
+                await asyncio.sleep(check_interval)
+            else:
+                logger.warning(f"[v118.0] Unexpected socket error on port {port}: {e}")
+                await asyncio.sleep(check_interval)
+        finally:
+            try:
+                test_sock.close()
+            except Exception:
+                pass
+
+    elapsed = time.time() - start_time
+    logger.warning(
+        f"[v118.0] Port {port} not available after {elapsed:.1f}s ({attempt} attempts)"
+    )
+    return False
+
+
+def _update_cross_repo_port_registry(
+    service_name: str,
+    actual_port: int,
+    original_port: int,
+) -> bool:
+    """
+    v118.0: Update the distributed port registry for cross-repo coordination.
+
+    When reactor-core gets a fallback port, the supervisor and other repos
+    need to know where to connect. This updates ~/.jarvis/registry/ports.json
+    with the actual port mapping.
+
+    This is a SYNCHRONOUS function to be called after successful port binding,
+    ensuring the registry is updated immediately before any health checks.
+
+    Args:
+        service_name: Name of the service (e.g., "reactor-core")
+        actual_port: The port actually bound to
+        original_port: The originally requested port
+
+    Returns:
+        True if registry updated successfully, False otherwise
+    """
+    registry_dir = Path.home() / ".jarvis" / "registry"
+    registry_dir.mkdir(parents=True, exist_ok=True)
+
+    registry_file = registry_dir / "ports.json"
+    lock_file = registry_dir / "ports.json.lock"
+
+    try:
+        # Use file locking for atomic update
+        with _acquire_registry_lock(lock_file, timeout=10.0):
+            # Load existing registry
+            if registry_file.exists():
+                try:
+                    registry = json.loads(registry_file.read_text())
+                except json.JSONDecodeError:
+                    registry = {"version": "1.0", "ports": {}, "fallbacks": []}
+            else:
+                registry = {"version": "1.0", "ports": {}, "fallbacks": []}
+
+            # Update port mapping for all reactor-core variants
+            for name in [service_name, "reactor-core", "reactor_core", "reactor"]:
+                registry["ports"][name] = {
+                    "port": actual_port,
+                    "original_port": original_port,
+                    "allocated_at": time.time(),
+                    "is_fallback": actual_port != original_port,
+                    "pid": os.getpid(),
+                }
+
+            # Track fallback history
+            if actual_port != original_port:
+                if "fallbacks" not in registry:
+                    registry["fallbacks"] = []
+                registry["fallbacks"].append({
+                    "service": service_name,
+                    "original": original_port,
+                    "fallback": actual_port,
+                    "timestamp": time.time(),
+                    "pid": os.getpid(),
+                })
+                # Keep only last 100 fallback records
+                registry["fallbacks"] = registry["fallbacks"][-100:]
+
+            # Write atomically
+            temp_file = registry_file.with_suffix(".tmp")
+            with open(temp_file, 'w') as f:
+                json.dump(registry, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(registry_file)
+
+        fallback_msg = f" (fallback from {original_port})" if actual_port != original_port else ""
+        logger.info(
+            f"[v118.0] ✅ Updated cross-repo port registry: "
+            f"{service_name} -> {actual_port}{fallback_msg}"
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"[v118.0] ⚠️ Could not update port registry: {e}")
+        return False
+
+
+async def _find_available_port(
+    host: str,
+    preferred_port: int,
+    fallback_range: tuple = (9001, 9100),
+) -> int:
+    """
+    v118.0: Find an available port, preferring the specified port.
+
+    If preferred port is unavailable after a brief wait, searches for
+    an alternative port in the fallback range.
+
+    Args:
+        host: Host to bind to
+        preferred_port: Preferred port to use
+        fallback_range: Range of ports to search if preferred unavailable
+
+    Returns:
+        Available port number
+
+    Raises:
+        RuntimeError: If no port could be found
+    """
+    import socket
+
+    # First, try the preferred port with a short wait
+    if await _wait_for_port_available(host, preferred_port, timeout=5.0):
+        return preferred_port
+
+    # Preferred port unavailable, search for fallback
+    logger.info(
+        f"[v118.0] Preferred port {preferred_port} unavailable, "
+        f"searching for fallback in range {fallback_range}..."
+    )
+
+    for port in range(fallback_range[0], fallback_range[1] + 1):
+        try:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT'):
+                try:
+                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            test_sock.settimeout(1.0)
+            test_sock.bind((host, port))
+            test_sock.close()
+
+            logger.info(
+                f"[v118.0] Found available fallback port: {port} "
+                f"(preferred {preferred_port} was unavailable)"
+            )
+            return port
+
+        except OSError:
+            continue
+        finally:
+            try:
+                test_sock.close()
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        f"No available port found: preferred {preferred_port} and "
+        f"fallback range {fallback_range} all exhausted"
+    )
+
+
 async def create_health_server(
     config: ReactorCoreConfig,
     state: Dict[str, Any],
     job_manager: TrainingJobManager,
 ):
-    """Create HTTP server with health and job endpoints."""
+    """
+    Create HTTP server with health and job endpoints.
+
+    v118.0: Enhanced with robust port binding that handles TIME_WAIT state.
+    - Waits for port to become available instead of failing immediately
+    - Uses SO_REUSEADDR and SO_REUSEPORT for fast rebind
+    - Falls back to alternative port if preferred port is stuck
+    """
     try:
         from aiohttp import web
         AIOHTTP_AVAILABLE = True
@@ -683,10 +921,99 @@ async def create_health_server(
 
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, config.host, config.port)
-        await site.start()
 
-        logger.info(f"Reactor Core server started on http://{config.host}:{config.port}")
+        # v118.0: Robust port binding with TIME_WAIT handling
+        # First, ensure port is available (wait for TIME_WAIT to clear if needed)
+        original_port = config.port  # Track original for logging
+        actual_port = config.port
+        max_bind_attempts = 3
+        bind_attempt = 0
+        site = None
+
+        while bind_attempt < max_bind_attempts and site is None:
+            bind_attempt += 1
+            try:
+                # Wait for port availability before binding
+                port_available = await _wait_for_port_available(
+                    config.host if config.host != "0.0.0.0" else "127.0.0.1",
+                    actual_port,
+                    timeout=15.0,
+                    check_interval=1.0,
+                )
+
+                if not port_available:
+                    # Try to find a fallback port
+                    logger.warning(
+                        f"[v118.0] Port {actual_port} unavailable after wait, "
+                        f"finding fallback..."
+                    )
+                    actual_port = await _find_available_port(
+                        config.host if config.host != "0.0.0.0" else "127.0.0.1",
+                        config.port,
+                        fallback_range=(9001, 9100),
+                    )
+                    # Update config to use new port
+                    config.port = actual_port
+                    logger.info(
+                        f"[v118.0] Using fallback port {actual_port}"
+                    )
+
+                # Create TCPSite with reuse_address=True for fast rebind
+                # This is CRITICAL for handling TIME_WAIT state
+                site = web.TCPSite(
+                    runner,
+                    config.host,
+                    actual_port,
+                    reuse_address=True,  # v118.0: Enable SO_REUSEADDR
+                    reuse_port=True,     # v118.0: Enable SO_REUSEPORT where supported
+                )
+                await site.start()
+
+            except OSError as e:
+                error_msg = str(e)
+                if "Address already in use" in error_msg or "address already in use" in error_msg:
+                    logger.warning(
+                        f"[v118.0] Bind attempt {bind_attempt}/{max_bind_attempts} failed: {e}"
+                    )
+                    if bind_attempt < max_bind_attempts:
+                        # Exponential backoff before retry
+                        backoff = 2.0 ** bind_attempt
+                        logger.info(f"[v118.0] Retrying in {backoff}s...")
+                        await asyncio.sleep(backoff)
+                        # Try fallback port on next attempt
+                        actual_port = await _find_available_port(
+                            config.host if config.host != "0.0.0.0" else "127.0.0.1",
+                            config.port,
+                            fallback_range=(9001 + bind_attempt * 10, 9100),
+                        )
+                        config.port = actual_port
+                    else:
+                        raise
+                else:
+                    raise
+
+        if site is None:
+            raise RuntimeError(f"Failed to bind to any port after {max_bind_attempts} attempts")
+
+        # Update config with actual port used (for registration purposes)
+        config.port = actual_port
+
+        # v118.0: Update cross-repo port registry so supervisor knows our actual port
+        # This is CRITICAL for cross-repo coordination when using fallback ports
+        _update_cross_repo_port_registry(
+            service_name="reactor-core",
+            actual_port=actual_port,
+            original_port=original_port,
+        )
+
+        if actual_port != original_port:
+            logger.warning(
+                f"Reactor Core server started on FALLBACK port "
+                f"http://{config.host}:{actual_port} (preferred: {original_port})"
+            )
+        else:
+            logger.info(f"Reactor Core server started on http://{config.host}:{actual_port}")
+
         return runner
     else:
         return None
