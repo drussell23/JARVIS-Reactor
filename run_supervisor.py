@@ -97,6 +97,46 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 # Add reactor_core to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# =============================================================================
+# TRINITY UNIFIED LOOP MANAGER (v3.0) - Cross-Repo Foundation
+# =============================================================================
+# Add cross_repo path for shared Trinity infrastructure
+_cross_repo_path = Path.home() / ".jarvis" / "cross_repo"
+if str(_cross_repo_path) not in sys.path:
+    sys.path.insert(0, str(_cross_repo_path))
+
+try:
+    from unified_loop_manager import (
+        get_trinity_manager,
+        trinity_startup,
+        trinity_shutdown,
+        TrinityComponent,
+        TrinityConfig,
+        safe_create_task,
+        safe_to_thread,
+        safe_gather,
+    )
+    TRINITY_AVAILABLE = True
+except ImportError as e:
+    TRINITY_AVAILABLE = False
+    logging.getLogger(__name__).info(f"Trinity not available (optional): {e}")
+
+    # Fallback implementations
+    async def trinity_startup(component):
+        return None
+
+    async def trinity_shutdown():
+        pass
+
+    def safe_create_task(coro, *, name=None):
+        return asyncio.create_task(coro, name=name)
+
+    async def safe_to_thread(func, *args, **kwargs):
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def safe_gather(*coros, return_exceptions=False):
+        return await asyncio.gather(*coros, return_exceptions=return_exceptions)
+
 from reactor_core.orchestration.trinity_orchestrator import (
     TrinityOrchestrator,
     ComponentType,
@@ -2418,7 +2458,30 @@ class AGISupervisor:
 # =============================================================================
 
 async def main():
-    """Main entry point for AGI Supervisor."""
+    """Main entry point for AGI Supervisor with Trinity integration."""
+
+    # ==========================================================================
+    # PHASE 0: TRINITY INITIALIZATION (Before anything else)
+    # ==========================================================================
+    # Initialize Trinity Unified Loop Manager FIRST
+    # This provides the shared async infrastructure for all three repos:
+    # - JARVIS (Body)
+    # - JARVIS Prime (Mind)
+    # - Reactor Core (Nerves)
+    trinity_manager = None
+    if TRINITY_AVAILABLE:
+        try:
+            from unified_loop_manager import TrinityComponent
+            trinity_manager = await trinity_startup(TrinityComponent.REACTOR_CORE)
+            logger.info("=" * 70)
+            logger.info("  TRINITY UNIFIED LOOP MANAGER INITIALIZED")
+            logger.info("  Cross-repo consensus protocol active")
+            logger.info("=" * 70)
+        except Exception as e:
+            logger.warning(f"Trinity initialization failed (continuing without): {e}")
+    else:
+        logger.info("Trinity not available - using standalone mode")
+
     parser = argparse.ArgumentParser(
         description="AGI OS Unified Supervisor - Project Trinity (v91.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2549,6 +2612,16 @@ Examples:
 
     # Cleanup
     await supervisor.stop()
+
+    # ==========================================================================
+    # TRINITY SHUTDOWN
+    # ==========================================================================
+    if trinity_manager is not None:
+        try:
+            await trinity_shutdown()
+            logger.info("Trinity manager shutdown complete")
+        except Exception as e:
+            logger.warning(f"Trinity shutdown error (non-fatal): {e}")
 
     return 0 if success else 1
 
