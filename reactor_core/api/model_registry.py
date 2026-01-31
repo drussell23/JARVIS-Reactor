@@ -72,6 +72,27 @@ from typing import (
     Union,
 )
 
+# v152.0: Import cloud mode detector for JARVIS ecosystem awareness
+try:
+    from reactor_core.core.cloud_mode_detector import (
+        is_cloud_mode_active,
+        get_effective_jarvis_url,
+        should_skip_local_service,
+    )
+    CLOUD_MODE_DETECTOR_AVAILABLE = True
+except ImportError:
+    CLOUD_MODE_DETECTOR_AVAILABLE = False
+    def is_cloud_mode_active() -> bool:
+        return os.getenv("JARVIS_GCP_OFFLOAD_ACTIVE", "false").lower() == "true"
+    def get_effective_jarvis_url(default: str = "http://localhost:8000") -> str:
+        if is_cloud_mode_active():
+            return os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
+        return default
+    def should_skip_local_service(service_name: str = "jarvis") -> tuple:
+        if is_cloud_mode_active():
+            return True, "Cloud mode active"
+        return False, None
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,9 +122,28 @@ class RegistryConfig:
     MAX_VERSIONS_KEPT = int(os.getenv("MAX_MODEL_VERSIONS", "10"))
     CHECKPOINT_RETENTION_DAYS = int(os.getenv("CHECKPOINT_RETENTION_DAYS", "30"))
 
-    # Notification
+    # Notification - v152.0: Use cloud-aware URL resolution
     JARVIS_API_URL = os.getenv("JARVIS_API_URL", "http://localhost:8000")
     PRIME_API_URL = os.getenv("PRIME_API_URL", "http://localhost:8001")
+
+    @staticmethod
+    def get_jarvis_api_url() -> str:
+        """v152.0: Get JARVIS API URL, respecting cloud mode."""
+        env_url = os.getenv("JARVIS_API_URL")
+        if env_url:
+            return env_url
+        return get_effective_jarvis_url("http://localhost:8000")
+
+    @staticmethod
+    def get_prime_api_url() -> str:
+        """v152.0: Get Prime API URL, respecting cloud mode."""
+        env_url = os.getenv("PRIME_API_URL")
+        if env_url:
+            return env_url
+        # In cloud mode, Prime and JARVIS share the same endpoint
+        if is_cloud_mode_active():
+            return get_effective_jarvis_url("")
+        return "http://localhost:8001"
 
 
 # ============================================================================
@@ -1137,11 +1177,45 @@ class DeploymentManager:
 
     async def _notify_deployment(self, version: ModelVersion, target: DeploymentTarget):
         """Send deployment notification to target systems."""
+        # v152.0: Check cloud mode before attempting local notifications
+        if is_cloud_mode_active():
+            logger.info(
+                f"[Deploy] [v152.0] Cloud mode active - skipping local notifications "
+                f"for {version.model_name} v{version.version}"
+            )
+            # In cloud mode, we could optionally notify the cloud endpoint
+            cloud_url = get_effective_jarvis_url("")
+            if cloud_url:
+                try:
+                    import aiohttp
+                    payload = {
+                        "event": "model_deployed",
+                        "version_id": version.version_id,
+                        "model_name": version.model_name,
+                        "version": str(version.version),
+                        "artifact_path": version.artifact_path,
+                        "deployed_at": time.time(),
+                        "source": "reactor-core",
+                        "cloud_mode": True,
+                    }
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{cloud_url}/reactor-core/model/deployed",
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as response:
+                            if response.status == 200:
+                                logger.info(f"[Deploy] [v152.0] Notified cloud endpoint")
+                except Exception as e:
+                    logger.debug(f"[Deploy] [v152.0] Cloud notification failed (non-fatal): {e}")
+            return
+
+        # Standard local notification
         targets = []
         if target in (DeploymentTarget.JARVIS, DeploymentTarget.BOTH):
-            targets.append(("jarvis", RegistryConfig.JARVIS_API_URL))
+            targets.append(("jarvis", RegistryConfig.get_jarvis_api_url()))
         if target in (DeploymentTarget.PRIME, DeploymentTarget.BOTH):
-            targets.append(("prime", RegistryConfig.PRIME_API_URL))
+            targets.append(("prime", RegistryConfig.get_prime_api_url()))
 
         try:
             import aiohttp
@@ -1175,6 +1249,22 @@ class DeploymentManager:
 
     async def _notify_rollback(self, version: ModelVersion, target: DeploymentTarget, reason: str):
         """Send rollback notification."""
+        # v152.0: Check cloud mode before attempting local notifications
+        if is_cloud_mode_active():
+            logger.info(
+                f"[Rollback] [v152.0] Cloud mode active - using cloud endpoint for "
+                f"{version.model_name} v{version.version} rollback notification"
+            )
+            base_url = get_effective_jarvis_url("")
+            if not base_url:
+                logger.debug("[Rollback] [v152.0] No cloud endpoint available, skipping notification")
+                return
+        else:
+            base_url = (
+                RegistryConfig.get_jarvis_api_url() if target == DeploymentTarget.JARVIS
+                else RegistryConfig.get_prime_api_url()
+            )
+
         try:
             import aiohttp
 
@@ -1185,12 +1275,8 @@ class DeploymentManager:
                 "version": str(version.version),
                 "reason": reason,
                 "rolled_back_at": time.time(),
+                "cloud_mode": is_cloud_mode_active(),
             }
-
-            base_url = (
-                RegistryConfig.JARVIS_API_URL if target == DeploymentTarget.JARVIS
-                else RegistryConfig.PRIME_API_URL
-            )
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(

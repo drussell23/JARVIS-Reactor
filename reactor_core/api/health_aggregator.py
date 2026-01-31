@@ -70,6 +70,27 @@ from typing import (
     TypeVar,
 )
 
+# v152.0: Import cloud mode detector for JARVIS ecosystem awareness
+try:
+    from reactor_core.core.cloud_mode_detector import (
+        is_cloud_mode_active,
+        get_effective_jarvis_url,
+        should_skip_local_service,
+    )
+    CLOUD_MODE_DETECTOR_AVAILABLE = True
+except ImportError:
+    CLOUD_MODE_DETECTOR_AVAILABLE = False
+    def is_cloud_mode_active() -> bool:
+        return os.getenv("JARVIS_GCP_OFFLOAD_ACTIVE", "false").lower() == "true"
+    def get_effective_jarvis_url(default: str = "http://localhost:8000") -> str:
+        if is_cloud_mode_active():
+            return os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
+        return default
+    def should_skip_local_service(service_name: str = "jarvis") -> tuple:
+        if is_cloud_mode_active():
+            return True, "Cloud mode active"
+        return False, None
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,7 +101,31 @@ logger = logging.getLogger(__name__)
 class HealthConfig:
     """Health aggregator configuration."""
 
-    # Endpoints
+    # v152.0: Cloud-aware endpoint resolution
+    # When cloud mode is active, use GCP endpoints or skip local checks entirely
+
+    @staticmethod
+    def _get_jarvis_health_url() -> str:
+        """v152.0: Get JARVIS health URL, respecting cloud mode."""
+        env_url = os.getenv("JARVIS_HEALTH_URL")
+        if env_url:
+            return env_url
+        base_url = get_effective_jarvis_url("http://localhost:8000")
+        return f"{base_url}/health" if base_url else ""
+
+    @staticmethod
+    def _get_prime_health_url() -> str:
+        """v152.0: Get Prime health URL, respecting cloud mode."""
+        env_url = os.getenv("PRIME_HEALTH_URL")
+        if env_url:
+            return env_url
+        # Prime is same as JARVIS in cloud mode (unified endpoint)
+        if is_cloud_mode_active():
+            base_url = get_effective_jarvis_url("")
+            return f"{base_url}/health" if base_url else ""
+        return "http://localhost:8001/health"
+
+    # Endpoints - use property-like access via class methods
     JARVIS_HEALTH_URL = os.getenv("JARVIS_HEALTH_URL", "http://localhost:8000/health")
     PRIME_HEALTH_URL = os.getenv("PRIME_HEALTH_URL", "http://localhost:8001/health")
     REACTOR_HEALTH_URL = os.getenv("REACTOR_HEALTH_URL", "http://localhost:8003/health")
@@ -304,6 +349,28 @@ class ComponentChecker:
     async def check(self) -> HealthCheck:
         """Perform health check."""
         start_time = time.time()
+
+        # v152.0: Check cloud mode before attempting local service checks
+        # When cloud mode is active, local JARVIS/Prime are intentionally offline
+        if self.component in ("jarvis", "prime"):
+            skip_local, reason = should_skip_local_service(self.component)
+            if skip_local:
+                logger.debug(
+                    f"[Health] [v152.0] Skipping {self.component} local check: {reason}"
+                )
+                # Return a special "expected offline" status instead of unhealthy
+                # This prevents circuit breaker from recording failures for intentionally disabled services
+                return HealthCheck(
+                    component=self.component,
+                    status=HealthStatus.DEGRADED,  # Not unhealthy - it's expected
+                    latency_ms=0,
+                    message=f"Cloud mode active - {self.component} running in cloud",
+                    details={
+                        "cloud_mode": True,
+                        "reason": reason,
+                        "skip_local": True,
+                    },
+                )
 
         # Check circuit breaker (v93.4: startup-aware half-open timeout)
         if self._circuit_open:

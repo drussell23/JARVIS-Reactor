@@ -73,6 +73,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("reactor.core")
 
+# v152.0: Import cloud mode detector for JARVIS ecosystem awareness
+try:
+    from reactor_core.core.cloud_mode_detector import (
+        is_cloud_mode_active,
+        get_effective_jarvis_url,
+        get_cloud_state,
+    )
+    CLOUD_MODE_DETECTOR_AVAILABLE = True
+    logger.info("[v152.0] Cloud mode detector loaded")
+except ImportError as e:
+    CLOUD_MODE_DETECTOR_AVAILABLE = False
+    logger.debug(f"[v152.0] Cloud mode detector not available: {e}")
+    def is_cloud_mode_active() -> bool:
+        return os.getenv("JARVIS_GCP_OFFLOAD_ACTIVE", "false").lower() == "true"
+    def get_effective_jarvis_url(default: str = "http://localhost:8000") -> str:
+        if is_cloud_mode_active():
+            return os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
+        return default
+    def get_cloud_state():
+        return None
+
 
 # =============================================================================
 # v96.0: PROCESS FINGERPRINTING FOR SERVICE REGISTRY
@@ -472,10 +493,24 @@ class ReactorCoreConfig:
     def __init__(self):
         self.port = int(os.getenv("REACTOR_PORT", "8090"))
         self.host = os.getenv("REACTOR_HOST", "0.0.0.0")
-        self.jarvis_prime_url = os.getenv("JARVIS_PRIME_URL", "http://localhost:8000")
+
+        # v152.0: Cloud-aware JARVIS Prime URL resolution
+        env_url = os.getenv("JARVIS_PRIME_URL")
+        if env_url:
+            self.jarvis_prime_url = env_url
+        else:
+            self.jarvis_prime_url = get_effective_jarvis_url("http://localhost:8000")
+
+        # v152.0: Track cloud mode state
+        self.cloud_mode_active = is_cloud_mode_active()
+        if self.cloud_mode_active:
+            logger.info(
+                f"[v152.0] Cloud mode detected - JARVIS Prime URL: {self.jarvis_prime_url}"
+            )
+
         self.trinity_enabled = os.getenv("TRINITY_ENABLED", "true").lower() == "true"
         self.service_name = "reactor_core"
-        self.version = "v92.0"
+        self.version = "v152.0"  # v152.0: Updated version for cloud mode support
 
         # Directories
         jarvis_prime_path = Path.home() / "Documents" / "repos" / "jarvis-prime"

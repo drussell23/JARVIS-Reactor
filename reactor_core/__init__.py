@@ -51,7 +51,7 @@ TRINITY INTEGRATION:
 - Unified supervisor for single-command startup
 """
 
-__version__ = "2.10.0"  # v89.0 - Trinity Unification Engine: Ultimate System Coordination
+__version__ = "2.11.0"  # v152.0 - Cloud Mode Detection: Cross-Repo Cloud State Awareness
 
 # Core training
 from reactor_core.training import (
@@ -472,6 +472,19 @@ from reactor_core.integration import (
     ShutdownPlan,
 )
 
+# === CLOUD MODE DETECTION (v152.0) ===
+
+# Cloud Mode Detector - Cross-repo cloud state awareness
+from reactor_core.core import (
+    CloudModeDetector,
+    CloudModeState,
+    get_cloud_mode_detector,
+    is_cloud_mode_active,
+    get_cloud_state,
+    get_effective_jarvis_url,
+    should_skip_local_service,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -788,4 +801,12 @@ __all__ = [
     "TrinityLifecyclePhase",
     "ShutdownLayer",
     "ShutdownPlan",
+    # === CLOUD MODE DETECTION (v152.0) ===
+    "CloudModeDetector",
+    "CloudModeState",
+    "get_cloud_mode_detector",
+    "is_cloud_mode_active",
+    "get_cloud_state",
+    "get_effective_jarvis_url",
+    "should_skip_local_service",
 ]
