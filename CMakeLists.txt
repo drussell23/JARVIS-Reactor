@@ -48,6 +48,12 @@ endif()
 find_package(pybind11 CONFIG REQUIRED)
 message(STATUS "[v190.0] pybind11 found: ${pybind11_VERSION}")
 
+# v190.0: Force static library build for Python bindings
+# This ensures the library code is linked directly into the .so file
+# eliminating runtime dependency on a separate .dylib file
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries for Python bindings" FORCE)
+message(STATUS "[v190.0] Building MLForgeLib as STATIC library for Python bindings")
+
 # Add MLForge as subdirectory (C++ core)
 add_subdirectory(mlforge)
 
