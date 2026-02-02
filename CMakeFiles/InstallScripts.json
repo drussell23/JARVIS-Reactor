@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/Users/djrussell23/Documents/repos/reactor-core/cmake_install.cmake",
-		"/Users/djrussell23/Documents/repos/reactor-core/mlforge/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
