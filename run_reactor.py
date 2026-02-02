@@ -1241,6 +1241,9 @@ class ReactorCoreService:
             "running": False,
             "start_time": time.time(),
             "trinity_connected": False,
+            # v186.0: Startup phase tracking for DMS cross-repo monitoring
+            "startup_phase": "initializing",
+            "startup_progress": 0,
         }
         self._trinity_client: Optional[TrinityClient] = None
         self._job_manager = TrainingJobManager(config)
