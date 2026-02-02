@@ -1,0 +1,98 @@
+[
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/ai/nlp_transformer.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/ai/nlp_transformer.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/ai/nlp_transformer.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/ai/nlp_transformer.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/algorithms/decision.tree.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/decision.tree.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/decision.tree.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/algorithms/decision.tree.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/algorithms/linear_regression.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/linear_regression.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/linear_regression.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/algorithms/linear_regression.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/algorithms/logistic_regression.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/logistic_regression.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/logistic_regression.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/algorithms/logistic_regression.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/algorithms/neural_net.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/neural_net.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/algorithms/neural_net.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/algorithms/neural_net.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/core/data_structures/trie.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/data_structures/trie.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/data_structures/trie.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/core/data_structures/trie.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/core/matrix.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/matrix.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/matrix.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/core/matrix.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/core/utils.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/utils.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/core/utils.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/core/utils.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/deployment/api.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/deployment/api.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/deployment/api.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/deployment/api.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/deployment/model_server.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/deployment/model_server.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/deployment/model_server.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/deployment/model_server.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++ -DMLForgeLib_EXPORTS -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIC -Wall -Wextra -pedantic -Werror -o CMakeFiles/MLForgeLib.dir/src/serialization/serializer.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/src/serialization/serializer.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/src/serialization/serializer.cpp",
+  "output": "mlforge/CMakeFiles/MLForgeLib.dir/src/serialization/serializer.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++  -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIE -Wall -Wextra -pedantic -Werror -o CMakeFiles/test_algorithms.dir/tests/test_algorithms.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_algorithms.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_algorithms.cpp",
+  "output": "mlforge/CMakeFiles/test_algorithms.dir/tests/test_algorithms.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++  -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIE -Wall -Wextra -pedantic -Werror -o CMakeFiles/test_linear_regression.dir/tests/test_linear_regression.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_linear_regression.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_linear_regression.cpp",
+  "output": "mlforge/CMakeFiles/test_linear_regression.dir/tests/test_linear_regression.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++  -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIE -Wall -Wextra -pedantic -Werror -o CMakeFiles/test_logistic_regression.dir/tests/test_logistic_regression.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_logistic_regression.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/tests/test_logistic_regression.cpp",
+  "output": "mlforge/CMakeFiles/test_logistic_regression.dir/tests/test_logistic_regression.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++  -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIE -Wall -Wextra -pedantic -Werror -o CMakeFiles/benchmarks.dir/benchmarks/benchmarks.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/benchmarks/benchmarks.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/benchmarks/benchmarks.cpp",
+  "output": "mlforge/CMakeFiles/benchmarks.dir/benchmarks/benchmarks.cpp.o"
+},
+{
+  "directory": "/Users/djrussell23/Documents/repos/reactor-core/mlforge",
+  "command": "/usr/bin/c++  -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/third_party/cpp-httplib -I/Users/djrussell23/Documents/repos/reactor-core/mlforge/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -fPIE -Wall -Wextra -pedantic -Werror -o CMakeFiles/profiler.dir/profiling/profiler.cpp.o -c /Users/djrussell23/Documents/repos/reactor-core/mlforge/profiling/profiler.cpp",
+  "file": "/Users/djrussell23/Documents/repos/reactor-core/mlforge/profiling/profiler.cpp",
+  "output": "mlforge/CMakeFiles/profiler.dir/profiling/profiler.cpp.o"
+}
+]
