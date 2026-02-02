@@ -902,13 +902,46 @@ async def create_health_server(
         app = web.Application()
 
         async def health_handler(request):
+            """
+            v190.0: Enhanced health endpoint with semantic readiness detection.
+
+            Returns detailed state information enabling intelligent readiness
+            detection by the unified_supervisor:
+
+            - status: "starting" | "healthy" | "error"
+            - training_ready: True only when job manager is fully initialized
+            - trinity_connected: Whether connected to Trinity mesh
+            - phase: Current startup phase for progress tracking
+            """
+            is_running = state.get("running", False)
+            startup_phase = state.get("startup_phase", "initializing")
+
+            # v190.0: training_ready is TRUE only when:
+            # 1. Service is running
+            # 2. Startup phase is "running" or "ready" (not "initializing")
+            # 3. Job manager is operational (tracked by startup completion)
+            training_ready = is_running and startup_phase in ("running", "ready", "operational")
+
+            # Determine semantic status
+            if is_running and training_ready:
+                status = "healthy"
+                phase = "ready"
+            elif is_running:
+                status = "starting"
+                phase = startup_phase
+            else:
+                status = "starting"
+                phase = startup_phase or "pre-init"
+
             return web.json_response({
-                "status": "healthy" if state.get("running") else "starting",
+                "status": status,
+                "phase": phase,
                 "service": config.service_name,
                 "version": config.version,
                 "uptime_seconds": time.time() - state.get("start_time", time.time()),
                 "trinity_connected": state.get("trinity_connected", False),
-                "training_ready": True,
+                "training_ready": training_ready,
+                "startup_progress": state.get("startup_progress", 0),
                 "timestamp": datetime.now().isoformat(),
             })
 
@@ -1254,23 +1287,42 @@ class ReactorCoreService:
 
     async def start(self):
         """
-        v95.0: Start the Reactor Core service with shared service registration.
+        v190.0: Start the Reactor Core service with shared service registration
+        and progressive startup phase tracking.
 
         Registers Reactor Core with the shared service registry at
         ~/.jarvis/registry/services.json to enable TrinityIntegrator's
         registration-aware verification.
+
+        Startup phases (for semantic readiness detection):
+        1. initializing - Service object created
+        2. loading_jobs - Loading persisted training jobs
+        3. starting_server - Starting HTTP health server
+        4. registering - Registering with service registry
+        5. connecting_trinity - Connecting to Trinity mesh
+        6. ready - Fully operational
         """
         logger.info(f"Starting Reactor Core service {self._config.version}")
 
+        # v190.0: Progressive startup phase tracking
+        self._state["startup_phase"] = "loading_jobs"
+        self._state["startup_progress"] = 10
+
         # Load persisted jobs
         await self._job_manager.load_jobs()
+        self._state["startup_progress"] = 30
+        logger.debug("[v190.0] Job manager initialized")
 
         # Start health server
+        self._state["startup_phase"] = "starting_server"
+        self._state["startup_progress"] = 40
         self._health_runner = await create_health_server(
             self._config,
             self._state,
             self._job_manager,
         )
+        self._state["startup_progress"] = 60
+        logger.debug("[v190.0] Health server started")
 
         # v96.0: Register with shared service registry using ATOMIC locking
         # This is CRITICAL for TrinityIntegrator's registration-aware verification
@@ -1318,6 +1370,10 @@ class ReactorCoreService:
             "machine_id": machine_id,
         }
 
+        # v190.0: Phase tracking for service registration
+        self._state["startup_phase"] = "registering"
+        self._state["startup_progress"] = 70
+
         # Use atomic registration with file locking
         if _atomic_register_service(
             service_name="reactor_core",
@@ -1342,14 +1398,31 @@ class ReactorCoreService:
         else:
             logger.warning("[v96.0] Service registry registration failed (non-fatal)")
 
+        self._state["startup_progress"] = 80
+
+        # v190.0: Phase tracking for Trinity connection
+        self._state["startup_phase"] = "connecting_trinity"
+        self._state["startup_progress"] = 85
+
         # Connect to Trinity if enabled
         if self._config.trinity_enabled:
             self._trinity_client = TrinityClient(self._config)
             connected = await self._trinity_client.connect()
             self._state["trinity_connected"] = connected
+            if connected:
+                logger.debug("[v190.0] Trinity mesh connected")
+            else:
+                logger.debug("[v190.0] Trinity mesh connection failed (non-fatal)")
+        else:
+            logger.debug("[v190.0] Trinity disabled, skipping connection")
 
+        self._state["startup_progress"] = 95
+
+        # v190.0: Final readiness
         self._state["running"] = True
-        logger.info(f"Reactor Core service started on port {self._config.port}")
+        self._state["startup_phase"] = "ready"
+        self._state["startup_progress"] = 100
+        logger.info(f"[v190.0] ✅ Reactor Core service fully ready on port {self._config.port}")
 
         # Write state for cross-repo coordination
         await self._write_state()
