@@ -1549,6 +1549,62 @@ class ReactorCoreService:
 # MAIN ENTRY POINT
 # =============================================================================
 
+def _check_port_available(port: int, host: str = "0.0.0.0") -> tuple[bool, str]:
+    """
+    v198.0: Pre-startup port availability check for Reactor Core.
+
+    Defense-in-depth measure that provides clear error message BEFORE
+    attempting to bind, rather than cryptic "Address already in use".
+
+    Uses two-phase check:
+    1. Connect test - detects if something is actively listening
+    2. Bind test - confirms we can actually bind
+
+    Returns:
+        Tuple of (is_available, error_message)
+    """
+    import socket
+
+    bind_host = '127.0.0.1' if host == '0.0.0.0' else host
+
+    # Phase 1: Check if anything is already listening
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            result = sock.connect_ex((bind_host, port))
+            if result == 0:
+                # Connection succeeded = something is listening
+                pass  # Fall through to get PID info
+            else:
+                # No listener, verify we can bind
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as bind_sock:
+                        bind_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        bind_sock.settimeout(1.0)
+                        bind_sock.bind((bind_host, port))
+                        return True, ""
+                except OSError:
+                    pass  # Fall through to error reporting
+    except Exception:
+        pass
+
+    # Port is in use - gather diagnostic info
+    pid_info = ""
+    if PSUTIL_AVAILABLE:
+        try:
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr.port == port:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        pid_info = f" (PID {conn.pid}: {proc.name()})"
+                    except Exception:
+                        pid_info = f" (PID {conn.pid})"
+                    break
+        except Exception:
+            pass
+    return False, f"Port {port} is already in use{pid_info}"
+
+
 async def main(args: argparse.Namespace):
     """Main entry point."""
     config = ReactorCoreConfig()
@@ -1558,6 +1614,23 @@ async def main(args: argparse.Namespace):
         config.port = args.port
     if args.prime_url:
         config.jarvis_prime_url = args.prime_url
+
+    # =========================================================================
+    # v198.0: PRE-STARTUP PORT AVAILABILITY CHECK
+    # =========================================================================
+    port_available, port_error = _check_port_available(config.port)
+    if not port_available:
+        logger.error("=" * 70)
+        logger.error("🔴 PORT CONFLICT DETECTED - REACTOR CORE")
+        logger.error("=" * 70)
+        logger.error(f"   {port_error}")
+        logger.error("")
+        logger.error("   Possible solutions:")
+        logger.error(f"   1. Kill the process using port {config.port}")
+        logger.error(f"   2. Use a different port: --port {config.port + 1}")
+        logger.error(f"   3. Run 'lsof -i :{config.port}' to see what's using it")
+        logger.error("=" * 70)
+        sys.exit(1)
 
     # Create and start service
     service = ReactorCoreService(config)
