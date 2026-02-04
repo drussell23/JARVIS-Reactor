@@ -1,8 +1,8 @@
-# JARVIS Reactor
+# JARVIS Reactor (Reactor-Core)
 
-**An Advanced AI/ML Training & Serving Engine for AGI OS**
+**The Nerves of the AGI OS — training, fine-tuning, experience collection, and model deployment**
 
-JARVIS Reactor (formerly Reactor Core) is the "nervous system" of the JARVIS AGI ecosystem, providing enterprise-grade ML training, model serving, and real-time event coordination across distributed AI systems.
+JARVIS Reactor (Reactor-Core) is the **training and learning layer** of the JARVIS AGI ecosystem. It provides ML training (DPO, RLHF, curriculum, meta-learning, world models, causal reasoning), model serving with hot-reload, experience collection from JARVIS Body, model deployment to JARVIS-Prime, and **Trinity Protocol** integration for cross-repo coordination. It is started either **standalone** (`run_reactor.py`) or by the **unified supervisor** in JARVIS (`python3 unified_supervisor.py`).
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -11,7 +11,19 @@ JARVIS Reactor (formerly Reactor Core) is the "nervous system" of the JARVIS AGI
 
 ---
 
-## 🚀 What is JARVIS Reactor?
+## What is JARVIS Reactor? (Trinity Role)
+
+| Role | Repository | Responsibility |
+|------|------------|----------------|
+| **Body** | [JARVIS (JARVIS-AI-Agent)](https://github.com/drussell23/JARVIS-AI-Agent) | macOS integration, computer use, unified supervisor, voice/vision |
+| **Mind** | [JARVIS-Prime](https://github.com/drussell23/jarvis-prime) | LLM inference, Neural Orchestrator Core, OpenAI-compatible API |
+| **Nerves** | **Reactor-Core (this repo)** | Training, fine-tuning, experience collection, model deployment, Trinity coordination |
+
+Reactor-Core is the **nervous system**: it trains and improves models, collects experience from JARVIS, and deploys models to JARVIS-Prime. The **unified supervisor** in JARVIS discovers and starts Reactor-Core (default port **8090**) alongside JARVIS-Prime (8000) and the JARVIS backend (8010).
+
+---
+
+## 🚀 What is JARVIS Reactor? (Features)
 
 JARVIS Reactor is a production-grade ML infrastructure combining:
 
@@ -382,6 +394,24 @@ docker-compose up supervisor
 
 ## 🚀 Quick Start
 
+### Start Reactor-Core (Recommended: via JARVIS)
+
+```bash
+# From JARVIS-AI-Agent repo — starts Body + Prime + Reactor-Core
+cd /path/to/JARVIS-AI-Agent
+python3 unified_supervisor.py
+```
+
+Reactor-Core will start on port **8090** and register with Trinity. Health: `http://localhost:8090/health`.
+
+### Start Reactor-Core Standalone
+
+```bash
+# From Reactor-Core repo
+cd /path/to/Reactor-Core
+python3 run_reactor.py --port 8090
+```
+
 ### Basic Training
 
 ```python
@@ -531,31 +561,29 @@ print(f"Prime: {health['prime'].status}")
 print(f"Reactor: {health['reactor'].status}")
 ```
 
+### Entry Points
+
+| Entry Point | Purpose | When to Use |
+|-------------|---------|-------------|
+| **Unified Supervisor (JARVIS)** | `python3 unified_supervisor.py` in **JARVIS-AI-Agent** | **Recommended** — starts Body + Prime + Reactor-Core with Trinity coordination; discovers Reactor via `REACTOR_CORE_REPO_PATH` or default path |
+| **`run_reactor.py`** | Trinity-integrated Reactor entry point | Standalone Reactor, or when supervisor calls it (e.g. `python3 run_reactor.py --port 8090`) |
+| **`run_supervisor.py`** (in this repo) | Legacy/alternative supervisor in Reactor repo | When running orchestration from the Reactor repo instead of JARVIS |
+
+The **unified supervisor lives in JARVIS-AI-Agent**. It starts Reactor-Core by running `run_reactor.py` (or the configured script) in this repo, typically on port **8090**. Reactor exposes `/health` for supervisor health checks and Trinity state sync.
+
 ### Unified Supervisor (One-Command Startup)
 
-The unified supervisor (`run_supervisor.py`) is the **single entry point** for starting the entire AGI OS ecosystem. It automatically discovers, starts, and coordinates JARVIS, JARVIS Prime, and Reactor Core.
+The unified supervisor is in **JARVIS-AI-Agent** (`unified_supervisor.py`). It is the **single entry point** for the entire AGI OS ecosystem and automatically discovers, starts, and coordinates JARVIS (Body), JARVIS-Prime (Mind), and Reactor-Core (Nerves).
 
 ```bash
-# Start entire AGI OS ecosystem (recommended)
-python3 run_supervisor.py
+# From JARVIS-AI-Agent repo — start entire AGI OS ecosystem (recommended)
+python3 unified_supervisor.py
 
-# With specific components
-python3 run_supervisor.py --components jarvis,prime,reactor
-
-# Development mode (verbose logging)
-python3 run_supervisor.py --dev --log-level DEBUG
-
-# Custom ports
-python3 run_supervisor.py --api-port 8003 --serving-port 8001 --jprime-port 8000
-
-# Disable specific features
-python3 run_supervisor.py --no-online-learning --no-distributed
-
-# GCP Spot VM mode
-python3 run_supervisor.py --gcp-project my-project --checkpoint-bucket my-bucket
+# With options (see JARVIS-AI-Agent unified_supervisor.py for full CLI)
+# python3 unified_supervisor.py --mode supervisor --skip-trinity ...
 ```
 
-**What the Supervisor Does:**
+**What the Supervisor Does (in JARVIS-AI-Agent):**
 
 1. **Component Discovery**: Automatically finds JARVIS, JARVIS Prime, and Reactor Core repos
 2. **Health Monitoring**: Continuous health checks with automatic recovery
@@ -1054,6 +1082,31 @@ await checkpointer.resume_training()
 - System load spikes
 - Network latency increases
 - Memory pressure indicators
+
+---
+
+## Cross-Repo Integration (Trinity)
+
+Reactor-Core is the **Nerves** in the three-repo Trinity architecture. It is **started and monitored** by the JARVIS unified supervisor and **coordinates with JARVIS-Prime** for inference and model deployment.
+
+**How JARVIS (Body) uses Reactor-Core:**
+
+- **Discovery:** Supervisor resolves `REACTOR_CORE_REPO_PATH` (or default `~/Documents/repos/Reactor-Core`).
+- **Startup:** Supervisor runs `run_reactor.py` (or configured script) with port **8090**; Reactor starts HTTP server and health endpoint.
+- **Health:** Supervisor polls `GET /health` on port 8090; Reactor reports training readiness and Trinity connection state.
+- **State:** Reactor reads/writes shared state under `~/.jarvis/` (e.g. Trinity state, experience queue) for coordination.
+
+**How Reactor-Core uses JARVIS-Prime:**
+
+- **Inference:** Reactor can call Prime’s OpenAI-compatible API for generation during training, evaluation, or distillation.
+- **Model deployment:** Trained/updated models can be deployed to Prime (e.g. hot swap, model registry).
+- **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Reactor participates in Trinity state sync and experience collection from JARVIS Body.
+
+**run_reactor.py:**
+
+- **Trinity-integrated entry point** for Reactor-Core. Designed to be started by the unified supervisor (`python3 run_reactor.py --port 8090`).
+- Exposes **health** (`/health`) for supervisor monitoring and **training/API** endpoints for the ecosystem.
+- Environment: `REACTOR_PORT` (default 8090), `JARVIS_PRIME_URL`, `TRINITY_ENABLED`, `MODEL_OUTPUT_DIR`, `LOG_LEVEL`.
 
 ---
 
@@ -1623,12 +1676,14 @@ POST http://localhost:8001/models/load
 
 ## 🔗 Links & Resources
 
-### Repositories
+### Repositories (Trinity)
 
-- **JARVIS Reactor (This Repo)**: https://github.com/drussell23/JARVIS-Reactor
-- **MLForge C++ Core**: https://github.com/drussell23/MLForge
-- **JARVIS-AI-Agent (Body)**: https://github.com/drussell23/JARVIS-AI-Agent
-- **JARVIS Prime (Mind)**: https://github.com/drussell23/jarvis-prime
+| Role | Repository | URL |
+|------|------------|-----|
+| **Body** | JARVIS (JARVIS-AI-Agent) | https://github.com/drussell23/JARVIS-AI-Agent |
+| **Mind** | JARVIS-Prime | https://github.com/drussell23/jarvis-prime |
+| **Nerves** | **Reactor-Core (this repo)** | https://github.com/drussell23/JARVIS-Reactor |
+| **C++ Core** | MLForge | https://github.com/drussell23/MLForge |
 
 ### Documentation
 
