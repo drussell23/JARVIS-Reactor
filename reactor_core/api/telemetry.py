@@ -799,6 +799,45 @@ class TelemetryCollector:
 
         logger.info("[Telemetry] Collector started")
 
+    async def flush_pending(self):
+        """Drain all remaining events from the buffer and process them.
+
+        Call this BEFORE stop() during shutdown to avoid data loss.
+        The ring buffer is in-memory only — anything not processed is lost
+        when the process exits.
+        """
+        flushed = 0
+        while True:
+            events = await self._buffer.pop_batch(TelemetryConfig.BATCH_SIZE)
+            if not events:
+                break
+            for event in events:
+                self._processed_count += 1
+                flushed += 1
+                # Broadcast event (handlers may persist to disk/DB)
+                topic = f"events:{event.event_type.name.lower()}"
+                try:
+                    await self._broadcaster.broadcast(topic, event.to_dict())
+                except Exception as e:
+                    logger.debug(f"[Telemetry] Flush broadcast failed: {e}")
+
+                # Call registered handlers
+                handlers = self._event_handlers.get(event.event_type, [])
+                for handler in handlers:
+                    try:
+                        await handler(event)
+                    except Exception as e:
+                        logger.debug(f"[Telemetry] Flush handler error: {e}")
+
+        # Final system metrics broadcast
+        try:
+            await self._broadcast_system_metrics()
+        except Exception:
+            pass
+
+        if flushed > 0:
+            logger.info(f"[Telemetry] Flushed {flushed} pending events on shutdown")
+
     async def stop(self):
         """Stop the telemetry collector."""
         self._running = False

@@ -332,6 +332,11 @@ class UnifiedTrainingPipeline:
             os.getenv("REACTOR_EXPERIENCE_BUFFER_THRESHOLD", "100")
         )
 
+        # v242.3: Strong references to background tasks to prevent GC collection.
+        # Without this, fire-and-forget tasks created with asyncio.create_task()
+        # can be garbage-collected before completion, silently dropping work.
+        self._background_tasks: set = set()
+
     async def add_experiences(
         self,
         experiences: Union[Dict[str, Any], List[Dict[str, Any]]],
@@ -454,11 +459,10 @@ class UnifiedTrainingPipeline:
         # Trigger training outside the lock but only if we won the race
         if should_flush:
             logger.info(f"[Pipeline] Buffer threshold reached ({buffer_size}), scheduling training")
-            task = asyncio.create_task(
+            task = self._spawn_background_task(
                 self._flush_experiences_to_training(),
-                name="experience_flush_training"
+                name="experience_flush_training",
             )
-            task.add_done_callback(self._handle_flush_task_result)
             # v242.0: Clear flush-in-progress when task completes
             task.add_done_callback(lambda _: setattr(self, '_flush_in_progress', False))
 
@@ -474,6 +478,32 @@ class UnifiedTrainingPipeline:
             logger.debug("[Pipeline] Flush task was cancelled")
         except asyncio.InvalidStateError:
             pass  # Task not done yet
+
+    def _spawn_background_task(self, coro, *, name: str = "") -> asyncio.Task:
+        """Create a background task with error logging and GC protection.
+
+        All fire-and-forget coroutines should go through this method instead
+        of bare ``asyncio.create_task()`` to ensure:
+        1. Strong reference prevents garbage collection before completion.
+        2. Done callback logs exceptions instead of silently swallowing them.
+        3. Reference is auto-cleaned on completion to avoid memory leak.
+        """
+        task = asyncio.create_task(coro, name=name or None)
+        self._background_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            try:
+                exc = t.exception()
+                if exc:
+                    logger.warning(f"[Pipeline] Background task '{t.get_name()}' failed: {exc}")
+            except asyncio.CancelledError:
+                pass
+            except asyncio.InvalidStateError:
+                pass
+
+        task.add_done_callback(_on_done)
+        return task
 
     async def get_buffered_experiences(self) -> List[Dict[str, Any]]:
         """
@@ -711,18 +741,18 @@ class UnifiedTrainingPipeline:
             # Voice announcement: Training started
             try:
                 from reactor_core.voice_integration import announce_training_started
-                asyncio.create_task(announce_training_started(
+                self._spawn_background_task(announce_training_started(
                     model_name=self.config.base_model.split("/")[-1],
                     samples=len(raw_interactions),
                     epochs=self.config.num_epochs,
-                ))
+                ), name="voice_announce_training_started")
             except Exception:
                 pass
 
             # Trinity Event: Training started
             try:
                 from reactor_core.integration.trinity_publisher import publish_training_started
-                asyncio.create_task(publish_training_started(
+                self._spawn_background_task(publish_training_started(
                     model_name=self.config.base_model.split("/")[-1],
                     config={
                         "epochs": self.config.num_epochs,
@@ -731,7 +761,7 @@ class UnifiedTrainingPipeline:
                         "samples": len(raw_interactions),
                         "lora_rank": self.config.lora_rank,
                     },
-                ))
+                ), name="trinity_training_started")
             except Exception as e:
                 logger.debug(f"Trinity event publish failed: {e}")
 
@@ -780,11 +810,11 @@ class UnifiedTrainingPipeline:
                 # Voice announcement: Training failed
                 try:
                     from reactor_core.voice_integration import announce_training_failed
-                    asyncio.create_task(announce_training_failed(
+                    self._spawn_background_task(announce_training_failed(
                         model_name=self.config.base_model.split("/")[-1],
                         error_message=training_result.error_message or "Unknown error",
                         steps_completed=training_result.total_steps or 0,
-                    ))
+                    ), name="voice_announce_training_failed")
                 except Exception:
                     pass
 
@@ -800,20 +830,20 @@ class UnifiedTrainingPipeline:
             # Voice announcement: Training complete
             try:
                 from reactor_core.voice_integration import announce_training_complete
-                asyncio.create_task(announce_training_complete(
+                self._spawn_background_task(announce_training_complete(
                     model_name=self.config.base_model.split("/")[-1],
                     steps=training_result.total_steps or 0,
                     loss=training_result.final_loss or 0.0,
                     duration_seconds=training_result.training_time_seconds or 0.0,
                     success=True,
-                ))
+                ), name="voice_announce_training_complete")
             except Exception:
                 pass
 
             # Trinity Event: Training complete
             try:
                 from reactor_core.integration.trinity_publisher import publish_training_complete
-                asyncio.create_task(publish_training_complete(
+                self._spawn_background_task(publish_training_complete(
                     model_name=self.config.base_model.split("/")[-1],
                     model_path=str(training_result.merged_model_path or training_result.adapter_path or ""),
                     metrics={
@@ -822,7 +852,7 @@ class UnifiedTrainingPipeline:
                     },
                     total_steps=training_result.total_steps,
                     training_time_seconds=training_result.training_time_seconds,
-                ))
+                ), name="trinity_training_complete")
             except Exception as e:
                 logger.debug(f"Trinity event publish failed: {e}")
 
@@ -833,10 +863,10 @@ class UnifiedTrainingPipeline:
                 # Voice announcement: Export started
                 try:
                     from reactor_core.voice_integration import announce_export_started
-                    asyncio.create_task(announce_export_started(
+                    self._spawn_background_task(announce_export_started(
                         format="GGUF",
                         quantization=self.config.gguf_quantization,
-                    ))
+                    ), name="voice_announce_export_started")
                 except Exception:
                     pass
 
@@ -847,10 +877,10 @@ class UnifiedTrainingPipeline:
                     try:
                         from reactor_core.voice_integration import announce_export_complete
                         file_size_mb = result.gguf_path.stat().st_size / (1024 * 1024) if result.gguf_path.exists() else None
-                        asyncio.create_task(announce_export_complete(
+                        self._spawn_background_task(announce_export_complete(
                             format="GGUF",
                             file_size_mb=file_size_mb,
-                        ))
+                        ), name="voice_announce_export_complete")
                     except Exception:
                         pass
 
@@ -861,9 +891,9 @@ class UnifiedTrainingPipeline:
                 # Voice announcement: Deployment started
                 try:
                     from reactor_core.voice_integration import announce_deployment_started
-                    asyncio.create_task(announce_deployment_started(
+                    self._spawn_background_task(announce_deployment_started(
                         target="JARVIS-Prime",
-                    ))
+                    ), name="voice_announce_deployment_started")
                 except Exception:
                     pass
 
@@ -876,10 +906,10 @@ class UnifiedTrainingPipeline:
                     try:
                         from reactor_core.voice_integration import announce_deployment_complete
                         model_version = result.gguf_path.name if result.gguf_path else None
-                        asyncio.create_task(announce_deployment_complete(
+                        self._spawn_background_task(announce_deployment_complete(
                             target="JARVIS-Prime",
                             model_version=model_version,
-                        ))
+                        ), name="voice_announce_deployment_complete")
                     except Exception:
                         pass
 
@@ -887,7 +917,7 @@ class UnifiedTrainingPipeline:
                     # This is THE KEY EVENT that closes the loop!
                     try:
                         from reactor_core.integration.trinity_publisher import publish_model_ready
-                        asyncio.create_task(publish_model_ready(
+                        self._spawn_background_task(publish_model_ready(
                             model_name=self.config.base_model.split("/")[-1],
                             model_path=str(result.deployed_to or result.gguf_path or result.model_path),
                             capabilities=["text_generation", "instruction_following"],
@@ -898,7 +928,7 @@ class UnifiedTrainingPipeline:
                                 "samples_used": result.samples_used,
                                 "quantization": self.config.gguf_quantization,
                             },
-                        ))
+                        ), name="trinity_model_ready")
                         logger.info("[Trinity] Published MODEL_READY - hot-swap can now occur!")
                     except Exception as e:
                         logger.debug(f"Trinity MODEL_READY publish failed: {e}")
@@ -923,12 +953,12 @@ class UnifiedTrainingPipeline:
             # Trinity Event: Training failed
             try:
                 from reactor_core.integration.trinity_publisher import publish_training_failed
-                asyncio.create_task(publish_training_failed(
+                self._spawn_background_task(publish_training_failed(
                     model_name=self.config.base_model.split("/")[-1],
                     error_message=str(e),
                     step=self._progress.training_step,
                     traceback=traceback.format_exc(),
-                ))
+                ), name="trinity_training_failed")
             except Exception:
                 pass  # Don't let event publishing failure mask the real error
 

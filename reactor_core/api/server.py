@@ -698,6 +698,14 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("Shutting down services...")
 
+        # Flush telemetry buffer BEFORE stopping — in-memory ring buffer
+        # data is lost if we cancel the processor task without draining it
+        if telemetry:
+            try:
+                await telemetry.flush_pending()
+            except Exception as e:
+                logger.warning(f"Telemetry flush failed: {e}")
+
         # Stop services
         if telemetry:
             await telemetry.stop()
