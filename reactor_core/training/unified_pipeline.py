@@ -407,12 +407,12 @@ class UnifiedTrainingPipeline:
                         logger.debug("Skipping experience missing assistant_output")
                         continue
             except Exception as val_err:
-                logger.debug(f"Skipping malformed experience: {val_err}")
+                logger.warning(f"[Pipeline] Rejecting malformed experience at boundary: {val_err}")
                 continue
 
             # Require minimum fields (post-normalization)
             if not validated.get("user_input") or not validated.get("assistant_output"):
-                logger.debug("Skipping experience missing user_input or assistant_output")
+                logger.warning("[Pipeline] Rejecting experience: missing user_input or assistant_output")
                 continue
 
             # Check confidence threshold
@@ -637,6 +637,29 @@ class UnifiedTrainingPipeline:
         if model_name:
             self.config.base_model = model_name
 
+        # v242.2: Training-level mutual exclusion — prevents concurrent training from
+        # ANY entry point (server.py API, NightShiftPipeline, PipelineScheduler, manual).
+        # Lock is at the training layer, not the HTTP layer, so all paths are protected.
+        _lock_fd = None
+        try:
+            import fcntl
+            lock_dir = Path.home() / ".reactor_core" / "scheduler" / "locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_file = lock_dir / "training_pipeline.lock"
+            _lock_fd = open(lock_file, "w")
+            try:
+                fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_fd.write(f"{os.getpid()}:{time.time()}\n")
+                _lock_fd.flush()
+            except (IOError, OSError):
+                _lock_fd.close()
+                _lock_fd = None
+                logger.warning("[Pipeline] Training already in progress (lock held) — skipping")
+                result.error_message = "Training already in progress — concurrent run blocked"
+                return result
+        except ImportError:
+            pass  # fcntl not available (Windows) — skip locking
+
         try:
             # Start Trinity heartbeat
             await self._trinity.start(self._progress)
@@ -712,21 +735,38 @@ class UnifiedTrainingPipeline:
 
             # Step 3b: DPO preference training (if pairs were generated in Step 1b)
             # This runs AFTER SFT as a refinement step on the same model.
+            # DPO requires a full (merged) model — LoRA adapters alone aren't loadable.
+            # If SFT produced only adapters (QLoRA path), we must merge first.
+            dpo_model_path = None
             if dpo_pairs and training_result.success:
                 try:
-                    preference_pairs = [p.to_preference_pair() for p in dpo_pairs]
-                    dpo_result = await self._train_dpo(
-                        preference_pairs=preference_pairs,
-                        model_path=training_result.merged_model_path or training_result.adapter_path,
-                    )
-                    if dpo_result:
-                        result.metrics["dpo_training_loss"] = dpo_result.get("final_loss", 0.0)
-                        result.metrics["dpo_training_steps"] = dpo_result.get("total_steps", 0)
-                        logger.info(
-                            f"[Pipeline] DPO training complete: "
-                            f"{dpo_result.get('total_steps', 0)} steps, "
-                            f"loss={dpo_result.get('final_loss', 0):.4f}"
+                    # Resolve the model path for DPO — needs a full model, not just adapters
+                    dpo_input_path = training_result.merged_model_path
+                    if not dpo_input_path and training_result.adapter_path:
+                        # SFT produced LoRA adapters only (QLoRA path) — merge before DPO
+                        logger.info("[Pipeline] Merging LoRA adapters into base model for DPO input")
+                        dpo_input_path = await self._merge_lora_for_dpo(
+                            adapter_path=training_result.adapter_path,
                         )
+
+                    if dpo_input_path:
+                        preference_pairs = [p.to_preference_pair() for p in dpo_pairs]
+                        dpo_result = await self._train_dpo(
+                            preference_pairs=preference_pairs,
+                            model_path=dpo_input_path,
+                        )
+                        if dpo_result and dpo_result.get("model_path"):
+                            # Use DPO-refined model for all downstream steps (GGUF, deploy)
+                            dpo_model_path = Path(dpo_result["model_path"])
+                            result.metrics["dpo_training_loss"] = dpo_result.get("final_loss", 0.0)
+                            result.metrics["dpo_training_steps"] = dpo_result.get("total_steps", 0)
+                            logger.info(
+                                f"[Pipeline] DPO training complete: "
+                                f"{dpo_result.get('total_steps', 0)} steps, "
+                                f"loss={dpo_result.get('final_loss', 0):.4f}"
+                            )
+                    else:
+                        logger.warning("[Pipeline] No mergeable model path for DPO — skipping DPO step")
                 except ImportError:
                     logger.info("[Pipeline] DPO trainer (advanced_training) not available — skipping DPO step")
                 except Exception as dpo_train_err:
@@ -747,7 +787,8 @@ class UnifiedTrainingPipeline:
                 raise RuntimeError(f"Training failed: {training_result.error_message}")
 
             result.adapter_path = training_result.adapter_path
-            result.model_path = training_result.merged_model_path or training_result.adapter_path
+            # Use DPO-refined model if available, otherwise fall back to SFT output
+            result.model_path = dpo_model_path or training_result.merged_model_path or training_result.adapter_path
             result.training_steps = training_result.total_steps
             result.final_loss = training_result.final_loss
             result.training_time_seconds = training_result.training_time_seconds
@@ -890,6 +931,16 @@ class UnifiedTrainingPipeline:
         finally:
             await self._trinity.stop()
             result.total_time_seconds = time.time() - self._start_time
+
+            # v242.2: Release training lock
+            if _lock_fd:
+                try:
+                    import fcntl
+                    fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                finally:
+                    _lock_fd.close()
 
         return result
 
@@ -1062,6 +1113,53 @@ class UnifiedTrainingPipeline:
         )
 
         return result
+
+    async def _merge_lora_for_dpo(self, adapter_path: Path) -> Optional[Path]:
+        """
+        Merge LoRA adapters into the base model to produce a full model for DPO.
+
+        When SFT used QLoRA, only adapter weights are saved — the DPO trainer needs
+        a full model to load and create a reference copy. This merges the adapters
+        into the base model and saves the result.
+
+        Returns:
+            Path to the merged model directory, or None on failure.
+        """
+        try:
+            from peft import PeftModel, PeftConfig
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import torch
+
+            # Load the PEFT config to find the base model name
+            peft_config = PeftConfig.from_pretrained(str(adapter_path))
+            base_model_name = peft_config.base_model_name_or_path or self.config.base_model
+
+            logger.info(f"[Pipeline] Loading base model {base_model_name} for LoRA merge")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                base_model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+
+            # Load and merge adapters
+            model = PeftModel.from_pretrained(base_model, str(adapter_path))
+            merged_model = model.merge_and_unload()
+
+            # Save merged model
+            merged_dir = self.config.output_dir / "sft_merged_for_dpo"
+            merged_dir.mkdir(parents=True, exist_ok=True)
+            merged_model.save_pretrained(str(merged_dir))
+            tokenizer.save_pretrained(str(merged_dir))
+
+            logger.info(f"[Pipeline] LoRA adapters merged for DPO: {merged_dir}")
+            return merged_dir
+
+        except ImportError as e:
+            logger.warning(f"[Pipeline] peft not available for LoRA merge: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[Pipeline] LoRA merge for DPO failed: {e}")
+            return None
 
     async def _train_dpo(
         self,

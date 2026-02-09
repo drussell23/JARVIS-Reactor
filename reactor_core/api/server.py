@@ -1978,27 +1978,10 @@ async def run_training_pipeline(job_id: str):
                 labels={"job_id": job_id, "stage": stage},
             )
 
-    # v242.1: Mutual exclusion — prevent concurrent training runs from
-    # multiple schedulers (NightShiftScheduler + PipelineScheduler) or
-    # manual triggers overlapping with scheduled runs.
-    lock_dir = Path.home() / ".reactor_core" / "scheduler" / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_dir / "training_pipeline.lock"
-
-    try:
-        import fcntl
-        _lock_fd = open(lock_file, "w")
-        try:
-            fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (IOError, OSError):
-            logger.warning(f"[Pipeline] Training already in progress (lock held), skipping job {job_id}")
-            await job_manager.fail_job(job_id, "Training already in progress — concurrent run blocked")
-            _lock_fd.close()
-            return
-        _lock_fd.write(f"{os.getpid()}:{job_id}\n")
-        _lock_fd.flush()
-    except ImportError:
-        _lock_fd = None  # fcntl not available (Windows) — skip locking
+    # v242.2: Training-level mutual exclusion is now inside
+    # UnifiedTrainingPipeline.run_training_cycle() itself, so ALL entry points
+    # (server.py API, NightShiftPipeline, PipelineScheduler, manual) are protected.
+    # No lock needed here — the training layer handles it.
 
     try:
         logger.info(f"[Pipeline] Starting: job_id={job_id}")
@@ -2188,17 +2171,6 @@ async def run_training_pipeline(job_id: str):
                 },
             ))
 
-    finally:
-        # v242.1: Release training pipeline lock so other schedulers can proceed
-        if _lock_fd:
-            try:
-                import fcntl
-                fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-            finally:
-                _lock_fd.close()
-                _lock_fd = None
 
 
 # ============================================================================
