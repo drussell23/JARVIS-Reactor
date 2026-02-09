@@ -1101,6 +1101,7 @@ Reactor-Core is the **Nerves** in the three-repo Trinity architecture. It is **s
 - **Inference:** Reactor can call Prime’s OpenAI-compatible API for generation during training, evaluation, or distillation.
 - **Model deployment:** Trained/updated models can be deployed to Prime (e.g. hot swap, model registry).
 - **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Reactor participates in Trinity state sync and experience collection from JARVIS Body.
+- **DPO Training from Telemetry (v238.0+):** JARVIS Body's `TelemetryEmitter` captures every interaction — query, complexity classification, response, latency, and source. Reactor-Core uses this telemetry to build DPO preference pairs (e.g., chosen: `"10"`, rejected: `"Of course, the sum of five and five is ten..."`) for fine-tuning Mistral-7B. This training loop makes the v236.0/v238.0 adaptive prompt system's conciseness enforcement **permanent** — encoding terse-vs-detailed behavior in the model's weights instead of relying on prompt instructions. See the JARVIS-Prime README for the full training loop architecture.
 
 **run_reactor.py:**
 
@@ -1466,6 +1467,15 @@ bandit -r reactor_core/
 ```
 
 ## 📈 Version History
+
+### **v238.0** - Ecosystem: Degenerate Response Elimination (2026-02-08, JARVIS Body-side)
+- JARVIS Body v238.0 fixes degenerate LLM responses ("...") via 3-layer defense-in-depth
+- SIMPLE classification narrowed: "what is X?" queries promoted to MODERATE (512 tokens)
+- Backend degenerate response detection with safe retry using MODERATE parameters
+- Client-side degenerate suppression with zombie timeout re-arming
+- `requestId` echo in WebSocket responses enables frontend deduplication
+- Reactor-Core's DPO training pipeline receives improved telemetry (complexity + source fields) for preference pair generation
+- **Note:** v238.0 changes are in JARVIS (Body) and documented here for ecosystem coherence
 
 ### **v92.0** - Reliability & Robustness (2025-01-15)
 - **Structured Concurrency**: Python 3.11+ TaskGroup patterns for robust async operations
