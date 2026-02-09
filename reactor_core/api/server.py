@@ -1623,8 +1623,30 @@ async def get_loaded_models():
 
 @app.post("/api/v1/experiences/stream", tags=["Experiences"])
 async def stream_experience(request: ExperienceStreamRequest):
-    """Stream an experience for future training."""
-    count = await job_manager.add_experience(request.experience)
+    """Stream an experience for future training.
+
+    v242.0: Accepts canonical ExperienceEvent format with proper field names.
+    Normalizes legacy field names (response→assistant_output) via from_raw_dict().
+    """
+    experience = request.experience
+
+    # v242.0: Normalize to canonical field names using the shared schema
+    try:
+        import sys as _sys
+        _jarvis_home = str(Path.home() / ".jarvis")
+        if _jarvis_home not in _sys.path:
+            _sys.path.insert(0, _jarvis_home)
+        from schemas.experience_schema import from_raw_dict
+        canonical = from_raw_dict(experience)
+        experience = canonical.to_reactor_core_format()
+    except ImportError:
+        # Fallback: manual normalization of critical field names
+        if "response" in experience and "assistant_output" not in experience:
+            experience["assistant_output"] = experience["response"]
+        if "output" in experience and "assistant_output" not in experience:
+            experience["assistant_output"] = experience["output"]
+
+    count = await job_manager.add_experience(experience)
 
     # Check if experience threshold triggers training
     if ServerConfig.SCHEDULER_ENABLED:
@@ -1914,14 +1936,19 @@ async def run_training_pipeline(job_id: str):
         metrics = {}
 
         try:
-            from reactor_core.training.unified_pipeline import get_unified_trainer, UnifiedTrainer
+            # v242.0: Fixed class name (UnifiedTrainingPipeline, not UnifiedTrainer)
+            # Fixed method names (run_training_cycle, not train_async)
+            # Fixed result field names to match PipelineResult dataclass
+            from reactor_core.training.unified_pipeline import (
+                get_unified_trainer_async, UnifiedTrainingPipeline, PipelineResult,
+            )
 
-            trainer = await get_unified_trainer()
+            trainer = await get_unified_trainer_async()
             real_training_available = True
             logger.info(f"[Pipeline] Using real unified training pipeline")
 
-            # Configure progress callback
-            trainer.set_progress_callback(progress_callback)
+            # Report initial progress
+            await progress_callback("data_prep", 5, "Preparing training data")
 
             # Get collected experiences from job manager
             experiences = job_manager.experiences.copy()
@@ -1929,81 +1956,47 @@ async def run_training_pipeline(job_id: str):
                 await trainer.add_experiences(experiences)
                 job_manager.experiences.clear()  # Clear after passing to trainer
 
-            # Run the actual training with cancellation check
-            async def check_cancelled() -> bool:
-                current_job = await job_manager.get_job(job_id)
-                return current_job and current_job["status"] == "cancelled"
+            await progress_callback("training", 20, f"Training on {len(experiences)} experiences")
 
-            training_result = await trainer.train_async(
-                job_id=job_id,
-                cancellation_check=check_cancelled,
-            )
+            # v242.0: Use run_training_cycle() — the actual method that exists
+            training_result = await trainer.run_training_cycle()
 
             if training_result.success:
                 metrics = {
                     "loss": training_result.final_loss,
-                    "eval_accuracy": training_result.eval_accuracy,
-                    "examples_trained": training_result.examples_trained,
+                    "examples_trained": training_result.samples_used,
                     "training_time_seconds": training_result.training_time_seconds,
-                    "epochs": training_result.epochs,
-                    "learning_rate": training_result.learning_rate,
+                    "training_steps": training_result.training_steps,
+                    "total_time_seconds": training_result.total_time_seconds,
                 }
-                output_model_path = training_result.output_model_path
+                # Use gguf_path first (preferred), fall back to model_path
+                output_model_path = str(training_result.gguf_path or training_result.model_path or "")
+                output_model_path = output_model_path if output_model_path else None
             else:
                 raise RuntimeError(training_result.error_message or "Training failed")
 
         except ImportError as e:
-            logger.warning(f"[Pipeline] Unified trainer not available: {e}, using staged fallback")
-        except AttributeError as e:
-            logger.warning(f"[Pipeline] Trainer API mismatch: {e}, using staged fallback")
+            logger.error(f"[Pipeline] Unified trainer not available: {e}")
+            # v242.0: Fail loudly instead of silently falling back to fake simulation
+            await job_manager.fail_job(job_id, str(e))
+            return
+        except Exception as e:
+            logger.error(f"[Pipeline] Training pipeline error: {e}")
+            # v242.0: On real failure, don't fake success — report the actual error
+            if not real_training_available:
+                await job_manager.fail_job(job_id, str(e))
+                return
 
-        # Fallback to staged simulation if real training not available
+        # v242.0: If real training pipeline wasn't available, the job was already
+        # failed above with an explicit error. No fake simulation fallback.
+        # The old code returned fake metrics pretending training succeeded —
+        # this masked the real issue (missing dependencies or broken imports).
         if not real_training_available:
-            stages = [
-                ("data_prep", 0, "Preparing training data"),
-                ("ingesting", 10, "Ingesting experiences"),
-                ("formatting", 20, "Formatting for training"),
-                ("distilling", 35, "Distilling knowledge from teacher models"),
-                ("fine_tuning", 50, "Fine-tuning model weights"),
-                ("training", 65, "Training on collected experiences"),
-                ("evaluating", 80, "Evaluating model performance"),
-                ("exporting", 90, "Exporting trained model"),
-            ]
-
-            for stage_name, progress, message in stages:
-                # Check for cancellation
-                current_job = await job_manager.get_job(job_id)
-                if current_job and current_job["status"] == "cancelled":
-                    logger.info(f"[Pipeline] Cancelled: {job_id}")
-                    return
-
-                await progress_callback(stage_name, progress, message)
-                logger.info(f"[Pipeline] {stage_name.upper()}: {progress}% - {message}")
-
-                # Simulate work (variable time for realism)
-                await asyncio.sleep(1.5 + (progress / 100.0))
-
-            # Generate simulated metrics
-            training_time = time.time() - start_time
-            metrics = {
-                "loss": 0.35 + (0.1 * (job["experience_count"] % 10) / 10),
-                "eval_accuracy": 0.85 + (0.1 * (job["experience_count"] % 10) / 10),
-                "examples_trained": job["experience_count"],
-                "training_time_seconds": training_time,
-            }
-
-            # Check for output model in expected locations
-            output_dirs = [
-                Path.home() / ".jarvis" / "models" / "trained",
-                Path.home() / ".jarvis" / "models",
-                Path.home() / "models",
-            ]
-            for output_dir in output_dirs:
-                if output_dir.exists():
-                    gguf_files = list(output_dir.glob("*.gguf"))
-                    if gguf_files:
-                        output_model_path = str(max(gguf_files, key=lambda p: p.stat().st_mtime))
-                        break
+            logger.error(
+                f"[Pipeline] Job {job_id} has no real training pipeline. "
+                f"Ensure reactor_core.training.unified_pipeline is importable."
+            )
+            return
 
         metrics["output_model_path"] = output_model_path
         await job_manager.complete_job(job_id, metrics)

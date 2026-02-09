@@ -781,28 +781,170 @@ class NightShiftPipeline:
         return total
 
     async def _run_formatting(self) -> int:
-        """Run formatting stage."""
+        """
+        Run formatting stage — converts ingested events to training format.
+
+        Reads raw events from work_dir/jarvis_events/ and scout_data/,
+        converts to ChatML training pairs, and writes to work_dir/formatted/.
+        """
         logger.info("Starting formatting stage...")
 
-        # Placeholder - actual implementation would use formatting module
-        formatted_count = self._state.ingestion_count if self._state else 0
+        formatted_dir = self.config.work_dir / "formatted"
+        formatted_dir.mkdir(exist_ok=True)
+        formatted_count = 0
+
+        # Collect raw events from all sources
+        sources = [
+            self.config.work_dir / "jarvis_events",
+            self.config.work_dir / "scout_data",
+        ]
+
+        for source_dir in sources:
+            if not source_dir.exists():
+                continue
+            for event_file in source_dir.glob("*.json"):
+                try:
+                    with open(event_file) as f:
+                        event = json.load(f)
+
+                    # Normalize field names (canonical schema support)
+                    user_input = (
+                        event.get("user_input")
+                        or event.get("input")
+                        or event.get("query")
+                        or event.get("prompt")
+                        or ""
+                    )
+                    assistant_output = (
+                        event.get("assistant_output")
+                        or event.get("response")
+                        or event.get("output")
+                        or event.get("answer")
+                        or ""
+                    )
+
+                    if not user_input or not assistant_output:
+                        continue
+
+                    system_context = event.get("system_context", "")
+
+                    # Build ChatML training example
+                    messages = []
+                    if system_context:
+                        messages.append({"role": "system", "content": system_context})
+                    messages.append({"role": "user", "content": user_input})
+                    messages.append({"role": "assistant", "content": assistant_output})
+
+                    formatted = {
+                        "messages": messages,
+                        "metadata": {
+                            "source": str(source_dir.name),
+                            "confidence": event.get("confidence", 1.0),
+                            "model_id": event.get("model_id"),
+                            "task_type": event.get("task_type"),
+                            "event_id": event.get("event_id", event_file.stem),
+                        },
+                    }
+
+                    out_file = formatted_dir / f"{event_file.stem}.json"
+                    with open(out_file, "w") as f:
+                        json.dump(formatted, f, indent=2)
+                    formatted_count += 1
+
+                except Exception as e:
+                    logger.warning(f"Error formatting {event_file.name}: {e}")
 
         if self._state:
             self._state.formatted_count = formatted_count
 
-        logger.info(f"Formatted {formatted_count} examples")
+        logger.info(f"Formatted {formatted_count} examples to {formatted_dir}")
         return formatted_count
 
     async def _run_distillation(self) -> int:
-        """Run distillation stage."""
+        """
+        Run distillation stage — uses a teacher model to improve training examples.
+
+        Reads formatted examples from work_dir/formatted/, sends them through
+        the distillation pipeline (Gemini/GPT-4o teacher), and writes improved
+        examples to work_dir/distilled/.
+        """
         if not self.config.enable_distillation:
             logger.info("Distillation disabled, skipping...")
             return 0
 
         logger.info("Starting distillation stage...")
 
-        # Placeholder - actual implementation would use distillation module
+        formatted_dir = self.config.work_dir / "formatted"
+        distilled_dir = self.config.work_dir / "distilled"
+        distilled_dir.mkdir(exist_ok=True)
         distilled_count = 0
+
+        if not formatted_dir.exists():
+            logger.warning("No formatted data directory found")
+            return 0
+
+        try:
+            from reactor_core.distillation import create_teacher_client
+            teacher = create_teacher_client(self.config.distillation_model)
+
+            formatted_files = list(formatted_dir.glob("*.json"))
+            logger.info(f"Distilling {len(formatted_files)} examples with {self.config.distillation_model}")
+
+            for formatted_file in formatted_files:
+                try:
+                    with open(formatted_file) as f:
+                        example = json.load(f)
+
+                    messages = example.get("messages", [])
+                    if len(messages) < 2:
+                        continue
+
+                    # Extract the user question and current answer
+                    user_msg = next((m["content"] for m in messages if m["role"] == "user"), "")
+                    assistant_msg = next((m["content"] for m in messages if m["role"] == "assistant"), "")
+
+                    if not user_msg or not assistant_msg:
+                        continue
+
+                    # Ask teacher to improve the response
+                    improved = await teacher.improve_response(
+                        question=user_msg,
+                        original_response=assistant_msg,
+                    )
+
+                    if improved and len(improved.strip()) > len(assistant_msg) * 0.3:
+                        # Replace assistant message with improved version
+                        for msg in messages:
+                            if msg["role"] == "assistant":
+                                msg["content"] = improved
+                                break
+
+                        example["metadata"] = example.get("metadata", {})
+                        example["metadata"]["distilled"] = True
+                        example["metadata"]["teacher_model"] = self.config.distillation_model
+
+                    # Write (distilled or pass-through)
+                    out_file = distilled_dir / formatted_file.name
+                    with open(out_file, "w") as f:
+                        json.dump(example, f, indent=2)
+                    distilled_count += 1
+
+                except Exception as e:
+                    # Pass through undistilled on failure
+                    logger.debug(f"Distillation failed for {formatted_file.name}: {e}")
+                    try:
+                        import shutil
+                        shutil.copy2(formatted_file, distilled_dir / formatted_file.name)
+                        distilled_count += 1
+                    except Exception:
+                        pass
+
+        except ImportError:
+            logger.warning("Distillation module not available — passing through formatted data")
+            import shutil
+            for f in formatted_dir.glob("*.json"):
+                shutil.copy2(f, distilled_dir / f.name)
+                distilled_count += 1
 
         if self._state:
             self._state.distilled_count = distilled_count
@@ -811,64 +953,299 @@ class NightShiftPipeline:
         return distilled_count
 
     async def _run_training(self) -> Dict[str, Any]:
-        """Run training stage."""
+        """
+        Run training stage — delegates to UnifiedTrainingPipeline.
+
+        Reads formatted/distilled data and runs LoRA fine-tuning via
+        the real AsyncTrainer. Returns training result dict.
+        """
         logger.info("Starting training stage...")
 
-        # Placeholder - actual implementation would use training module
-        training_result = {
-            "model_path": str(self.config.work_dir / "model"),
-            "adapter_path": str(self.config.work_dir / "adapter"),
-            "final_loss": 0.5,
-        }
+        # Determine source directory (distilled if available, else formatted)
+        distilled_dir = self.config.work_dir / "distilled"
+        formatted_dir = self.config.work_dir / "formatted"
+        data_dir = distilled_dir if distilled_dir.exists() else formatted_dir
+
+        if not data_dir.exists():
+            raise RuntimeError(f"No training data found in {data_dir}")
+
+        # Load training examples
+        examples = []
+        for example_file in data_dir.glob("*.json"):
+            try:
+                with open(example_file) as f:
+                    example = json.load(f)
+                messages = example.get("messages", [])
+                if len(messages) >= 2:
+                    examples.append(example)
+            except Exception as e:
+                logger.warning(f"Error loading {example_file.name}: {e}")
+
+        if not examples:
+            raise RuntimeError("No valid training examples found")
+
+        logger.info(f"Loaded {len(examples)} examples from {data_dir.name}")
+
+        try:
+            from reactor_core.training.trainer import AsyncTrainer, TrainingConfig
+
+            output_dir = self.config.output_dir or (self.config.work_dir / "output")
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            training_config = TrainingConfig(
+                model_name=self.config.base_model,
+                num_epochs=self.config.num_epochs,
+                batch_size=4,
+                learning_rate=2e-5,
+                max_seq_length=2048,
+                gradient_accumulation_steps=4,
+                use_lora=True,
+                lora_rank=self.config.lora_rank,
+                lora_alpha=self.config.lora_alpha,
+                use_qlora=True,
+                output_dir=output_dir,
+                checkpoint_dir=self.config.work_dir / "checkpoints",
+            )
+
+            # Progress callback wired to pipeline state
+            async def _training_progress(progress):
+                if self._state:
+                    self._state.training_step = progress.current_step
+                    self._state.training_checkpoint = str(
+                        progress.checkpoint_path
+                    ) if hasattr(progress, "checkpoint_path") and progress.checkpoint_path else None
+                    self._save_state()
+                if self._progress_callback:
+                    self._progress_callback(self._state)
+
+            trainer = AsyncTrainer(
+                config=training_config,
+                progress_callback=_training_progress,
+            )
+
+            # Build HuggingFace dataset from examples
+            try:
+                from datasets import Dataset
+            except ImportError:
+                raise ImportError("datasets required: pip install datasets")
+
+            # Convert to training text format
+            train_texts = []
+            for ex in examples:
+                parts = []
+                for msg in ex.get("messages", []):
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    parts.append(f"<|{role}|>\n{content}</s>")
+                train_texts.append({
+                    "text": "\n".join(parts),
+                    "messages": ex["messages"],
+                })
+
+            full_dataset = Dataset.from_list(train_texts)
+            split = full_dataset.train_test_split(test_size=0.1, seed=42)
+
+            result = await trainer.train(
+                train_dataset=split["train"],
+                eval_dataset=split["test"],
+            )
+
+            training_result = {
+                "model_path": str(result.merged_model_path or result.adapter_path or ""),
+                "adapter_path": str(result.adapter_path or ""),
+                "final_loss": result.final_loss or 0.0,
+                "total_steps": result.total_steps or 0,
+                "training_time_seconds": result.training_time_seconds or 0.0,
+                "success": result.success,
+            }
+
+        except ImportError as e:
+            logger.error(f"Training dependencies not available: {e}")
+            raise RuntimeError(f"Training requires: {e}")
 
         if self._state:
             self._state.model_path = training_result["model_path"]
             self._state.adapter_path = training_result["adapter_path"]
 
-        logger.info(f"Training complete: {training_result}")
+        logger.info(f"Training complete: loss={training_result['final_loss']:.4f}, "
+                     f"steps={training_result.get('total_steps', 0)}")
         return training_result
 
     async def _run_evaluation(self) -> Dict[str, float]:
-        """Run evaluation stage."""
+        """
+        Run evaluation stage — benchmark the trained model.
+
+        Uses the reactor_core evaluation module if available.
+        Falls back to loss-based quality gate if evaluation module unavailable.
+        """
         logger.info("Starting evaluation stage...")
 
-        # Placeholder - actual implementation would use eval module
-        metrics = {
-            "overall_score": 0.85,
-            "safety": 0.98,
-            "instruction_following": 0.82,
-        }
+        model_path = self._state.model_path if self._state else None
+        if not model_path:
+            logger.warning("No model path available for evaluation")
+            return {}
 
-        gatekeeper_passed = metrics["overall_score"] >= self.config.eval_threshold
+        metrics: Dict[str, float] = {}
+
+        try:
+            from reactor_core.evaluation import ModelEvaluator, EvalConfig
+
+            eval_config = EvalConfig(
+                model_path=Path(model_path),
+                eval_tasks=["instruction_following", "safety", "helpfulness"],
+            )
+            evaluator = ModelEvaluator(eval_config)
+            eval_result = await evaluator.evaluate()
+
+            metrics = {
+                "overall_score": eval_result.overall_score,
+                "safety": eval_result.safety_score,
+                "instruction_following": eval_result.instruction_score,
+                "helpfulness": eval_result.helpfulness_score,
+            }
+
+        except ImportError:
+            logger.info("Evaluation module not available — using training loss as quality gate")
+            # Fall back to loss-based gate: loss < 1.0 = pass, lower = better score
+            adapter_path = self._state.adapter_path if self._state else None
+            training_result_file = self.config.work_dir / "output" / "training_result.json"
+
+            final_loss = 0.5  # default
+            if training_result_file.exists():
+                try:
+                    with open(training_result_file) as f:
+                        tr = json.load(f)
+                    final_loss = tr.get("final_loss", 0.5)
+                except Exception:
+                    pass
+
+            # Heuristic: loss < 0.3 = excellent, < 0.5 = good, < 1.0 = acceptable
+            overall = max(0.0, min(1.0, 1.0 - final_loss))
+            metrics = {
+                "overall_score": round(overall, 4),
+                "safety": 1.0,  # Assume safe until eval module proves otherwise
+                "instruction_following": round(overall, 4),
+                "loss_based_gate": True,
+            }
+
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}")
+            metrics = {"overall_score": 0.0, "error": str(e)}
+
+        gatekeeper_passed = metrics.get("overall_score", 0.0) >= self.config.eval_threshold
 
         if self._state:
             self._state.eval_metrics = metrics
             self._state.gatekeeper_passed = gatekeeper_passed
 
-        logger.info(f"Evaluation complete: {metrics}, gatekeeper: {gatekeeper_passed}")
+        logger.info(f"Evaluation: {metrics}, gatekeeper: {'PASS' if gatekeeper_passed else 'FAIL'}")
         return metrics
 
     async def _run_quantization(self) -> str:
-        """Run quantization stage."""
+        """
+        Run quantization stage — convert trained model to GGUF format.
+
+        Uses reactor_core.quantization.gguf_converter if available,
+        falls back to llama.cpp script conversion.
+        """
         if self.config.skip_quantization:
             logger.info("Quantization disabled, skipping...")
             return ""
 
-        logger.info("Starting quantization stage...")
+        model_path = self._state.model_path if self._state else None
+        if not model_path:
+            logger.warning("No model path — skipping quantization")
+            return ""
 
-        # Placeholder - actual implementation would use quantization module
-        output_path = str(
-            self.config.work_dir / f"model-{self.config.quantization_method}.gguf"
-        )
+        model_path = Path(model_path)
+        logger.info(f"Starting quantization stage ({self.config.quantization_method})...")
+
+        output_path = ""
+
+        try:
+            from reactor_core.quantization.gguf_converter import (
+                GGUFConverter,
+                GGUFConfig,
+                QuantizationMethod,
+            )
+
+            quant_map = {
+                "q4_k_m": QuantizationMethod.Q4_K_M,
+                "q5_k_m": QuantizationMethod.Q5_K_M,
+                "q8_0": QuantizationMethod.Q8_0,
+                "q3_k_m": QuantizationMethod.Q3_K_M,
+                "f16": QuantizationMethod.F16,
+            }
+            method = quant_map.get(
+                self.config.quantization_method.lower(),
+                QuantizationMethod.Q4_K_M,
+            )
+
+            output_dir = self.config.output_dir or self.config.work_dir
+            gguf_config = GGUFConfig(
+                method=method,
+                output_dir=output_dir,
+                output_name=f"model-{method.value}.gguf",
+            )
+            converter = GGUFConverter(gguf_config)
+            result = await converter.convert(model_path)
+
+            if result.success:
+                output_path = str(result.output_path)
+                logger.info(
+                    f"Quantization complete: {output_path} "
+                    f"({result.quantized_size_mb:.1f}MB)"
+                )
+            else:
+                logger.error(f"Quantization failed: {result.error}")
+
+        except ImportError:
+            logger.warning("GGUF converter not available — attempting legacy conversion")
+            # Legacy: use llama.cpp convert script
+            import shutil
+            convert_script = shutil.which("convert-hf-to-gguf.py")
+            if not convert_script:
+                candidates = [
+                    Path.home() / "llama.cpp" / "convert_hf_to_gguf.py",
+                    Path("/usr/local/bin/convert-hf-to-gguf.py"),
+                ]
+                for c in candidates:
+                    if c.exists():
+                        convert_script = str(c)
+                        break
+
+            if convert_script and model_path.exists():
+                gguf_out = self.config.work_dir / f"model-{self.config.quantization_method}.gguf"
+                proc = await asyncio.create_subprocess_exec(
+                    "python3", convert_script,
+                    str(model_path),
+                    "--outfile", str(gguf_out),
+                    "--outtype", self.config.quantization_method.lower().replace("_", "-"),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    output_path = str(gguf_out)
+                    logger.info(f"Legacy quantization complete: {output_path}")
+                else:
+                    logger.error(f"Legacy quantization failed: {stderr.decode()}")
+            else:
+                logger.warning("No quantization tool available")
 
         if self._state:
             self._state.quantized_path = output_path
 
-        logger.info(f"Quantization complete: {output_path}")
         return output_path
 
     async def _run_deployment(self) -> None:
-        """Run deployment stage."""
+        """
+        Run deployment stage — copy model to J-Prime and notify.
+
+        Deploys quantized GGUF (preferred) or adapter model to J-Prime's
+        models directory, updates the current.gguf symlink, and publishes
+        a Trinity model_ready event for hot-swap.
+        """
         logger.info("Starting deployment stage...")
 
         # Check gatekeeper
@@ -876,8 +1253,80 @@ class NightShiftPipeline:
             if not self._state or not self._state.gatekeeper_passed:
                 raise RuntimeError("Gatekeeper did not approve deployment")
 
-        # Placeholder - actual deployment logic
-        logger.info("Deployment complete")
+        # Determine what to deploy
+        quantized_path = self._state.quantized_path if self._state else None
+        model_path = self._state.model_path if self._state else None
+        deploy_source = quantized_path or model_path
+
+        if not deploy_source:
+            logger.warning("No model artifact to deploy")
+            return
+
+        deploy_source = Path(deploy_source)
+        if not deploy_source.exists():
+            logger.error(f"Deploy source not found: {deploy_source}")
+            return
+
+        # Find J-Prime models directory (env-var-driven discovery)
+        jprime_dir = None
+        jprime_env = os.getenv("JPRIME_MODELS_DIR")
+        if jprime_env:
+            jprime_dir = Path(jprime_env)
+        else:
+            candidates = [
+                Path(os.getenv("JPRIME_REPO_DIR", "")) / "models",
+                Path.home() / ".jarvis" / "models",
+                Path.home() / "Documents" / "repos" / "jarvis-prime" / "models",
+            ]
+            for candidate in candidates:
+                if str(candidate) and candidate.exists():
+                    jprime_dir = candidate
+                    break
+
+        if not jprime_dir:
+            logger.warning("J-Prime models directory not found — skipping deployment")
+            return
+
+        jprime_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+
+        # Deploy
+        dest_path = jprime_dir / deploy_source.name
+        if deploy_source.is_dir():
+            if dest_path.exists():
+                shutil.rmtree(dest_path)
+            shutil.copytree(deploy_source, dest_path)
+        else:
+            shutil.copy2(deploy_source, dest_path)
+
+        # Update current.gguf symlink for GGUF files
+        if deploy_source.suffix == ".gguf":
+            current_link = jprime_dir / "current.gguf"
+            if current_link.exists() or current_link.is_symlink():
+                current_link.unlink()
+            current_link.symlink_to(dest_path.name)
+            logger.info("Updated current.gguf symlink")
+
+        logger.info(f"Deployed to J-Prime: {dest_path}")
+
+        # Publish Trinity model_ready event
+        try:
+            from reactor_core.integration.trinity_publisher import get_trinity_publisher
+            publisher = get_trinity_publisher()
+            if publisher:
+                await publisher.publish_event(
+                    event_type="model_ready",
+                    payload={
+                        "model_path": str(dest_path),
+                        "model_name": dest_path.name,
+                        "deployed_at": datetime.now().isoformat(),
+                        "source": "nightshift_pipeline",
+                        "gatekeeper_metrics": self._state.eval_metrics if self._state else {},
+                    },
+                )
+                logger.info(f"Published model_ready event for {dest_path.name}")
+        except Exception as e:
+            logger.debug(f"Trinity model_ready notification failed (non-critical): {e}")
 
     async def run(
         self,

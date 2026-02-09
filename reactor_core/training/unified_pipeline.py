@@ -405,22 +405,26 @@ class UnifiedTrainingPipeline:
             self._experience_buffer.extend(valid_experiences)
             buffer_size = len(self._experience_buffer)
 
-            # Check threshold while still holding the lock to prevent race
+            # v242.0: Check threshold AND flush-in-progress flag while holding lock
+            # to prevent duplicate training jobs (the old code released the lock
+            # before creating the task, allowing a second coroutine to also trigger)
             if flush and buffer_size >= self._buffer_flush_threshold:
-                should_flush = True
+                if not getattr(self, '_flush_in_progress', False):
+                    self._flush_in_progress = True
+                    should_flush = True
 
         logger.info(f"[Pipeline] Added {len(valid_experiences)} experiences (buffer: {buffer_size})")
 
-        # Trigger training outside the lock but after checking
+        # Trigger training outside the lock but only if we won the race
         if should_flush:
             logger.info(f"[Pipeline] Buffer threshold reached ({buffer_size}), scheduling training")
-            # Use asyncio.create_task with proper error handling
             task = asyncio.create_task(
                 self._flush_experiences_to_training(),
                 name="experience_flush_training"
             )
-            # Add done callback to log errors
             task.add_done_callback(self._handle_flush_task_result)
+            # v242.0: Clear flush-in-progress when task completes
+            task.add_done_callback(lambda _: setattr(self, '_flush_in_progress', False))
 
         return buffer_size
 
@@ -616,6 +620,27 @@ class UnifiedTrainingPipeline:
 
             result.samples_used = len(raw_interactions)
             self._progress.samples_collected = len(raw_interactions)
+
+            # Step 1b: Generate DPO preference pairs from multi-model telemetry
+            dpo_pairs = []
+            try:
+                from reactor_core.training.dpo_pair_generator import DPOPairGenerator
+                dpo_gen = DPOPairGenerator()
+                dpo_pairs = await dpo_gen.generate_from_telemetry(
+                    telemetry_dir=self.config.telemetry_dir,
+                    since=since,
+                )
+                if dpo_pairs:
+                    dpo_export_path = await dpo_gen.export_pairs(dpo_pairs)
+                    result.metrics["dpo_pairs_generated"] = len(dpo_pairs)
+                    result.metrics["dpo_export_path"] = str(dpo_export_path)
+                    logger.info(f"[Pipeline] Generated {len(dpo_pairs)} DPO pairs")
+                else:
+                    logger.info("[Pipeline] No DPO pairs generated (insufficient multi-model data)")
+            except ImportError:
+                logger.debug("[Pipeline] DPO pair generator not available")
+            except Exception as dpo_err:
+                logger.warning(f"[Pipeline] DPO generation failed (non-blocking): {dpo_err}")
 
             # Step 2: Build dataset
             await self._update_state(PipelineState.PREPROCESSING, "Building dataset")
@@ -1090,16 +1115,21 @@ class UnifiedTrainingPipeline:
             # Determine J-Prime models directory
             jprime_dir = self.config.jprime_models_dir
             if not jprime_dir:
-                # Try to find it
-                candidates = [
-                    Path.home() / "Documents" / "repos" / "jarvis-prime" / "models",
-                    Path("../jarvis-prime/models"),
-                    Path.home() / ".jarvis" / "models",
-                ]
-                for candidate in candidates:
-                    if candidate.exists():
-                        jprime_dir = candidate
-                        break
+                # v242.0: Env-var-driven discovery instead of hardcoded paths
+                jprime_env = os.getenv("JPRIME_MODELS_DIR")
+                if jprime_env:
+                    jprime_dir = Path(jprime_env)
+                else:
+                    # Fall back to dynamic discovery
+                    candidates = [
+                        Path(os.getenv("JPRIME_REPO_DIR", "")) / "models",
+                        Path.home() / ".jarvis" / "models",
+                        Path.home() / "Documents" / "repos" / "jarvis-prime" / "models",
+                    ]
+                    for candidate in candidates:
+                        if str(candidate) and candidate.exists():
+                            jprime_dir = candidate
+                            break
 
             if not jprime_dir:
                 logger.warning("[Pipeline] J-Prime models directory not found")
@@ -1123,6 +1153,25 @@ class UnifiedTrainingPipeline:
                 logger.info(f"[Pipeline] Updated current.gguf symlink")
 
             logger.info(f"[Pipeline] Deployed to J-Prime: {dest_path}")
+
+            # v242.0: Notify J-Prime that a new model is available via Trinity event
+            try:
+                from reactor_core.integration.trinity_publisher import get_trinity_publisher
+                publisher = get_trinity_publisher()
+                if publisher:
+                    await publisher.publish_event(
+                        event_type="model_ready",
+                        payload={
+                            "model_path": str(dest_path),
+                            "model_name": dest_path.name,
+                            "deployed_at": datetime.now().isoformat(),
+                            "source": "reactor_core_pipeline",
+                        },
+                    )
+                    logger.info(f"[Pipeline] Published model_ready event for {dest_path.name}")
+            except Exception as notify_err:
+                logger.debug(f"[Pipeline] model_ready notification failed (non-critical): {notify_err}")
+
             return dest_path
 
         except Exception as e:

@@ -510,6 +510,8 @@ class TrinityOrchestrator:
         self._command_timeout_task: Optional[asyncio.Task] = None
         # v79.0: DLQ auto-retry task
         self._dlq_auto_retry_task: Optional[asyncio.Task] = None
+        # v242.0: Shutdown event (was missing — caused AttributeError in DLQ auto-retry loop)
+        self._shutdown_event: asyncio.Event = asyncio.Event()
 
         logger.info("[Trinity] Orchestrator initialized")
 

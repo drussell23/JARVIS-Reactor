@@ -385,11 +385,13 @@ class CircuitBreaker:
         failure_threshold: int = 5,
         success_threshold: int = 2,
         timeout_seconds: float = 30.0,
+        health_check: Optional[Callable] = None,
     ):
         self.name = name
         self._failure_threshold = failure_threshold
         self._success_threshold = success_threshold
         self._timeout = timeout_seconds
+        self._health_check = health_check  # v242.0: async callable returning bool
 
         self._state = CircuitState.CLOSED
         self._failure_count = 0
@@ -404,10 +406,28 @@ class CircuitBreaker:
                 return True
 
             if self._state == CircuitState.OPEN:
-                # Check if timeout has passed
-                if self._last_failure_time and (
+                # v242.0: Health-check-based recovery (preferred over timeout alone)
+                # If a health check is configured, use it to determine readiness.
+                # Falls back to timeout-based recovery if no health check provided.
+                should_try = False
+                if self._health_check:
+                    try:
+                        healthy = await self._health_check()
+                        if healthy:
+                            should_try = True
+                            logger.debug(
+                                f"[CircuitBreaker:{self.name}] Health check passed — "
+                                f"transitioning to HALF_OPEN"
+                            )
+                    except Exception:
+                        pass  # Health check itself failed — stay OPEN
+
+                if not should_try and self._last_failure_time and (
                     time.time() - self._last_failure_time > self._timeout
                 ):
+                    should_try = True
+
+                if should_try:
                     self._state = CircuitState.HALF_OPEN
                     self._success_count = 0
                     return True
@@ -636,11 +656,28 @@ class TrinityExperienceReceiver:
         )
 
         # Circuit breaker for flush operations
+        # v242.0: Health-check-based recovery — probes training pipeline
+        # readiness instead of relying solely on timeout-based recovery
+        async def _pipeline_health_check() -> bool:
+            """Check if training pipeline is ready to accept experiences."""
+            try:
+                from reactor_core.training.unified_pipeline import get_unified_trainer_async
+                trainer = await get_unified_trainer_async()
+                if not trainer:
+                    return False
+                progress = trainer.get_progress()
+                # Pipeline is healthy if it's idle or collecting
+                # (not in the middle of training/exporting/deploying)
+                return progress.state.value in ("idle", "collecting", "completed")
+            except Exception:
+                return False
+
         self._circuit_breaker = CircuitBreaker(
             name="experience_flush",
             failure_threshold=circuit_breaker_threshold,
             success_threshold=2,
             timeout_seconds=30.0,
+            health_check=_pipeline_health_check,
         )
 
         # Metrics
@@ -1115,19 +1152,33 @@ class TrinityExperienceReceiver:
         # Add to buffer with normalization
         async with self._buffer_lock:
             for exp in experiences:
-                # Normalize experience format
-                normalized = {
-                    "user_input": exp.get("user_input", exp.get("input", {}).get("query", "")),
-                    "assistant_output": exp.get("assistant_output", exp.get("output", {}).get("response", "")),
-                    "confidence": exp.get("confidence", 1.0),
-                    "feedback_type": exp.get("feedback_type", "implicit"),
-                    "timestamp": exp.get("timestamp", time.time()),
-                    "metadata": exp.get("metadata", {}),
+                # v242.0: Use canonical schema adapter if available
+                try:
+                    import sys as _sys
+                    _jarvis_home = str(Path.home() / ".jarvis")
+                    if _jarvis_home not in _sys.path:
+                        _sys.path.insert(0, _jarvis_home)
+                    from schemas.experience_schema import from_raw_dict
+                    canonical = from_raw_dict(exp)
+                    normalized = canonical.to_reactor_core_format()
                     # Preserve causal metadata
-                    "vector_clock": event.get("vector_clock", {}),
-                    "sequence": event.get("sequence_number", 0),
-                    "source": event.get("source", "unknown"),
-                }
+                    normalized["vector_clock"] = event.get("vector_clock", {})
+                    normalized["sequence"] = event.get("sequence_number", 0)
+                    normalized["source"] = event.get("source", "unknown")
+                except ImportError:
+                    # Fallback: manual normalization
+                    normalized = {
+                        "user_input": exp.get("user_input", exp.get("input", {}).get("query", "")),
+                        "assistant_output": exp.get("assistant_output", exp.get("output", {}).get("response", "")),
+                        "confidence": exp.get("confidence", 1.0),
+                        "feedback_type": exp.get("feedback_type", "implicit"),
+                        "timestamp": exp.get("timestamp", time.time()),
+                        "metadata": exp.get("metadata", {}),
+                        # Preserve causal metadata
+                        "vector_clock": event.get("vector_clock", {}),
+                        "sequence": event.get("sequence_number", 0),
+                        "source": event.get("source", "unknown"),
+                    }
 
                 # Skip empty experiences
                 if normalized["user_input"] and normalized["assistant_output"]:
@@ -1177,9 +1228,10 @@ class TrinityExperienceReceiver:
                     await result
             else:
                 # Default: use unified training pipeline
-                from reactor_core.training.unified_pipeline import get_unified_trainer
+                # v242.0: Use async version for proper initialization in async context
+                from reactor_core.training.unified_pipeline import get_unified_trainer_async
 
-                trainer = get_unified_trainer()
+                trainer = await get_unified_trainer_async()
                 await trainer.add_experiences(experiences, flush=True)
 
             # Success - update metrics and circuit breaker
