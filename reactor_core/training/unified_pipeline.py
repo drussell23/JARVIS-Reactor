@@ -378,14 +378,18 @@ class UnifiedTrainingPipeline:
         valid_experiences = []
         _schema_available = False
         try:
-            import sys
-            schema_dir = str(Path.home() / ".jarvis" / "schemas")
-            if schema_dir not in sys.path:
-                sys.path.insert(0, schema_dir)
-            from experience_schema import ExperienceEvent, from_raw_dict
+            from reactor_core.schemas.experience_schema import ExperienceEvent, from_raw_dict
             _schema_available = True
         except ImportError:
-            pass
+            try:
+                import sys
+                schema_dir = str(Path.home() / ".jarvis" / "schemas")
+                if schema_dir not in sys.path:
+                    sys.path.insert(0, schema_dir)
+                from experience_schema import ExperienceEvent, from_raw_dict
+                _schema_available = True
+            except ImportError:
+                pass
 
         for exp in experiences:
             if not isinstance(exp, dict):

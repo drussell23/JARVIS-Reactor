@@ -1152,13 +1152,16 @@ class TrinityExperienceReceiver:
         # Add to buffer with normalization
         async with self._buffer_lock:
             for exp in experiences:
-                # v242.0: Use canonical schema adapter if available
+                # v242.2: Use canonical schema (repo-local first, ~/.jarvis fallback)
                 try:
-                    import sys as _sys
-                    _jarvis_home = str(Path.home() / ".jarvis")
-                    if _jarvis_home not in _sys.path:
-                        _sys.path.insert(0, _jarvis_home)
-                    from schemas.experience_schema import from_raw_dict
+                    try:
+                        from reactor_core.schemas.experience_schema import from_raw_dict
+                    except ImportError:
+                        import sys as _sys
+                        _jarvis_home = str(Path.home() / ".jarvis")
+                        if _jarvis_home not in _sys.path:
+                            _sys.path.insert(0, _jarvis_home)
+                        from schemas.experience_schema import from_raw_dict
                     canonical = from_raw_dict(exp)
                     normalized = canonical.to_reactor_core_format()
                     # Preserve causal metadata

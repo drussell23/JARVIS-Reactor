@@ -1630,16 +1630,24 @@ async def stream_experience(request: ExperienceStreamRequest):
     """
     experience = request.experience
 
-    # v242.0: Normalize to canonical field names using the shared schema
+    # v242.2: Normalize to canonical field names using the shared schema
+    # Try repo-local vendored copy first, then ~/.jarvis fallback
     try:
-        import sys as _sys
-        _jarvis_home = str(Path.home() / ".jarvis")
-        if _jarvis_home not in _sys.path:
-            _sys.path.insert(0, _jarvis_home)
-        from schemas.experience_schema import from_raw_dict
+        from reactor_core.schemas.experience_schema import from_raw_dict
         canonical = from_raw_dict(experience)
         experience = canonical.to_reactor_core_format()
     except ImportError:
+        try:
+            import sys as _sys
+            _jarvis_home = str(Path.home() / ".jarvis")
+            if _jarvis_home not in _sys.path:
+                _sys.path.insert(0, _jarvis_home)
+            from schemas.experience_schema import from_raw_dict
+            canonical = from_raw_dict(experience)
+            experience = canonical.to_reactor_core_format()
+        except ImportError:
+            pass
+    except Exception:
         # Fallback: manual normalization of critical field names
         if "response" in experience and "assistant_output" not in experience:
             experience["assistant_output"] = experience["response"]
@@ -1694,17 +1702,21 @@ async def batch_experiences(request: Request):
     accepted = 0
     errors = 0
 
-    # Normalize via canonical schema
+    # v242.2: Normalize via canonical schema (repo-local first, ~/.jarvis fallback)
     _from_raw_dict = None
     try:
-        import sys as _sys
-        _jarvis_home = str(Path.home() / ".jarvis")
-        if _jarvis_home not in _sys.path:
-            _sys.path.insert(0, _jarvis_home)
-        from schemas.experience_schema import from_raw_dict as _from_raw_dict_fn
+        from reactor_core.schemas.experience_schema import from_raw_dict as _from_raw_dict_fn
         _from_raw_dict = _from_raw_dict_fn
     except ImportError:
-        pass
+        try:
+            import sys as _sys
+            _jarvis_home = str(Path.home() / ".jarvis")
+            if _jarvis_home not in _sys.path:
+                _sys.path.insert(0, _jarvis_home)
+            from schemas.experience_schema import from_raw_dict as _from_raw_dict_fn
+            _from_raw_dict = _from_raw_dict_fn
+        except ImportError:
+            pass
 
     for exp in experiences:
         try:
