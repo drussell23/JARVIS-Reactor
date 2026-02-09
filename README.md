@@ -63,6 +63,11 @@ JARVIS Reactor is a production-grade ML infrastructure combining:
 - [Troubleshooting](#troubleshooting)
 - [Development Guide](#development-guide)
 - [Version History](#version-history)
+- [Roadmap](#roadmap--next-phases)
+  - [v242.0 — Training Data Pipeline Activation](#v2420--training-data-pipeline-activation-planned)
+  - [v243.0 — Ouroboros Training Support](#v2430--ouroboros-training-support-planned)
+  - [v244.0 — Continuous Learning Loop](#v2440--continuous-learning-loop-planned)
+  - [v245.0 — Distributed Training on GCP](#v2450--distributed-training-on-gcp-planned)
 - [Links](#links)
 
 ---
@@ -1557,6 +1562,83 @@ bandit -r reactor_core/
 
 ---
 
+## 🗺️ Roadmap — Next Phases
+
+### v242.0 — Training Data Pipeline Activation (Planned)
+
+**Status:** Infrastructure ~80% built. The pieces exist across all three repos but the connection points are not wired. This is the single highest-impact next step for the entire JARVIS ecosystem.
+
+**What Reactor Core needs to do:**
+
+1. **Ingest telemetry from JARVIS Body**
+   - `TelemetryIngestor` reads JSONL from `~/.jarvis/telemetry/`
+   - Expected format: `{event_type, timestamp, properties: {user_input, output, task_type}, metrics: {model_id, latency_ms, tokens}}`
+   - JARVIS Body's `TelemetryEmitter` writes to this path — but the schema alignment is unverified
+   - **Fix needed:** Validate field names match between emitter and ingestor. Add schema versioning.
+
+2. **Ingest interaction logs from J-Prime**
+   - `TrinityExperienceReceiver` watches `~/.jarvis/` for event files from J-Prime
+   - J-Prime's `TrainingDataPipeline` captures conversations and calls `ReactorCoreBridge.upload_training_data()`
+   - **Broken link:** `upload_training_data()` is called but **not fully implemented** on the Reactor Core side. This means J-Prime's locally captured conversations never arrive.
+   - **Fix needed:** Implement the upload endpoint in Reactor Core's API server, or have J-Prime write directly to `~/.jarvis/telemetry/` in the expected JSONL format.
+
+3. **Generate DPO preference pairs automatically**
+   - v241.1's multi-model routing creates implicit quality comparisons:
+     ```
+     Query: "solve 5x+3=18" routed to Mistral-7B → "x=11" (wrong)
+     Same query type routed to Qwen-Math-7B → "x=3" (correct)
+     → Automatic DPO pair: {prompt, chosen: "x=3", rejected: "x=11"}
+     ```
+   - **Multi-model routing IS the labeling mechanism.** No human annotation needed.
+   - `model_id` in telemetry enables per-model performance tracking and automatic pair generation.
+   - **Fix needed:** Build the comparison logic in `UnifiedTrainingPipeline` that groups interactions by query type and generates preference pairs from model_id divergences.
+
+4. **Fine-tune and export**
+   - `UnifiedTrainingPipeline` already supports DPO training with LoRA/QLoRA
+   - Training requires full-precision FP16 base models (~14 GB for 7B), not the GGUFs
+   - Output: quantized GGUF files deployed to J-Prime's golden image
+   - Elastic Weight Consolidation (EWC) prevents catastrophic forgetting
+
+5. **Deploy to J-Prime**
+   - `HotSwapManager` in J-Prime accepts fine-tuned GGUF files with zero-downtime swap
+   - Reactor Core's `ModelDeploymentManager` handles GGUF export and deployment signaling
+   - **Fix needed:** Verify the deployment signal path (Reactor Core → Trinity Protocol → J-Prime HotSwapManager) is end-to-end functional.
+
+**When this works, the full loop is:**
+```
+User → JARVIS Body → J-Prime (inference + telemetry capture)
+  → ~/.jarvis/telemetry/ (JSONL logs with model_id)
+    → Reactor Core TelemetryIngestor
+      → DPO pair generation (cross-model comparison)
+        → LoRA fine-tuning (DPO on preference data)
+          → GGUF quantization → deploy to J-Prime golden image
+            → Models improve at being JARVIS, automatically
+```
+
+### v243.0 — Ouroboros Training Support (Planned)
+
+Support the training side of JARVIS self-programming:
+
+- [ ] **Code quality evaluation** — Evaluate generated code diffs for correctness, style, security. Feed scores back as DPO signals.
+- [ ] **Self-programming telemetry** — Capture Ouroboros cycles (architect plan → generated code → verifier review → human decision) as training data.
+- [ ] **Architect/Implementer specialization** — Fine-tune DeepSeek-R1-14B on architectural reasoning traces and Qwen-Coder-14B on code generation from plans, using Ouroboros interaction data.
+- [ ] **Constitutional AI for code** — Apply Constitutional AI training to code generation: "Is this code safe? Does it follow the existing patterns? Does it handle errors?"
+
+### v244.0 — Continuous Learning Loop (Planned)
+
+- [ ] **Night Shift automation** — `NightShiftScheduler` already exists. Wire it to trigger DPO training runs during off-peak hours using accumulated telemetry.
+- [ ] **Concept drift detection** — `PageHinkleyDriftDetector` already exists. Monitor model performance metrics and trigger retraining when quality degrades.
+- [ ] **A/B model testing** — `ModelRegistry` supports versioned models and A/B testing. Deploy fine-tuned models alongside originals, compare performance, promote winners.
+- [ ] **Curriculum learning** — Start fine-tuning on easy tasks (general chat), progressively add harder tasks (math, code, reasoning) using curriculum learning infrastructure already built in v79.0.
+
+### v245.0 — Distributed Training on GCP (Planned)
+
+- [ ] **Multi-VM gradient aggregation** — v91.0 built distributed training with gradient compression. Activate for 14B model fine-tuning which exceeds single-VM memory.
+- [ ] **Spot VM resilience** — Predictive preemption with checkpoint save already built. Test with real training runs.
+- [ ] **Cost-aware scheduling** — Train on spot VMs during cheap hours, pause during expensive hours. `DynamicResourceAllocator` has the framework.
+
+---
+
 ## 📚 API Documentation
 
 ### REST API Endpoints
@@ -1745,5 +1827,5 @@ Built with ❤️ for the JARVIS AGI Ecosystem
 ---
 
 **Version**: 2.10.0 (v92.0)  
-**Last Updated**: January 2025  
+**Last Updated**: February 2026  
 **Status**: ✅ Production Ready
