@@ -327,6 +327,7 @@ class UnifiedTrainingPipeline:
         # Experience buffer for real-time data ingestion
         self._experience_buffer: List[Dict[str, Any]] = []
         self._experience_lock = asyncio.Lock()
+        self._flush_in_progress: bool = False
         self._buffer_flush_threshold = int(
             os.getenv("REACTOR_EXPERIENCE_BUFFER_THRESHOLD", "100")
         )
@@ -371,29 +372,60 @@ class UnifiedTrainingPipeline:
         if isinstance(experiences, dict):
             experiences = [experiences]
 
-        # Validate and filter experiences
+        # v242.1: Validate via canonical schema (Pydantic) at the pipeline boundary.
+        # This catches malformed data (wrong types, missing fields, null values)
+        # BEFORE it enters the training buffer where it could corrupt a training run.
         valid_experiences = []
+        _schema_available = False
+        try:
+            import sys
+            schema_dir = str(Path.home() / ".jarvis" / "schemas")
+            if schema_dir not in sys.path:
+                sys.path.insert(0, schema_dir)
+            from experience_schema import ExperienceEvent, from_raw_dict
+            _schema_available = True
+        except ImportError:
+            pass
+
         for exp in experiences:
             if not isinstance(exp, dict):
                 logger.warning(f"Skipping non-dict experience: {type(exp)}")
                 continue
 
-            # Require minimum fields
-            if not exp.get("user_input") or not exp.get("assistant_output"):
+            try:
+                if _schema_available:
+                    # Full Pydantic validation — rejects bad types, nulls, missing fields
+                    canonical = from_raw_dict(exp)
+                    validated = canonical.to_reactor_core_format()
+                else:
+                    # Fallback: manual field check
+                    validated = exp
+                    if not exp.get("user_input") and not exp.get("input") and not exp.get("query"):
+                        logger.debug("Skipping experience missing user_input")
+                        continue
+                    if not exp.get("assistant_output") and not exp.get("response"):
+                        logger.debug("Skipping experience missing assistant_output")
+                        continue
+            except Exception as val_err:
+                logger.debug(f"Skipping malformed experience: {val_err}")
+                continue
+
+            # Require minimum fields (post-normalization)
+            if not validated.get("user_input") or not validated.get("assistant_output"):
                 logger.debug("Skipping experience missing user_input or assistant_output")
                 continue
 
             # Check confidence threshold
-            confidence = exp.get("confidence", 1.0)
+            confidence = validated.get("confidence", 1.0)
             if confidence < self.config.min_confidence:
                 logger.debug(f"Skipping low-confidence experience: {confidence}")
                 continue
 
             # Add timestamp if missing
-            if "timestamp" not in exp:
-                exp["timestamp"] = datetime.now().isoformat()
+            if "timestamp" not in validated:
+                validated["timestamp"] = datetime.now().isoformat()
 
-            valid_experiences.append(exp)
+            valid_experiences.append(validated)
 
         if not valid_experiences:
             logger.debug("No valid experiences to add")
@@ -409,7 +441,7 @@ class UnifiedTrainingPipeline:
             # to prevent duplicate training jobs (the old code released the lock
             # before creating the task, allowing a second coroutine to also trigger)
             if flush and buffer_size >= self._buffer_flush_threshold:
-                if not getattr(self, '_flush_in_progress', False):
+                if not self._flush_in_progress:
                     self._flush_in_progress = True
                     should_flush = True
 
@@ -677,6 +709,28 @@ class UnifiedTrainingPipeline:
                 logger.debug(f"Trinity event publish failed: {e}")
 
             training_result = await self._train_model(train_dataset, eval_dataset)
+
+            # Step 3b: DPO preference training (if pairs were generated in Step 1b)
+            # This runs AFTER SFT as a refinement step on the same model.
+            if dpo_pairs and training_result.success:
+                try:
+                    preference_pairs = [p.to_preference_pair() for p in dpo_pairs]
+                    dpo_result = await self._train_dpo(
+                        preference_pairs=preference_pairs,
+                        model_path=training_result.merged_model_path or training_result.adapter_path,
+                    )
+                    if dpo_result:
+                        result.metrics["dpo_training_loss"] = dpo_result.get("final_loss", 0.0)
+                        result.metrics["dpo_training_steps"] = dpo_result.get("total_steps", 0)
+                        logger.info(
+                            f"[Pipeline] DPO training complete: "
+                            f"{dpo_result.get('total_steps', 0)} steps, "
+                            f"loss={dpo_result.get('final_loss', 0):.4f}"
+                        )
+                except ImportError:
+                    logger.info("[Pipeline] DPO trainer (advanced_training) not available — skipping DPO step")
+                except Exception as dpo_train_err:
+                    logger.warning(f"[Pipeline] DPO training failed (non-blocking, SFT model preserved): {dpo_train_err}")
 
             if not training_result.success:
                 # Voice announcement: Training failed
@@ -1008,6 +1062,111 @@ class UnifiedTrainingPipeline:
         )
 
         return result
+
+    async def _train_dpo(
+        self,
+        preference_pairs: List[Any],
+        model_path: Optional[Path] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Run DPO preference training as a refinement step after SFT.
+
+        Uses the DPOTrainer from advanced_training.py with the SFT-trained
+        model as the starting point. The reference model is a frozen copy.
+
+        Args:
+            preference_pairs: List of PreferencePair objects (or compatible dicts)
+            model_path: Path to the SFT-trained model to refine
+
+        Returns:
+            Dict with training metrics, or None if DPO training is not possible
+        """
+        from reactor_core.training.advanced_training import (
+            DPOTrainer,
+            DPOConfig as AdvancedDPOConfig,
+            PreferencePair,
+        )
+
+        if not preference_pairs:
+            return None
+
+        # Convert any dict-form pairs to PreferencePair objects
+        converted_pairs = []
+        for pair in preference_pairs:
+            if isinstance(pair, PreferencePair):
+                converted_pairs.append(pair)
+            elif isinstance(pair, dict):
+                converted_pairs.append(PreferencePair.from_dict(pair))
+            else:
+                # Assume it's a DPOPair with to_preference_pair() already called
+                converted_pairs.append(pair)
+
+        if not converted_pairs:
+            return None
+
+        logger.info(f"[Pipeline] Starting DPO training with {len(converted_pairs)} preference pairs")
+
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            # Load the SFT-trained model for DPO refinement
+            model_name = str(model_path) if model_path else self.config.base_model
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+
+            dpo_config = AdvancedDPOConfig(
+                beta=float(os.getenv("DPO_BETA", "0.1")),
+                batch_size=int(os.getenv("DPO_BATCH_SIZE", "2")),
+                learning_rate=float(os.getenv("DPO_LEARNING_RATE", "5e-7")),
+                max_length=int(os.getenv("DPO_MAX_LENGTH", "512")),
+            )
+
+            dpo_trainer = DPOTrainer(
+                model=model,
+                tokenizer=tokenizer,
+                config=dpo_config,
+            )
+
+            # Train
+            num_epochs = int(os.getenv("DPO_NUM_EPOCHS", "1"))
+
+            async def dpo_progress(metrics):
+                self._progress.message = f"DPO step {metrics.step}: loss={metrics.loss:.4f}"
+                if self.progress_callback:
+                    self.progress_callback(self._progress)
+
+            all_metrics = await dpo_trainer.train_on_preferences(
+                preference_pairs=converted_pairs,
+                num_epochs=num_epochs,
+                progress_callback=dpo_progress,
+            )
+
+            final_loss = all_metrics[-1].loss if all_metrics else 0.0
+            total_steps = len(all_metrics)
+
+            # Save the DPO-refined model
+            dpo_output_dir = self.config.output_dir / "dpo_refined"
+            dpo_output_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(dpo_output_dir)
+            tokenizer.save_pretrained(dpo_output_dir)
+            logger.info(f"[Pipeline] DPO-refined model saved to {dpo_output_dir}")
+
+            return {
+                "final_loss": final_loss,
+                "total_steps": total_steps,
+                "model_path": str(dpo_output_dir),
+            }
+
+        except ImportError as e:
+            logger.warning(f"[Pipeline] DPO training dependencies not available: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"[Pipeline] DPO training error: {e}")
+            return None
 
     async def _export_gguf(self, model_path: Path) -> Optional[Path]:
         """Export model to GGUF format using the reactor_core GGUF converter."""

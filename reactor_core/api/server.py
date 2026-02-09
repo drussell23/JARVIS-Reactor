@@ -1673,6 +1673,72 @@ async def stream_experience(request: ExperienceStreamRequest):
     return {"accepted": True, "count": count}
 
 
+@app.post("/api/v1/experiences/batch", tags=["Experiences"])
+async def batch_experiences(request: Request):
+    """
+    v242.1: Batch experience ingestion endpoint.
+
+    Accepts an array of experiences in a single HTTP request instead of
+    requiring one request per experience. Dramatically reduces overhead
+    for bulk uploads (e.g., ReactorCoreBridge sync of 500 conversations).
+
+    Body: {"experiences": [{...}, {...}, ...], "source": "jarvis_body"}
+    """
+    body = await request.json()
+    experiences = body.get("experiences", [])
+    source = body.get("source", "unknown")
+
+    if not experiences:
+        return {"accepted": 0, "errors": 0}
+
+    accepted = 0
+    errors = 0
+
+    # Normalize via canonical schema
+    _from_raw_dict = None
+    try:
+        import sys as _sys
+        _jarvis_home = str(Path.home() / ".jarvis")
+        if _jarvis_home not in _sys.path:
+            _sys.path.insert(0, _jarvis_home)
+        from schemas.experience_schema import from_raw_dict as _from_raw_dict_fn
+        _from_raw_dict = _from_raw_dict_fn
+    except ImportError:
+        pass
+
+    for exp in experiences:
+        try:
+            if _from_raw_dict:
+                canonical = _from_raw_dict(exp)
+                exp = canonical.to_reactor_core_format()
+            else:
+                if "response" in exp and "assistant_output" not in exp:
+                    exp["assistant_output"] = exp["response"]
+
+            await job_manager.add_experience(exp)
+            accepted += 1
+        except Exception as e:
+            errors += 1
+            logger.debug(f"[Batch] Error ingesting experience: {e}")
+
+    # Trigger scheduler check based on total accepted
+    if accepted > 0 and ServerConfig.SCHEDULER_ENABLED:
+        scheduler = get_scheduler()
+        await scheduler.add_experiences(accepted)
+
+    # Telemetry
+    if accepted > 0 and ServerConfig.TELEMETRY_ENABLED:
+        telemetry = get_telemetry()
+        await telemetry.ingest_metric(
+            name="experiences_ingested",
+            value=accepted,
+            metric_type=MetricType.COUNTER,
+            labels={"source": source, "batch": "true"},
+        )
+
+    return {"accepted": accepted, "errors": errors, "total": len(experiences)}
+
+
 @app.get("/api/v1/experiences/count", response_model=ExperienceCountResponse, tags=["Experiences"])
 async def get_experience_count():
     """Get count of pending experiences."""
@@ -1912,6 +1978,28 @@ async def run_training_pipeline(job_id: str):
                 labels={"job_id": job_id, "stage": stage},
             )
 
+    # v242.1: Mutual exclusion — prevent concurrent training runs from
+    # multiple schedulers (NightShiftScheduler + PipelineScheduler) or
+    # manual triggers overlapping with scheduled runs.
+    lock_dir = Path.home() / ".reactor_core" / "scheduler" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_dir / "training_pipeline.lock"
+
+    try:
+        import fcntl
+        _lock_fd = open(lock_file, "w")
+        try:
+            fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            logger.warning(f"[Pipeline] Training already in progress (lock held), skipping job {job_id}")
+            await job_manager.fail_job(job_id, "Training already in progress — concurrent run blocked")
+            _lock_fd.close()
+            return
+        _lock_fd.write(f"{os.getpid()}:{job_id}\n")
+        _lock_fd.flush()
+    except ImportError:
+        _lock_fd = None  # fcntl not available (Windows) — skip locking
+
     try:
         logger.info(f"[Pipeline] Starting: job_id={job_id}")
 
@@ -2099,6 +2187,18 @@ async def run_training_pipeline(job_id: str):
                     "error": error_msg,
                 },
             ))
+
+    finally:
+        # v242.1: Release training pipeline lock so other schedulers can proceed
+        if _lock_fd:
+            try:
+                import fcntl
+                fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            finally:
+                _lock_fd.close()
+                _lock_fd = None
 
 
 # ============================================================================

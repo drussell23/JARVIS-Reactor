@@ -177,6 +177,33 @@ class DPOPair:
             "metadata": self.metadata,
         }
 
+    def to_preference_pair(self) -> Any:
+        """
+        Convert to advanced_training.PreferencePair format for DPOTrainer.
+
+        Returns a PreferencePair (from reactor_core.training.advanced_training)
+        if available, otherwise returns a dict with compatible fields.
+        """
+        pair_data = {
+            "prompt": self.prompt,
+            "chosen": self.chosen,
+            "rejected": self.rejected,
+            "chosen_score": self.chosen_score,
+            "rejected_score": self.rejected_score,
+            "source": self.generation_method,
+            "metadata": {
+                **self.metadata,
+                "chosen_model": self.chosen_model,
+                "rejected_model": self.rejected_model,
+                "task_type": self.task_type,
+            },
+        }
+        try:
+            from reactor_core.training.advanced_training import PreferencePair
+            return PreferencePair(**pair_data)
+        except ImportError:
+            return pair_data
+
 
 # =============================================================================
 # DPO Pair Generator
@@ -312,8 +339,8 @@ class DPOPairGenerator:
                             or metadata.get("task_type")
                         )
                         confidence = float(data.get("confidence", 1.0))
-                        if confidence > 1.0:
-                            confidence = confidence / 100.0
+                        # Clamp to [0, 1] — don't assume >1.0 means 0-100 scale
+                        confidence = max(0.0, min(1.0, confidence))
 
                         outcome = data.get("outcome", "unknown")
                         if isinstance(data.get("success"), bool):

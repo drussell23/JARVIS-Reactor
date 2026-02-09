@@ -311,7 +311,21 @@ class PipelineConfig:
             "meta-llama/Llama-3.2-3B"
         )
     )
-    num_epochs: int = 3
+    num_epochs: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_NUM_EPOCHS", "3"))
+    )
+    batch_size: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_BATCH_SIZE", "4"))
+    )
+    learning_rate: float = field(
+        default_factory=lambda: float(os.getenv("NIGHTSHIFT_LEARNING_RATE", "2e-5"))
+    )
+    max_seq_length: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_MAX_SEQ_LENGTH", "2048"))
+    )
+    gradient_accumulation_steps: int = field(
+        default_factory=lambda: int(os.getenv("NIGHTSHIFT_GRAD_ACCUM_STEPS", "4"))
+    )
     lora_rank: int = field(
         default_factory=lambda: int(os.getenv("NIGHTSHIFT_LORA_RANK", "64"))
     )
@@ -995,10 +1009,10 @@ class NightShiftPipeline:
             training_config = TrainingConfig(
                 model_name=self.config.base_model,
                 num_epochs=self.config.num_epochs,
-                batch_size=4,
-                learning_rate=2e-5,
-                max_seq_length=2048,
-                gradient_accumulation_steps=4,
+                batch_size=self.config.batch_size,
+                learning_rate=self.config.learning_rate,
+                max_seq_length=self.config.max_seq_length,
+                gradient_accumulation_steps=self.config.gradient_accumulation_steps,
                 use_lora=True,
                 lora_rank=self.config.lora_rank,
                 lora_alpha=self.config.lora_alpha,
