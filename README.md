@@ -1615,6 +1615,62 @@ User → JARVIS Body → J-Prime (inference + telemetry capture)
             → Models improve at being JARVIS, automatically
 ```
 
+### Architectural Status Report — Cross-Repo Audit (February 2026)
+
+A comprehensive audit of the JARVIS ecosystem identified critical integration gaps that affect Reactor Core's role as the training and learning layer:
+
+#### Training Data Pipeline Status
+
+The training data pipeline from JARVIS Body → J-Prime → Reactor Core is **~80% built but not end-to-end functional**. The infrastructure exists at each node but the connections between them are broken:
+
+| Component | Location | Status | Issue |
+|-----------|----------|--------|-------|
+| `TelemetryEmitter` | JARVIS Body | Built | JSONL output format may not match `TelemetryIngestor` expectations |
+| `TelemetryIngestor` | Reactor Core | Built | Reads from `~/.jarvis/telemetry/` but no data is being written there in the correct format |
+| `ReactorCoreBridge.upload_training_data()` | J-Prime | **Not implemented** | The method is called but has no implementation — J-Prime's captured conversations never reach Reactor Core |
+| `UnifiedTrainingPipeline` | Reactor Core | Built | DPO/LoRA training works in isolation but has never run on real production data |
+| `HotSwapManager` | J-Prime | Built | Accepts GGUF files for hot swap but the deployment signal path (Reactor → Trinity → J-Prime) is unverified |
+| `ModelDeploymentManager` | Reactor Core | Built | GGUF export and deployment signaling exists but is untested end-to-end |
+
+**Root Cause:** Each repo built its side of the pipeline independently, but nobody wired the handoff points. The JSONL format, the upload API, and the deployment signals need explicit cross-repo contract verification.
+
+#### Google Workspace Fixes Impact (v245.0)
+
+The v245.0 Google Workspace fixes in JARVIS Body have a direct impact on Reactor Core's future training data:
+
+- **Draft email body generation now works** — Previously silent failures meant no email body generation telemetry was captured. Now, every draft email request generates a real LLM inference call (with `X-Model-Id`), producing training-relevant interaction data.
+- **Agent singleton fix eliminates noise** — The 49s recreation bug caused timeout errors that would have polluted training data with failed interactions. Clean request/response pairs are now the norm.
+- **Task-type metadata flows correctly** — Workspace commands now carry proper task-type metadata, enabling Reactor Core to generate per-model DPO pairs from workspace interactions.
+
+#### LangGraph in JARVIS Body
+
+All 9 LangGraph reasoning graphs in JARVIS Body are **dead code** because `langgraph` is not installed. This means:
+
+- The reasoning engine uses linear fallback (analysis → planning → validation → execution → reflection → learning) instead of conditional graph routing
+- The `route_after_reflection()` loop-back (for iterative reasoning on low confidence) has **never executed**
+- Training data from the reasoning engine reflects single-pass linear thinking, not the intended iterative, graph-based reasoning
+- **Impact on Reactor Core:** When the training pipeline activates, the quality of reasoning traces available for fine-tuning will be lower than designed until LangGraph is installed (v246.0 in JARVIS Body)
+
+#### Planned: Unified Agent Runtime (v247.0 in JARVIS Body)
+
+The JARVIS Body Unified Agent Runtime will generate a new class of training data for Reactor Core:
+
+- **Multi-step goal traces** — Complete autonomous workflows (sense → think → act → verify → reflect) with sub-step decomposition, producing rich sequential decision-making data
+- **Cross-agent coordination traces** — When the Runtime dispatches work to Neural Mesh agents, the coordination patterns become training data for improving multi-agent orchestration
+- **Failure recovery traces** — When autonomous goals fail and the Runtime retries or replans, the recovery patterns become training data for improving resilience
+- **Human escalation signals** — When the Runtime escalates to the user for approval, the decision boundary becomes a training signal for the safety classifier
+
+**New training data types Reactor Core should prepare for:**
+
+| Data Type | Source | Training Method |
+|-----------|--------|----------------|
+| Goal decomposition traces | Agent Runtime THINK phase | Supervised fine-tuning on planning |
+| Sub-step success/failure | Agent Runtime VERIFY phase | DPO pairs (successful vs. failed approaches) |
+| Escalation decisions | Agent Runtime escalation protocol | Constitutional AI for safety boundaries |
+| Multi-agent coordination | Neural Mesh dispatch logs | Curriculum learning on orchestration complexity |
+
+---
+
 ### v243.0 — Ouroboros Training Support (Planned)
 
 Support the training side of JARVIS self-programming:
@@ -1636,6 +1692,27 @@ Support the training side of JARVIS self-programming:
 - [ ] **Multi-VM gradient aggregation** — v91.0 built distributed training with gradient compression. Activate for 14B model fine-tuning which exceeds single-VM memory.
 - [ ] **Spot VM resilience** — Predictive preemption with checkpoint save already built. Test with real training runs.
 - [ ] **Cost-aware scheduling** — Train on spot VMs during cheap hours, pause during expensive hours. `DynamicResourceAllocator` has the framework.
+
+### v246.0 — Agent Runtime Training Data Ingestion (Planned)
+
+Prepare Reactor Core to ingest and process training data from the JARVIS Body Unified Agent Runtime:
+
+- [ ] **Goal trace schema** — Define JSONL schema for multi-step autonomous goal traces (goal → sub-steps → outcomes → reflections) compatible with `TelemetryIngestor`
+- [ ] **Sequential DPO pairs** — Generate preference pairs from goal execution sequences: successful multi-step approaches vs. failed approaches for the same goal type
+- [ ] **Escalation boundary training** — Use human escalation decisions (approve/reject) as Constitutional AI training signals for the safety classifier
+- [ ] **Multi-agent coordination curriculum** — Build progressive difficulty curriculum from simple single-agent tasks to complex multi-agent workflows
+- [ ] **Failure recovery fine-tuning** — Fine-tune reasoning models on recovery traces: when a sub-step fails, what replanning strategies worked vs. didn't
+- [ ] **Cross-model comparison at scale** — With the Agent Runtime generating higher request volume across all specialist models, DPO pair generation becomes more statistically significant
+
+### v247.0 — End-to-End Pipeline Verification (Planned)
+
+Verify and fix all cross-repo handoff points in the training pipeline:
+
+- [ ] **JSONL format contract** — Define and enforce a shared schema between `TelemetryEmitter` (JARVIS Body), `TelemetryIngestor` (Reactor Core), and `TrainingDataPipeline` (J-Prime)
+- [ ] **Implement `ReactorCoreBridge.upload_training_data()`** — The broken link in J-Prime that prevents locally captured conversations from reaching Reactor Core
+- [ ] **Deployment signal verification** — Test the Reactor Core → Trinity Protocol → J-Prime `HotSwapManager` path end-to-end with a dummy GGUF
+- [ ] **Integration test suite** — Automated test that writes a telemetry event in JARVIS Body format, ingests it in Reactor Core, generates a DPO pair, runs a mock training step, exports a GGUF, and signals J-Prime for hot swap
+- [ ] **Monitoring dashboard** — Track pipeline health: events written/day, events ingested/day, DPO pairs generated, training runs completed, models deployed
 
 ---
 
@@ -1826,6 +1903,14 @@ Built with ❤️ for the JARVIS AGI Ecosystem
 
 ---
 
-**Version**: 2.10.0 (v92.0)  
+**Version**: 2.11.0 (v92.0)  
 **Last Updated**: February 2026  
-**Status**: ✅ Production Ready
+**Status**: ✅ Production Ready (training infrastructure built; cross-repo pipeline pending activation)
+
+### Known Gaps (In Roadmap)
+
+- **Training data pipeline not end-to-end** — Infrastructure exists at each node (emitter, ingestor, trainer, deployer) but cross-repo handoffs are broken (v247.0 target)
+- **`ReactorCoreBridge.upload_training_data()` not implemented** — J-Prime's captured conversations never reach Reactor Core (v247.0 target)
+- **No real production training data yet** — `UnifiedTrainingPipeline` has never run on actual user interaction data (v242.0 target)
+- **LangGraph reasoning traces unavailable** — JARVIS Body's reasoning engine produces linear fallback traces, not rich graph-based reasoning data (depends on JARVIS Body v246.0)
+- **Agent Runtime training data schema undefined** — When autonomous goal pursuit generates multi-step traces, Reactor Core needs a new ingestion schema (v246.0 target)
