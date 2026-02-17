@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -304,13 +305,48 @@ class ExperienceCountResponse(BaseModel):
 class TrainingJobManager:
     """Manages training jobs and pipeline execution."""
 
-    def __init__(self):
+    def __init__(self, persist_dir: Optional[Path] = None):
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.current_job_id: Optional[str] = None
         self.experiences: List[Dict[str, Any]] = []
         self.last_training: Optional[datetime] = None
         self.start_time = datetime.now()
         self._lock = asyncio.Lock()
+
+        # v2.1: Job persistence
+        self._persist_dir = Path(persist_dir) if persist_dir else Path.home() / ".jarvis" / "reactor_state"
+        self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._load_jobs()
+
+    def _load_jobs(self) -> None:
+        """Load persisted jobs from disk."""
+        jobs_file = self._persist_dir / "jobs.json"
+        if jobs_file.exists():
+            try:
+                data = json.loads(jobs_file.read_text())
+                if isinstance(data, dict):
+                    self.jobs = data
+                    logger.info(f"[JobManager] Loaded {len(data)} persisted jobs")
+            except Exception as e:
+                logger.warning(f"[JobManager] Failed to load jobs: {e}")
+
+    def _persist_jobs(self) -> None:
+        """Persist jobs to disk atomically."""
+        jobs_file = self._persist_dir / "jobs.json"
+        tmp_file = jobs_file.with_suffix(".tmp")
+        try:
+            tmp_file.write_text(json.dumps(self.jobs, indent=2, default=str))
+            tmp_file.rename(jobs_file)
+        except Exception as e:
+            logger.warning(f"[JobManager] Failed to persist jobs: {e}")
+
+    async def update_job(self, job_id: str, **kwargs) -> None:
+        """Update a job's fields and persist."""
+        async with self._lock:
+            if job_id in self.jobs:
+                self.jobs[job_id].update(kwargs)
+                self.jobs[job_id]["updated_at"] = datetime.now().isoformat()
+                self._persist_jobs()
 
     async def create_job(
         self,
@@ -340,6 +376,7 @@ class TrainingJobManager:
                 "metrics": {},
             }
             self.jobs[job_id] = job
+            self._persist_jobs()
             return job
 
     async def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
@@ -362,6 +399,7 @@ class TrainingJobManager:
                 job["status"] = "running"
                 job["started_at"] = datetime.now().isoformat()
                 self.current_job_id = job_id
+                self._persist_jobs()
                 return True
             return False
 
@@ -372,6 +410,7 @@ class TrainingJobManager:
             if job:
                 job["stage"] = stage
                 job["progress"] = progress
+                self._persist_jobs()
                 return True
             return False
 
@@ -387,6 +426,7 @@ class TrainingJobManager:
                 job["metrics"] = metrics
                 self.current_job_id = None
                 self.last_training = datetime.now()
+                self._persist_jobs()
                 return True
             return False
 
@@ -400,6 +440,7 @@ class TrainingJobManager:
                 job["error"] = error
                 job["completed_at"] = datetime.now().isoformat()
                 self.current_job_id = None
+                self._persist_jobs()
                 return True
             return False
 
@@ -412,6 +453,7 @@ class TrainingJobManager:
                 job["completed_at"] = datetime.now().isoformat()
                 if self.current_job_id == job_id:
                     self.current_job_id = None
+                self._persist_jobs()
                 return True
             return False
 
