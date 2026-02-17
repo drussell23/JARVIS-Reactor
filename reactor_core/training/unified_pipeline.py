@@ -125,9 +125,21 @@ class PipelineState(Enum):
     PREPROCESSING = "preprocessing"
     TRAINING = "training"
     EXPORTING = "exporting"
+    VALIDATING = "validating"  # v2.1: Deployment gate validation
     DEPLOYING = "deploying"
     COMPLETED = "completed"
     FAILED = "failed"
+    GATE_REJECTED = "gate_rejected"  # v2.1: Model failed deployment gate
+
+
+class _GateRejectionError(Exception):
+    """Internal sentinel to short-circuit the pipeline when the deployment gate rejects a model.
+
+    This is NOT a real failure — it's a controlled flow to skip deployment steps
+    after the gate has already set the appropriate result fields. Caught in the
+    outer try/except of run_training_cycle and _run_training_from_interactions.
+    """
+    pass
 
 
 @dataclass
@@ -176,6 +188,7 @@ class PipelineResult:
     training_time_seconds: float = 0.0
     total_time_seconds: float = 0.0
     error_message: Optional[str] = None
+    gate_summary: Optional[str] = None  # v2.1: Deployment gate result summary
     metrics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -192,6 +205,7 @@ class PipelineResult:
             "training_time_seconds": round(self.training_time_seconds, 2),
             "total_time_seconds": round(self.total_time_seconds, 2),
             "error_message": self.error_message,
+            "gate_summary": self.gate_summary,
             "metrics": self.metrics,
         }
 
@@ -607,6 +621,50 @@ class UnifiedTrainingPipeline:
                 await self._update_state(PipelineState.EXPORTING, "Exporting to GGUF")
                 result.gguf_path = await self._export_gguf(result.model_path)
 
+            # v2.1: Deployment gate — validate GGUF before deployment
+            if result.gguf_path:
+                await self._update_state(PipelineState.VALIDATING, "Validating GGUF via deployment gate")
+                try:
+                    from reactor_core.deployment.gate import DeploymentGate
+
+                    gate = DeploymentGate(
+                        skip_inference_check=bool(os.getenv("REACTOR_SKIP_INFERENCE_CHECK", "")),
+                    )
+                    gate_result = await gate.validate(result.gguf_path)
+                    result.gate_summary = gate_result.summary()
+
+                    if not gate_result.passed:
+                        logger.error(f"[Pipeline] Deployment gate REJECTED: {gate_result.summary()}")
+                        failed_dir = self.config.output_dir / "failed"
+                        failed_dir.mkdir(parents=True, exist_ok=True)
+                        failed_dest = failed_dir / result.gguf_path.name
+                        result.gguf_path.rename(failed_dest)
+                        logger.info(f"[Pipeline] Rejected GGUF moved to {failed_dest}")
+
+                        result.gguf_path = None
+                        result.metrics["gate_rejected"] = True
+                        result.metrics["gate_summary"] = gate_result.summary()
+                        result.metrics["gate_failed_path"] = str(failed_dest)
+
+                        await self._update_state(
+                            PipelineState.GATE_REJECTED,
+                            f"GGUF failed deployment gate: {gate_result.summary()}",
+                        )
+                        result.success = False
+                        result.state = PipelineState.GATE_REJECTED
+                        result.error_message = f"Deployment gate rejected: {gate_result.summary()}"
+                        raise _GateRejectionError(gate_result.summary())
+                    else:
+                        logger.info(f"[Pipeline] Deployment gate APPROVED: {gate_result.summary()}")
+                        result.metrics["gate_approved"] = True
+                        result.metrics["gate_summary"] = gate_result.summary()
+                except _GateRejectionError:
+                    raise
+                except ImportError:
+                    logger.warning("[Pipeline] DeploymentGate not available — skipping validation")
+                except Exception as gate_err:
+                    logger.warning(f"[Pipeline] Deployment gate error (non-blocking): {gate_err}")
+
             if self.config.auto_deploy and (result.gguf_path or result.model_path):
                 await self._update_state(PipelineState.DEPLOYING, "Deploying to J-Prime")
                 result.deployed_to = await self._deploy_to_jprime(
@@ -621,6 +679,10 @@ class UnifiedTrainingPipeline:
                 f"[Pipeline] Experience training complete: "
                 f"{result.training_steps} steps, loss={result.final_loss:.4f}"
             )
+
+        except _GateRejectionError:
+            # v2.1: Gate rejection — result fields already set, don't overwrite with FAILED
+            logger.warning("[Pipeline] Experience training ended: deployment gate rejected model")
 
         except Exception as e:
             import traceback
@@ -884,6 +946,64 @@ class UnifiedTrainingPipeline:
                     except Exception:
                         pass
 
+            # Step 4b: Deployment gate — validate GGUF before deployment (v2.1)
+            if result.gguf_path:
+                await self._update_state(PipelineState.VALIDATING, "Validating GGUF via deployment gate")
+                try:
+                    from reactor_core.deployment.gate import DeploymentGate
+
+                    gate = DeploymentGate(
+                        skip_inference_check=bool(os.getenv("REACTOR_SKIP_INFERENCE_CHECK", "")),
+                    )
+                    gate_result = await gate.validate(result.gguf_path)
+                    result.gate_summary = gate_result.summary()
+
+                    if not gate_result.passed:
+                        logger.error(f"[Pipeline] Deployment gate REJECTED: {gate_result.summary()}")
+
+                        # Move to failed/ directory instead of deploying
+                        failed_dir = self.config.output_dir / "failed"
+                        failed_dir.mkdir(parents=True, exist_ok=True)
+                        failed_dest = failed_dir / result.gguf_path.name
+                        result.gguf_path.rename(failed_dest)
+                        logger.info(f"[Pipeline] Rejected GGUF moved to {failed_dest}")
+
+                        result.gguf_path = None  # Clear so deploy step is skipped
+                        result.metrics["gate_rejected"] = True
+                        result.metrics["gate_summary"] = gate_result.summary()
+                        result.metrics["gate_failed_path"] = str(failed_dest)
+
+                        # Voice announcement: Gate rejected
+                        try:
+                            from reactor_core.voice_integration import announce_training_failed
+                            self._spawn_background_task(announce_training_failed(
+                                model_name=self.config.base_model.split("/")[-1],
+                                error_message=f"Deployment gate rejected: {gate_result.summary()}",
+                                steps_completed=result.training_steps,
+                            ), name="voice_announce_gate_rejected")
+                        except Exception:
+                            pass
+
+                        await self._update_state(
+                            PipelineState.GATE_REJECTED,
+                            f"GGUF failed deployment gate: {gate_result.summary()}",
+                        )
+                        result.success = False
+                        result.state = PipelineState.GATE_REJECTED
+                        result.error_message = f"Deployment gate rejected: {gate_result.summary()}"
+                        # Skip deployment — jump to finally via early return path
+                        raise _GateRejectionError(gate_result.summary())
+                    else:
+                        logger.info(f"[Pipeline] Deployment gate APPROVED: {gate_result.summary()}")
+                        result.metrics["gate_approved"] = True
+                        result.metrics["gate_summary"] = gate_result.summary()
+                except _GateRejectionError:
+                    raise  # Re-raise to skip deployment and reach the outer except/finally
+                except ImportError:
+                    logger.warning("[Pipeline] DeploymentGate not available — skipping validation")
+                except Exception as gate_err:
+                    logger.warning(f"[Pipeline] Deployment gate error (non-blocking): {gate_err}")
+
             # Step 5: Deploy to J-Prime (if configured)
             if self.config.auto_deploy and (result.gguf_path or result.model_path):
                 await self._update_state(PipelineState.DEPLOYING, "Deploying to J-Prime")
@@ -942,6 +1062,10 @@ class UnifiedTrainingPipeline:
                 f"[Pipeline] Training cycle complete: "
                 f"{result.training_steps} steps, loss={result.final_loss:.4f}"
             )
+
+        except _GateRejectionError:
+            # v2.1: Gate rejection — result fields already set above, don't overwrite
+            logger.warning(f"[Pipeline] Training cycle ended: deployment gate rejected model")
 
         except Exception as e:
             import traceback
