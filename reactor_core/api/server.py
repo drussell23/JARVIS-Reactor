@@ -104,6 +104,61 @@ from reactor_core.api.health_aggregator import (
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Pipeline Event Logger (v3.1)
+# ============================================================================
+# Simple JSONL event logger for cross-repo event tracing.
+# TrinityEventBus is not importable from reactor-core, so we write
+# structured events to a shared JSONL file that can be picked up by
+# the JARVIS supervisor or analyzed offline.
+
+_PIPELINE_EVENTS_DIR = Path(
+    os.getenv("REACTOR_PIPELINE_EVENTS_DIR",
+              str(Path.home() / ".jarvis" / "reactor" / "events"))
+)
+_PIPELINE_EVENTS_FILE = _PIPELINE_EVENTS_DIR / "pipeline_events.jsonl"
+
+
+def emit_pipeline_event(
+    topic: str,
+    payload: Optional[Dict[str, Any]] = None,
+    correlation_id: str = "",
+    causation_id: str = "",
+) -> Optional[str]:
+    """
+    Write a structured pipeline event to the shared JSONL log.
+
+    Args:
+        topic: Event topic (e.g. "training.started", "gate.evaluated").
+        payload: Event payload data.
+        correlation_id: Correlation ID for distributed tracing.
+        causation_id: ID of the event that caused this one.
+
+    Returns:
+        The event_id string, or None on failure.
+    """
+    event_id = str(uuid.uuid4())
+    event = {
+        "event_id": event_id,
+        "topic": topic,
+        "source": "reactor",
+        "timestamp": datetime.now().isoformat(),
+        "correlation_id": correlation_id or event_id,
+        "causation_id": causation_id,
+        "payload": payload or {},
+    }
+    try:
+        _PIPELINE_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_PIPELINE_EVENTS_FILE, "a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+        logger.debug(f"[PipelineEvent] {topic} (id={event_id[:8]})")
+        return event_id
+    except Exception as e:
+        logger.debug(f"[PipelineEvent] Failed to write event: {e}")
+        return None
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -878,6 +933,18 @@ async def trigger_training(
 
     # Start the job in background
     background_tasks.add_task(run_training_pipeline, job["job_id"])
+
+    # v3.1: Emit pipeline event for cross-repo tracing
+    emit_pipeline_event(
+        topic="training.started",
+        payload={
+            "job_id": job["job_id"],
+            "experience_count": job["experience_count"],
+            "priority": request.priority,
+            "triggered_by": request.triggered_by,
+        },
+        correlation_id=job["job_id"],
+    )
 
     # Ingest telemetry event
     if ServerConfig.TELEMETRY_ENABLED:
@@ -2318,6 +2385,18 @@ async def run_training_pipeline(job_id: str):
                 },
             ))
 
+        # v3.1: Emit pipeline event for cross-repo tracing
+        emit_pipeline_event(
+            topic="training.completed",
+            payload={
+                "job_id": job_id,
+                "metrics": metrics,
+                "output_model_path": output_model_path,
+                "training_time_seconds": time.time() - start_time,
+            },
+            correlation_id=job_id,
+        )
+
     except asyncio.CancelledError:
         logger.info(f"[Pipeline] Cancelled: job_id={job_id}")
         await job_manager.cancel_job(job_id)
@@ -2366,6 +2445,15 @@ async def run_training_pipeline(job_id: str):
                 },
             ))
 
+        # v3.1: Emit pipeline event for cross-repo tracing
+        emit_pipeline_event(
+            topic="training.failed",
+            payload={
+                "job_id": job_id,
+                "error": error_msg,
+            },
+            correlation_id=job_id,
+        )
 
 
 # ============================================================================
