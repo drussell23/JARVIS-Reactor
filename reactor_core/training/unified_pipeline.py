@@ -665,6 +665,9 @@ class UnifiedTrainingPipeline:
                 except Exception as gate_err:
                     logger.warning(f"[Pipeline] Deployment gate error (non-blocking): {gate_err}")
 
+            # Write model lineage record
+            self._write_model_lineage(result)
+
             if self.config.auto_deploy and (result.gguf_path or result.model_path):
                 await self._update_state(PipelineState.DEPLOYING, "Deploying to J-Prime")
                 result.deployed_to = await self._deploy_to_jprime(
@@ -1003,6 +1006,9 @@ class UnifiedTrainingPipeline:
                     logger.warning("[Pipeline] DeploymentGate not available — skipping validation")
                 except Exception as gate_err:
                     logger.warning(f"[Pipeline] Deployment gate error (non-blocking): {gate_err}")
+
+            # Step 4c: Write model lineage record
+            self._write_model_lineage(result)
 
             # Step 5: Deploy to J-Prime (if configured)
             if self.config.auto_deploy and (result.gguf_path or result.model_path):
@@ -1523,6 +1529,85 @@ class UnifiedTrainingPipeline:
         except Exception as e:
             logger.error(f"[Pipeline] Legacy GGUF export error: {e}")
             return None
+
+    def _write_model_lineage(
+        self,
+        result: "PipelineResult",
+        training_job_id: Optional[str] = None,
+        dataset_info: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Write a model lineage record after gate validation.
+
+        Records the model's full provenance: hash, parent model, training
+        config, eval scores, and gate decision. Fields that are not yet
+        known (deployed_at, probation_result) are left as None and will
+        be updated by later pipeline stages.
+
+        Args:
+            result: The PipelineResult with training outcomes.
+            training_job_id: Optional job ID from the server layer.
+            dataset_info: Optional dataset metadata dict.
+        """
+        try:
+            from reactor_core.data.lineage import LineageRecord, write_lineage_record
+            from reactor_core.data.versioning import DataHash
+
+            # Compute hash of the GGUF file if available
+            model_hash = None
+            artifact_path = result.gguf_path or result.model_path
+            if artifact_path and Path(artifact_path).exists():
+                try:
+                    dh = DataHash.from_file(Path(artifact_path))
+                    model_hash = dh.digest
+                except Exception as hash_err:
+                    logger.warning(f"[Lineage] Could not hash model file: {hash_err}")
+
+            # Build model_id from artifact name or fallback
+            model_id = None
+            if artifact_path:
+                model_id = Path(artifact_path).stem
+            if not model_id:
+                model_id = f"jarvis-trained-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+            # Determine gate decision
+            gate_decision = None
+            if result.metrics.get("gate_approved"):
+                gate_decision = "APPROVED"
+            elif result.metrics.get("gate_rejected"):
+                gate_decision = "REJECTED"
+
+            # Eval scores from result metrics
+            eval_scores = {}
+            if result.final_loss:
+                eval_scores["final_loss"] = result.final_loss
+            if result.metrics.get("eval_accuracy"):
+                eval_scores["eval_accuracy"] = result.metrics["eval_accuracy"]
+            if result.metrics.get("dpo_training_loss"):
+                eval_scores["dpo_training_loss"] = result.metrics["dpo_training_loss"]
+
+            record = LineageRecord(
+                model_id=model_id,
+                model_hash=model_hash,
+                parent_model=self.config.base_model,
+                training_method="lora_sft",
+                training_job_id=training_job_id,
+                dataset=dataset_info or {
+                    "size": result.samples_used,
+                },
+                eval_scores=eval_scores if eval_scores else None,
+                gate_decision=gate_decision,
+                deployed_at=None,
+                probation_result=None,
+                transformation_steps=[],
+            )
+
+            write_lineage_record(record)
+            logger.info(f"[Pipeline] Lineage record written for model_id={model_id}")
+
+        except ImportError as e:
+            logger.warning(f"[Pipeline] Lineage tracking not available: {e}")
+        except Exception as e:
+            logger.warning(f"[Pipeline] Lineage record write failed (non-blocking): {e}")
 
     async def _deploy_to_jprime(self, model_path: Path) -> Optional[Path]:
         """Deploy model to J-Prime."""

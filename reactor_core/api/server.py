@@ -2134,6 +2134,18 @@ async def run_training_pipeline(job_id: str):
         metrics["output_model_path"] = output_model_path
         await job_manager.complete_job(job_id, metrics)
 
+        # Update lineage record with training job_id (lineage was written by pipeline)
+        try:
+            from reactor_core.data.lineage import update_lineage_record
+            if output_model_path:
+                model_id = Path(output_model_path).stem
+                update_lineage_record(
+                    model_id=model_id,
+                    updates={"training_job_id": job_id},
+                )
+        except Exception as lineage_err:
+            logger.debug(f"[Pipeline] Lineage update with job_id failed (non-critical): {lineage_err}")
+
         # Create model version in registry
         try:
             registry = get_registry()
