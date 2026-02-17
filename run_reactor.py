@@ -79,6 +79,7 @@ try:
         is_cloud_mode_active,
         get_effective_jarvis_url,
         get_cloud_state,
+        get_cloud_mode_detector,
     )
     CLOUD_MODE_DETECTOR_AVAILABLE = True
     logger.info("[v152.0] Cloud mode detector loaded")
@@ -92,6 +93,8 @@ except ImportError as e:
             return os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
         return default
     def get_cloud_state():
+        return None
+    def get_cloud_mode_detector():
         return None
 
 
@@ -575,6 +578,22 @@ class TrainingJobManager:
             self._jobs[job_id]["started_at"] = datetime.now().isoformat()
             await self._persist_jobs()
 
+            # v258.4: Check supervisor CPU pressure before starting heavy work
+            try:
+                if CLOUD_MODE_DETECTOR_AVAILABLE:
+                    detector = get_cloud_mode_detector()
+                    if detector is not None:
+                        cpu_active, cpu_pct = detector.check_cpu_pressure()
+                        if cpu_active and cpu_pct >= 95.0:
+                            logger.warning(
+                                "[v258.4] CPU pressure detected (%.1f%%) — deferring "
+                                "training job %s for 30s",
+                                cpu_pct, job_id,
+                            )
+                            await asyncio.sleep(30.0)  # Brief deferral during CPU pressure
+            except Exception as e:
+                logger.debug(f"[v258.4] CPU pressure check failed: {e}")
+
             # Simulate training progress
             for i in range(10):
                 await asyncio.sleep(1)
@@ -933,7 +952,7 @@ async def create_health_server(
                 status = "starting"
                 phase = startup_phase or "pre-init"
 
-            return web.json_response({
+            health_data = {
                 "status": status,
                 "phase": phase,
                 "service": config.service_name,
@@ -943,7 +962,20 @@ async def create_health_server(
                 "training_ready": training_ready,
                 "startup_progress": state.get("startup_progress", 0),
                 "timestamp": datetime.now().isoformat(),
-            })
+            }
+
+            # v258.4: Include CPU pressure in health report
+            try:
+                if CLOUD_MODE_DETECTOR_AVAILABLE:
+                    detector = get_cloud_mode_detector()
+                    if detector is not None:
+                        cpu_active, cpu_pct = detector.check_cpu_pressure()
+                        health_data["cpu_pressure_active"] = cpu_active
+                        health_data["cpu_pressure_percent"] = cpu_pct
+            except Exception:
+                pass
+
+            return web.json_response(health_data)
 
         async def jobs_list_handler(request):
             jobs = await job_manager.list_jobs()

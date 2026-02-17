@@ -788,6 +788,9 @@ class PreemptionDetector:
         self._maintenance_events = 0
         self._preemption_notices = 0
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
     def _detect_gcp_environment(self) -> bool:
         """Detect if running on GCP."""
         try:
@@ -1050,8 +1053,13 @@ class PreemptionDetector:
         )
         self._preemption_context = context
 
-        # Notify callbacks in background
-        asyncio.create_task(self._notify_callbacks(context))
+        # Notify callbacks in background (v258.0: store strong reference)
+        _task = asyncio.create_task(
+            self._notify_callbacks(context),
+            name="preemption_notify_callbacks",
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get monitoring statistics."""
@@ -1832,6 +1840,9 @@ class SpotVMCheckpointer(CheckpointManager):
         # v92.0: Track preemption survivals
         self._preemptions_survived = 0
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
     async def start_monitoring(self) -> None:
         """Start monitoring for Spot VM preemption."""
         if self._is_monitoring:
@@ -1868,7 +1879,12 @@ class SpotVMCheckpointer(CheckpointManager):
 
     def start_monitoring_sync(self) -> None:
         """Synchronous version for legacy compatibility."""
-        asyncio.create_task(self.start_monitoring())
+        _task = asyncio.create_task(
+            self.start_monitoring(),
+            name="spot_vm_start_monitoring",
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
 
     def _handle_preemption(self, context: PreemptionContext) -> None:
         """Handle preemption signal."""

@@ -657,6 +657,9 @@ class NightShiftScheduler:
         self._on_job_started: List[Callable[[ScheduledJob], Awaitable[None]]] = []
         self._on_job_completed: List[Callable[[ScheduledJob], Awaitable[None]]] = []
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
     async def start(self):
         """Start the scheduler."""
         if self._running:
@@ -862,7 +865,12 @@ class NightShiftScheduler:
                 delay = SchedulerConfig.RETRY_BASE_DELAY * (
                     SchedulerConfig.RETRY_EXPONENTIAL_BASE ** (job.retry_count - 1)
                 )
-                asyncio.create_task(self._retry_job(job, delay))
+                _task = asyncio.create_task(
+                    self._retry_job(job, delay),
+                    name=f"retry_job_{job.job_id}",
+                )
+                self._background_tasks.add(_task)
+                _task.add_done_callback(self._background_tasks.discard)
 
         finally:
             job.completed_at = time.time()

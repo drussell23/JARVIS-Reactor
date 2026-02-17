@@ -788,6 +788,9 @@ class AsyncLifecycleCoordinator:
         self._shutdown_callbacks: List[Callable[[], Awaitable[None]]] = []
         self._signal_handlers_installed = False
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
     @classmethod
     async def get_coordinator(
         cls, config: Optional[ShutdownConfig] = None
@@ -809,7 +812,12 @@ class AsyncLifecycleCoordinator:
 
         def signal_handler(sig):
             logger.info(f"Received signal {sig}, initiating graceful shutdown")
-            asyncio.create_task(self.shutdown())
+            _task = asyncio.create_task(
+                self.shutdown(),
+                name="lifecycle_graceful_shutdown",
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
 
         try:
             for sig in (signal.SIGINT, signal.SIGTERM):

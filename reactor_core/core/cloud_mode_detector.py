@@ -39,6 +39,10 @@ logger = logging.getLogger("reactor_core.cloud_mode")
 TRINITY_DIR = Path.home() / ".jarvis" / "trinity"
 CLOUD_LOCK_FILE = TRINITY_DIR / "cloud_lock.json"
 
+# v258.4: CPU pressure signal from supervisor
+CPU_PRESSURE_SIGNAL_FILE = TRINITY_DIR.parent / "signals" / "cpu_pressure.json"
+CPU_PRESSURE_SIGNAL_TTL = float(os.environ.get("JARVIS_CPU_PRESSURE_SIGNAL_TTL", "60.0"))
+
 # Cache TTL to avoid excessive file I/O
 CLOUD_STATE_CACHE_TTL = 5.0  # seconds
 
@@ -56,6 +60,9 @@ class CloudModeState:
     timestamp: float = field(default_factory=time.time)
     gcp_endpoint: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # v258.4: CPU pressure signal from supervisor
+    cpu_pressure_active: bool = False
+    cpu_pressure_percent: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +72,8 @@ class CloudModeState:
             "timestamp": self.timestamp,
             "gcp_endpoint": self.gcp_endpoint,
             "metadata": self.metadata,
+            "cpu_pressure_active": self.cpu_pressure_active,
+            "cpu_pressure_percent": self.cpu_pressure_percent,
         }
 
 
@@ -133,6 +142,11 @@ class CloudModeDetector:
 
         # Check all cloud mode indicators
         state = self._detect_cloud_mode()
+
+        # v258.4: Enrich state with CPU pressure info
+        cpu_active, cpu_pct = self.check_cpu_pressure()
+        state.cpu_pressure_active = cpu_active
+        state.cpu_pressure_percent = cpu_pct
 
         # Update cache
         self._cache = state
@@ -254,6 +268,57 @@ class CloudModeDetector:
             return True, state.reason
 
         return False, None
+
+    def check_cpu_pressure(self) -> Tuple[bool, float]:
+        """v258.4: Check supervisor CPU pressure signal.
+
+        Reads the signal file written by the JARVIS supervisor when CPU
+        exceeds 95% sustained. The signal has a TTL (default 60s) after
+        which it is considered expired.
+
+        Returns:
+            Tuple of (is_active, cpu_percent). Non-blocking with file cache.
+            is_active is True only when the signal exists, is not expired,
+            and cpu_percent >= 95.0.
+        """
+        try:
+            if not CPU_PRESSURE_SIGNAL_FILE.exists():
+                return False, 0.0
+
+            content = CPU_PRESSURE_SIGNAL_FILE.read_text()
+            data = json.loads(content)
+
+            timestamp = data.get("timestamp", 0)
+            if time.time() - timestamp > CPU_PRESSURE_SIGNAL_TTL:
+                return False, 0.0  # Expired signal
+
+            cpu_pct = data.get("cpu_percent", 0.0)
+            return cpu_pct >= 95.0, cpu_pct
+
+        except Exception:
+            return False, 0.0  # Non-fatal
+
+    def check_supervisor_phase(self) -> Optional[Dict[str, Any]]:
+        """v258.4: Check supervisor's current startup/runtime phase.
+
+        Reads from ~/.jarvis/trinity/state/system_phase.json.
+        """
+        try:
+            _phase_file = TRINITY_DIR / "state" / "system_phase.json"
+            if not _phase_file.exists():
+                return None
+
+            content = _phase_file.read_text()
+            phase_data = json.loads(content)
+
+            timestamp = phase_data.get("timestamp", 0)
+            if time.time() - timestamp > 600:  # 10 min TTL
+                return None
+
+            return phase_data
+
+        except Exception:
+            return None
 
 
 # =============================================================================

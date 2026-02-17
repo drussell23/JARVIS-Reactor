@@ -202,6 +202,13 @@ class JARVISConnector:
         self._observer: Optional[Observer] = None
         self._event_queue: asyncio.Queue = asyncio.Queue()
 
+        # v258.0: Store event loop reference for thread-safe task scheduling
+        # (watchdog Observer callbacks run in a separate thread)
+        try:
+            self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_event_loop()
+        except RuntimeError:
+            self._loop = None
+
     @property
     def log_path(self) -> Path:
         """Get full path to log directory."""
@@ -482,9 +489,28 @@ class JARVISConnector:
 
     def _start_file_watcher(self) -> None:
         """Start watching log files for changes."""
+        # v258.0: Capture the running event loop for thread-safe scheduling.
+        # watchdog Observer runs callbacks in a background thread where
+        # asyncio.create_task() would fail (no running event loop).
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._loop = asyncio.get_event_loop()
+            except RuntimeError:
+                self._loop = None
+
         def on_file_change(file_path: str):
-            # Queue new events for processing
-            asyncio.create_task(self._process_file_change(file_path))
+            # v258.0: Use thread-safe scheduling since watchdog runs in a thread
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._process_file_change(file_path),
+                    self._loop,
+                )
+            else:
+                logger.debug(
+                    f"Cannot process file change for {file_path}: no running event loop"
+                )
 
         handler = LogFileHandler(
             on_file_change,

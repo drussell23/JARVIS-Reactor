@@ -782,6 +782,9 @@ def resilient(
 # Global error registry
 _global_registry = ErrorRegistry()
 
+# v258.0: Strong references for fire-and-forget background tasks (prevents GC collection)
+_background_tasks: set = set()
+
 
 def get_error_registry() -> ErrorRegistry:
     """Get global error registry."""
@@ -791,4 +794,33 @@ def get_error_registry() -> ErrorRegistry:
 def record_error(exception: Exception, context: Optional[Dict] = None) -> None:
     """Record error to global registry."""
     classified = ClassifiedError.from_exception(exception, context)
-    asyncio.create_task(_global_registry.record(classified))
+    try:
+        _task = asyncio.create_task(
+            _global_registry.record(classified),
+            name="record_error",
+        )
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
+    except RuntimeError:
+        # No running event loop — try to get an existing loop and schedule
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.call_soon_threadsafe(
+                    lambda: _record_error_from_loop(classified)
+                )
+            else:
+                loop.run_until_complete(_global_registry.record(classified))
+        except RuntimeError:
+            # No event loop at all — best effort, skip recording
+            pass
+
+
+def _record_error_from_loop(classified: ClassifiedError) -> None:
+    """Helper to create task from within the event loop thread."""
+    _task = asyncio.create_task(
+        _global_registry.record(classified),
+        name="record_error_deferred",
+    )
+    _background_tasks.add(_task)
+    _task.add_done_callback(_background_tasks.discard)

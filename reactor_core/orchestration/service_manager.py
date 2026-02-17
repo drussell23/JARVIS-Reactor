@@ -225,6 +225,9 @@ class ProcessManager:
         self.process_groups: Dict[str, int] = {}  # service_id -> pgid
         self._shutdown_handlers: List[callable] = []
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
         # Register signal handlers
         self._register_signal_handlers()
 
@@ -234,7 +237,12 @@ class ProcessManager:
 
         def shutdown_handler(signum):
             logger.info(f"Received signal {signum}, initiating shutdown...")
-            asyncio.create_task(self.shutdown_all())
+            _task = asyncio.create_task(
+                self.shutdown_all(),
+                name="service_manager_shutdown",
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
 
         # Handle SIGTERM and SIGINT
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -299,10 +307,21 @@ class ProcessManager:
         # Store process
         self.processes[service_id] = process
 
-        # Start stdout/stderr readers
+        # Start stdout/stderr readers (v258.0: store strong references)
         if stdout_callback:
-            asyncio.create_task(self._read_stream(process.stdout, stdout_callback))
-            asyncio.create_task(self._read_stream(process.stderr, stdout_callback))
+            _stdout_task = asyncio.create_task(
+                self._read_stream(process.stdout, stdout_callback),
+                name=f"read_stdout_{service_id}",
+            )
+            self._background_tasks.add(_stdout_task)
+            _stdout_task.add_done_callback(self._background_tasks.discard)
+
+            _stderr_task = asyncio.create_task(
+                self._read_stream(process.stderr, stdout_callback),
+                name=f"read_stderr_{service_id}",
+            )
+            self._background_tasks.add(_stderr_task)
+            _stderr_task.add_done_callback(self._background_tasks.discard)
 
         logger.info(f"Process '{service_id}' started with PID {process.pid}")
         return process
@@ -640,12 +659,17 @@ class ServiceManager:
             def stdout_callback(line):
                 logger.info(f"[{service_id}] {line}")
 
+            # v259.0: async wrapper replaces deprecated asyncio.coroutine()
+            # (removed in Python 3.11)
+            async def _async_stdout(line):
+                stdout_callback(line)
+
             await self.process_manager.start_process(
                 service_id=service_id,
                 command=full_command,
                 cwd=config.repo_path,
                 env=config.env,
-                stdout_callback=lambda line: asyncio.create_task(asyncio.coroutine(lambda: stdout_callback(line))()),
+                stdout_callback=_async_stdout,
             )
 
             # Step 4: Wait for health check (if configured)

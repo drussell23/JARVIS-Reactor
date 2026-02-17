@@ -327,6 +327,11 @@ class AsyncTrainer:
         # Start time tracking
         self._start_time: Optional[float] = None
 
+        # v258.0: Store event loop reference for thread-safe callback scheduling.
+        # HuggingFace TrainerCallback methods run in a training thread,
+        # not the async event loop thread.
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+
     async def _update_state(self, state: TrainingState) -> None:
         """Update training state thread-safely."""
         async with self._state_lock:
@@ -596,6 +601,9 @@ class AsyncTrainer:
         self._start_time = time.time()
         result = TrainingResult(success=False, state=TrainingState.FAILED)
 
+        # v258.0: Capture the running event loop for thread-safe callback scheduling
+        self._event_loop = asyncio.get_running_loop()
+
         try:
             # Initialize
             await self._update_state(TrainingState.INITIALIZING)
@@ -789,31 +797,31 @@ class AsyncTrainer:
         trainer = self
 
         class ProgressCallback(TrainerCallback):
+            # v258.0: HuggingFace TrainerCallback methods run in the training
+            # thread, NOT the async event loop thread. asyncio.create_task()
+            # would fail or create tasks on the wrong loop. Use
+            # run_coroutine_threadsafe() with the saved event loop reference.
+
             def on_step_end(self, args, state, control, **kwargs):
-                # Run async update in event loop
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.create_task(trainer._on_step_end(state))
-                except RuntimeError:
-                    pass
+                if trainer._event_loop and trainer._event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        trainer._on_step_end(state),
+                        trainer._event_loop,
+                    )
 
             def on_log(self, args, state, control, logs=None, **kwargs):
-                if logs:
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            asyncio.create_task(trainer._on_log(logs))
-                    except RuntimeError:
-                        pass
+                if logs and trainer._event_loop and trainer._event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        trainer._on_log(logs),
+                        trainer._event_loop,
+                    )
 
             def on_save(self, args, state, control, **kwargs):
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.create_task(trainer._on_save(state))
-                except RuntimeError:
-                    pass
+                if trainer._event_loop and trainer._event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        trainer._on_save(state),
+                        trainer._event_loop,
+                    )
 
         return ProgressCallback()
 

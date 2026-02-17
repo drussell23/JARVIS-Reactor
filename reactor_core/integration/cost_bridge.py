@@ -128,6 +128,9 @@ class CostBridge:
         # Event transport
         self._transport: Optional[FileTransport] = None
 
+        # v258.0: Strong references for fire-and-forget background tasks
+        self._background_tasks: set = set()
+
     async def initialize(self) -> None:
         """Initialize the cost bridge."""
         BRIDGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -157,6 +160,19 @@ class CostBridge:
         """Register callback for budget alerts."""
         self._alert_callbacks.append(callback)
 
+    def _spawn_budget_check(self) -> None:
+        """v258.0: Spawn budget check with strong task reference."""
+        try:
+            _task = asyncio.create_task(
+                self._check_budget(),
+                name="cost_bridge_budget_check",
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            # No running event loop — skip budget check
+            pass
+
     def record_distillation_cost(
         self,
         provider: str,
@@ -170,12 +186,12 @@ class CostBridge:
         self.reactor_requests += 1
 
         # Check budget
-        asyncio.create_task(self._check_budget())
+        self._spawn_budget_check()
 
     def record_training_cost(self, cost_usd: float) -> None:
         """Record cost from training compute."""
         self.reactor_costs["training_compute_costs"] += cost_usd
-        asyncio.create_task(self._check_budget())
+        self._spawn_budget_check()
 
     def record_storage_cost(self, cost_usd: float) -> None:
         """Record cost from storage usage."""

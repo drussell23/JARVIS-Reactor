@@ -83,6 +83,9 @@ from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+# v258.0: Strong references for fire-and-forget background tasks (prevents GC collection)
+_trinity_pub_background_tasks: set = set()
+
 # Event schema version for evolution
 EVENT_SCHEMA_VERSION = "2.0"
 
@@ -672,8 +675,10 @@ def _run_async_in_sync(coro) -> Any:
 
     # There's a running loop - check if we're in the same thread
     if threading.current_thread() is threading.main_thread():
-        # Same thread - schedule as task (fire-and-forget)
-        asyncio.create_task(coro)
+        # Same thread - schedule as task (v258.0: store strong reference)
+        _task = asyncio.create_task(coro, name="trinity_pub_sync_wrapper")
+        _trinity_pub_background_tasks.add(_task)
+        _task.add_done_callback(_trinity_pub_background_tasks.discard)
         return True
     else:
         # Different thread - use thread-safe method
