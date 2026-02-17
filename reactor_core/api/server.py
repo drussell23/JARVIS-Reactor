@@ -50,6 +50,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -1997,6 +1998,97 @@ async def stream_events(topics: Optional[str] = Query(None)):
 
 
 # ============================================================================
+# Experience Snapshot Helpers
+# ============================================================================
+
+# Default directory for training data snapshots
+SNAPSHOT_DIR = Path.home() / ".jarvis" / "reactor" / "training_data"
+
+
+async def drain_experience_buffer(mgr: "TrainingJobManager") -> List[Dict[str, Any]]:
+    """Atomically drain the experience buffer.
+
+    Acquires the manager's lock, copies the buffer, clears it, then releases.
+    This ensures no experiences are lost or double-counted between training runs.
+
+    Args:
+        mgr: The TrainingJobManager whose buffer to drain.
+
+    Returns:
+        List of experiences that were in the buffer.
+    """
+    async with mgr._lock:
+        drained = list(mgr.experiences)
+        mgr.experiences.clear()
+    return drained
+
+
+def write_experience_snapshot(
+    experiences: List[Dict[str, Any]],
+    job_id: str,
+    snapshot_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Write experiences to a JSONL snapshot file.
+
+    Uses atomic write (write to temp file, then rename) to prevent
+    corruption from partial writes.
+
+    Args:
+        experiences: List of experience dicts to write.
+        job_id: Training job ID (used in filename).
+        snapshot_dir: Directory for snapshot files.
+                     Defaults to ~/.jarvis/reactor/training_data/
+
+    Returns:
+        Path to the snapshot file, or None if experiences is empty.
+    """
+    if not experiences:
+        logger.warning(f"[Snapshot] No experiences to snapshot for job {job_id}")
+        return None
+
+    if snapshot_dir is None:
+        snapshot_dir = SNAPSHOT_DIR
+
+    snapshot_dir = Path(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    snapshot_path = snapshot_dir / f"snapshot_{job_id}.jsonl"
+
+    # Build content: one JSON line per experience
+    content = "".join(
+        json.dumps(exp, default=str) + "\n" for exp in experiences
+    )
+
+    # Atomic write: write to temp file, then rename
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(snapshot_dir),
+        prefix=".snapshot_",
+        suffix=".tmp",
+    )
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        os.replace(tmp_path, str(snapshot_path))
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    logger.info(
+        f"[Snapshot] Wrote {len(experiences)} experiences to {snapshot_path} "
+        f"({snapshot_path.stat().st_size} bytes)"
+    )
+    return snapshot_path
+
+
+# ============================================================================
 # Background Training Task
 # ============================================================================
 
@@ -2083,11 +2175,40 @@ async def run_training_pipeline(job_id: str):
             # Report initial progress
             await progress_callback("data_prep", 5, "Preparing training data")
 
-            # Get collected experiences from job manager
-            experiences = job_manager.experiences.copy()
+            # v3.1: Atomic experience snapshot — drain buffer under lock,
+            # write JSONL snapshot, compute dataset hash for versioning
+            experiences = await drain_experience_buffer(job_manager)
+            snapshot_path = None
+            dataset_hash = None
+
             if experiences:
+                snapshot_path = write_experience_snapshot(
+                    experiences=experiences,
+                    job_id=job_id,
+                )
+                if snapshot_path:
+                    try:
+                        from reactor_core.data.versioning import DataHash
+                        dataset_hash = DataHash.from_file(snapshot_path)
+                        await job_manager.update_job(
+                            job_id,
+                            metadata={
+                                **(job.get("metadata") or {}),
+                                "dataset_hash": str(dataset_hash),
+                                "dataset_hash_digest": dataset_hash.digest,
+                                "snapshot_path": str(snapshot_path),
+                                "snapshot_size_bytes": dataset_hash.size_bytes,
+                                "experience_count": len(experiences),
+                            },
+                        )
+                        logger.info(
+                            f"[Pipeline] Snapshot: {snapshot_path.name}, "
+                            f"hash={dataset_hash}, experiences={len(experiences)}"
+                        )
+                    except Exception as hash_err:
+                        logger.warning(f"[Pipeline] Dataset hash failed (non-critical): {hash_err}")
+
                 await trainer.add_experiences(experiences)
-                job_manager.experiences.clear()  # Clear after passing to trainer
 
             await progress_callback("training", 20, f"Training on {len(experiences)} experiences")
 
