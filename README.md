@@ -1107,6 +1107,7 @@ Reactor-Core is the **Nerves** in the three-repo Trinity architecture. It is **s
 - **Model deployment:** Trained/updated models can be deployed to Prime (e.g. hot swap, model registry).
 - **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Reactor participates in Trinity state sync and experience collection from JARVIS Body.
 - **DPO Training from Telemetry (v238.0+):** JARVIS Body's `TelemetryEmitter` captures every interaction — query, complexity classification, response, latency, and source. Reactor-Core uses this telemetry to build DPO preference pairs (e.g., chosen: `"10"`, rejected: `"Of course, the sum of five and five is ten..."`) for fine-tuning Mistral-7B. This training loop makes the v236.0/v238.0 adaptive prompt system's conciseness enforcement **permanent** — encoding terse-vs-detailed behavior in the model's weights instead of relying on prompt instructions. See the JARVIS-Prime README for the full training loop architecture.
+- **Voice Conversation Training Data (v238.0+):** JARVIS Body's real-time voice conversation pipeline generates a new class of training data: multi-turn conversation traces (20-turn sliding window sessions), barge-in events (proxy for response quality), turn detection accuracy logs, and conversation-mode-specific telemetry (`session_type: "conversation"`, `time_to_first_audio_ms`, `barge_in_count`). This data enables conversational DPO pairs (sustained-engagement vs. conversation-ending responses), conciseness training (shorter responses preferred in voice mode), and turn-detection classifier training (replacing the heuristic V1 with an ML-based V2). See v248.0 roadmap below.
 
 **run_reactor.py:**
 
@@ -1473,15 +1474,41 @@ bandit -r reactor_core/
 
 ## 📈 Version History
 
-### **v239.0** - Reactor Core Pipeline Activation (2026-02-17)
-- **DeploymentGate** (`reactor_core/deployment/gate.py`, 479 lines): GGUF model validation — magic bytes, version, file size, optional inference smoke test. Returns `APPROVED`/`REJECTED`/`PENDING_REVIEW`.
-- **Model Lineage Tracking** (`reactor_core/data/lineage.py`, 240 lines): `LineageRecord` dataclass with atomic JSONL append/read/update. Tracks parent model, training method, dataset hash, eval scores, gate decision, probation result.
-- **Job Persistence**: `TrainingJobManager` persists to `~/.jarvis/reactor_state/jobs.json` with atomic writes. Survives server restart via `_load_jobs()` on startup.
-- **Atomic Experience Snapshots**: `drain_experience_buffer()` (asyncio.Lock for atomic drain), `write_experience_snapshot()` (JSONL with tempfile+fsync+rename). `DataHash` computation for dataset versioning.
-- **Pipeline Event Logger**: JSONL event emission (`training.started`, `training.completed`, `training.failed`) with correlation/causation IDs for cross-repo tracing.
-- **Pipeline State Extensions**: `VALIDATING` and `GATE_REJECTED` states added to `PipelineState` in `unified_pipeline.py`. Gate wired into both training paths.
-- **Test Coverage**: 67 new tests (24 gate + 8 persistence + 16 lineage + 13 snapshots + 6 events)
-- **Cross-repo**: Works with JARVIS `ReactorCoreClient` (supervisor-driven activation) and J-Prime `ProbationMonitor` (post-deployment monitoring)
+### **v238.0** - Ecosystem: Real-Time Voice Conversation Infrastructure (2026-02-18, JARVIS Body-side)
+
+JARVIS Body v238.0 introduced a complete real-time voice conversation pipeline — continuous, bidirectional, streaming voice dialogue that transforms JARVIS from a command-response system into a conversational AI companion. This has significant implications for Reactor Core's training pipeline.
+
+**Architecture (7 layers in JARVIS Body):**
+- Layer -1: FullDuplexDevice (synchronized mic+speaker at same sample clock) + PlaybackRingBuffer
+- Layer 0: AudioBus singleton (all audio I/O flows through) + AEC via speexdsp
+- Layer 1: Streaming TTS (Piper — local neural TTS, ~50ms time-to-first-audio)
+- Layer 2: Streaming STT (faster-whisper — partial + final transcripts)
+- Layer 3: Turn Detector (adaptive silence thresholds: 300/600/900ms)
+- Layer 4: Barge-In Controller (user interrupts JARVIS mid-sentence via AEC-cleaned signal)
+- Layer 5: Conversation Pipeline (full orchestrator with 20-turn sliding context)
+- Layer 6: Mode Dispatcher (COMMAND / CONVERSATION / BIOMETRIC routing)
+- Bootstrap: Two-phase factory (AudioBus before narrator, pipeline after Intelligence)
+
+**Impact on Reactor Core training data:**
+
+| Data Type | Source | Training Application |
+|-----------|--------|---------------------|
+| Multi-turn conversation traces | ConversationSession (20-turn sliding window) | Fine-tune on conversational coherence — multi-turn dialogue pairs instead of single-turn Q&A |
+| Barge-in events | BargeInController logs | Train models to produce "checkpoint sentences" — natural pause points where interruption feels organic |
+| Turn detection accuracy | TurnDetector heuristic vs actual user behavior | Training signal for ML-based turn detection classifier (v248.0 in JARVIS Body) |
+| Conversation mode LLM telemetry | J-Prime `/v1/chat/completions` with conversation context | DPO pairs from multi-turn context: "which response kept the conversation flowing vs. which caused a restart?" |
+| Self-voice echo transcripts (dropped) | STT hallucination guard `conversation_mode` filter | Negative examples for STT fine-tuning — these are NOT user speech and should be classified as noise |
+
+**New telemetry fields flowing to Reactor Core:**
+- `session_type: "conversation"` vs `"command"` — enables per-mode DPO pair generation
+- `conversation_turn_count` — tracks where in a multi-turn session the response occurred
+- `barge_in_count` — how many times the user interrupted (proxy for response quality)
+- `time_to_first_audio_ms` — end-to-end latency metric for streaming pipeline
+
+**What Reactor Core should prepare for (v248.0+):**
+- **Conversational DPO pairs** — Responses that sustained multi-turn engagement ("chosen") vs. responses that ended the conversation ("rejected")
+- **Latency-aware training** — Shorter, more concise responses score higher in conversation mode (unlike detailed analysis mode)
+- **Turn-detection classifier training data** — When the heuristic V1 makes mistakes (too-early or too-late turn detection), log the error as training data for an ML-based V2
 
 ### **v238.0** - Ecosystem: Degenerate Response Elimination (2026-02-08, JARVIS Body-side)
 - JARVIS Body v238.0 fixes degenerate LLM responses ("...") via 3-layer defense-in-depth
@@ -1574,78 +1601,64 @@ bandit -r reactor_core/
 
 ## 🗺️ Roadmap — Next Phases
 
-### v239.0 — Pipeline Activation: Flip the Breaker (Completed, Feb 2026)
+### v239.0 — Pipeline Activation: Flip the Breaker (In Progress)
 
-**Status: COMPLETED.** 18 tasks, 5 phases, 22 commits across 3 repos, 67 new tests in this repo alone. The training pipeline that was 95% built but 0% connected is now fully wired end-to-end. All 6 root-cause disconnects have been fixed.
+**Status:** Infrastructure ~95% built. Schemas verified identical across repos. All code exists. **Zero training jobs have ever run.** This version activates the pipeline with ~200-400 lines of wiring changes, zero new Python files.
 
-**What was built in Reactor-Core (this repo):**
+**Approach:** Supervisor-Driven Activation — the unified supervisor already has `ReactorCoreClient` with `trigger_training()`, `stream_experience()`, `get_experience_count()`, and health monitoring. v239.0 wires these existing methods into the startup and runtime loops.
 
-| Component | File | Purpose |
-|-----------|------|---------|
-| `DeploymentGate` | `reactor_core/deployment/gate.py` (479 lines, new) | GGUF model validation before deployment: magic bytes (`0x46475547`), version check, file size bounds, optional inference smoke test |
-| `TrainingJobManager` persistence | `reactor_core/api/server.py` | Atomic JSON persistence (`~/.jarvis/reactor_state/jobs.json`), survives server restart, `_load_jobs()` on startup |
-| `LineageRecord` | `reactor_core/data/lineage.py` (240 lines, new) | Model lineage tracking: parent model, training method, dataset hash, eval scores, gate decision, probation result |
-| Atomic experience snapshots | `reactor_core/api/server.py` | `drain_experience_buffer()` with asyncio.Lock, `write_experience_snapshot()` to JSONL, `DataHash` computation |
-| Pipeline event logger | `reactor_core/api/server.py` | JSONL event emission (`training.started`, `training.completed`, `training.failed`) with correlation/causation IDs |
-| `VALIDATING` / `GATE_REJECTED` states | `reactor_core/training/unified_pipeline.py` | New pipeline states for deployment gate integration |
-| Gate + lineage wiring | `reactor_core/training/unified_pipeline.py` | `_write_model_lineage()` after gate evaluation, gate wired into both training paths |
+**What v239.0 changes:**
 
-**DeploymentGate validation checks (v1):**
-- GGUF magic bytes: `0x46475547` at offset 0
-- GGUF version: 2 or 3 (current spec)
-- File size: `>100MB` and `<expected_for_quant_level`
-- Optional inference: loads model via llama-cpp-python, generates text on 5 fixed prompts, verifies non-empty and non-repetitive output
-- Returns `GateResult` with `APPROVED`, `REJECTED`, or `PENDING_REVIEW`
+1. **Wire supervisor startup** (~40 lines in `unified_supervisor.py`)
+   - Call `initialize_reactor_core()` during Phase 5 (Trinity)
+   - Start `ReactorCoreWatcher` as background task
+   - Check for in-progress training jobs on startup (prevents duplicates after restart)
+   - Wire shutdown calls for clean cleanup
 
-**Experience snapshot flow:**
+2. **Verify HTTP connectivity** (debug, no code change)
+   - Confirm Reactor Core API server binds to port 8090 and accepts POSTs
+   - Verify `/api/v1/experiences/stream` endpoint is registered and reachable
+   - Manual `curl` test before any code changes
+
+3. **First training job** (manual trigger)
+   - Trigger via `ReactorCoreClient.trigger_training()` using accumulated telemetry
+   - Validate: `DatasetBuilder` → `LoRATrainer` → `GGUFExporter` chain works
+   - Goal: `jobs.json` goes from `{}` to having one completed job
+
+4. **Deployment smoke test gate** (~60 lines in `reactor_core_watcher.py`)
+   - Before deploying GGUF to Prime, load model in a **subprocess** (avoids OOM on 16GB Mac)
+   - Run 5 test prompts, verify non-garbage output
+   - Block deployment if smoke test fails
+   - Extensible `DeploymentGate` interface for future JARVIS-Bench integration
+
+5. **Deployment feedback loop** (~30 lines in `reactor_core_watcher.py`)
+   - After hot-swap notification to Prime, wait 10s, check Prime health
+   - Write `deployment_status.json` to `~/.jarvis/reactor/feedback/` with schema:
+     ```json
+     {
+       "schema_version": "1.0",
+       "model_path": "...",
+       "deployed_at": "2026-02-15T10:30:00Z",
+       "smoke_test_passed": true,
+       "hot_swap_notified": true,
+       "health_verified": true,
+       "previous_model": "qwen2.5-coder-7b-v1",
+       "deployment_latency_ms": 12400
+     }
+     ```
+   - Reactor Core consumes these to track deployment success rate
+
+**When this works, the full loop is:**
 ```
-Auto-trigger fires → drain_experience_buffer() [asyncio.Lock]
-  → Copy + clear buffer atomically
-  → write_experience_snapshot() → ~/.jarvis/reactor/training_data/snapshot_{job_id}.jsonl
-  → DataHash.from_file() computes dataset version (SHA256)
-  → New experiences buffer for next job
-```
-
-**Model lineage record schema:**
-```json
-{
-  "model_id": "string",
-  "model_hash": "sha256",
-  "parent_model": "string",
-  "training_method": "lora_sft",
-  "training_job_id": "string",
-  "dataset": {
-    "hash": "sha256", "size": 847,
-    "date_range": ["2026-02-10", "2026-02-15"],
-    "source_distribution": {"jarvis_body": 612, "corrections": 37},
-    "weighted_score": 142.5
-  },
-  "eval_scores": {"overall_quality": 0.82, "safety": 0.98},
-  "gate_decision": "APPROVED",
-  "deployed_at": "ISO 8601",
-  "probation_result": "COMMITTED"
-}
-```
-
-**Test coverage (67 tests):**
-- `test_deployment_gate.py`: 24 tests (magic bytes, version, size, inference, edge cases)
-- `test_job_persistence.py`: 8 tests (atomic writes, load on startup, concurrent updates)
-- `test_model_lineage.py`: 16 tests (write/read/update, atomic operations, schema validation)
-- `test_experience_snapshots.py`: 13 tests (drain, atomic writes, DataHash, concurrent access)
-- `test_pipeline_events.py`: 6 tests (event emission, JSONL format, correlation IDs)
-
-**Full pipeline (now active):**
-```
-User → JARVIS Body → J-Prime (inference + telemetry)
-  → ReactorCoreClient streams experiences to Reactor Core API
-    → ExperienceScorer quality-weights (7-tier: CORRECTION=10x → DUPLICATE=0.1x)
-      → Auto-trigger when weighted_score >= 100 (configurable)
-        → Atomic experience snapshot + DataHash
-          → LoRA SFT fine-tuning
-            → GGUF export → DeploymentGate (magic bytes + size + inference)
-              → Deploy to J-Prime → ProbationMonitor (30 min)
-                → COMMITTED or ROLLING_BACK
-                  → Model lineage recorded, events traced via correlation_id
+User → JARVIS Body → J-Prime (inference + telemetry capture)
+  → ~/.jarvis/telemetry/ (JSONL logs with model_id, task_type)
+    → Reactor Core TelemetryIngestor (via file watch or HTTP POST)
+      → Experience accumulation (threshold: 100 weighted experiences)
+        → Supervisor auto-triggers training via ReactorCoreClient
+          → LoRA fine-tuning (SFT first, DPO in v242.0)
+            → GGUF export → Smoke test gate (subprocess)
+              → Deploy to J-Prime → Feedback file
+                → Models improve, automatically
 ```
 
 ### v242.0 — DPO Training from Multi-Model Telemetry (Planned)
@@ -1765,6 +1778,17 @@ Support the training side of JARVIS self-programming:
 - [ ] **Spot VM resilience** — Predictive preemption with checkpoint save already built. Test with real training runs.
 - [ ] **Cost-aware scheduling** — Train on spot VMs during cheap hours, pause during expensive hours. `DynamicResourceAllocator` has the framework.
 
+### v248.0 — Voice Conversation Training Data Pipeline (Planned)
+
+Ingest and process training data from JARVIS Body's real-time voice conversation infrastructure (v238.0):
+
+- [ ] **Conversation trace schema** — Define JSONL schema for multi-turn conversation sessions: session_id, turns (role + text + audio_duration_ms), barge_in_events, turn_detection_errors, latency metrics. Compatible with existing `TelemetryIngestor`.
+- [ ] **Conversational DPO pairs** — Responses that sustained multi-turn engagement (user continued the conversation) are "chosen"; responses that ended the conversation (user said "goodbye" or restarted with a new topic) are "rejected". Barge-in count per response is a quality proxy (more interruptions → worse response).
+- [ ] **Conciseness training for conversation mode** — In conversation mode, shorter responses feel more natural. Generate DPO pairs where concise, direct responses are "chosen" over verbose, over-explained responses. This is the inverse of detailed-analysis mode training.
+- [ ] **Turn detection classifier training** — Log TurnDetector heuristic decisions (silence_duration_ms, threshold_used, was_correct) as training data. When the heuristic triggers too early (user wasn't done) or too late (awkward pause), these errors become labeled examples for a small ML classifier.
+- [ ] **Self-voice echo negative examples** — Transcripts dropped by the `stt_hallucination_guard` in conversation mode are negative examples for STT fine-tuning. These represent JARVIS's own speech (imperfect AEC residual) and should be classified as noise.
+- [ ] **Session-level metrics for curriculum learning** — Use conversation session duration, turn count, and user engagement as difficulty metrics for curriculum learning: short exchanges first, then longer multi-topic conversations.
+
 ### v246.0 — Agent Runtime Training Data Ingestion (Planned)
 
 Prepare Reactor Core to ingest and process training data from the JARVIS Body Unified Agent Runtime:
@@ -1782,11 +1806,11 @@ Cross-repo verification and integration testing. Many items previously planned h
 
 - [x] **JSONL format contract** — ~~Define and enforce shared schema~~ **VERIFIED:** Schemas are byte-identical across all three repos (v1.0 canonical `ExperienceEvent`). No action needed.
 - [x] **Implement `ReactorCoreBridge.upload_training_data()`** — ~~Broken link in J-Prime~~ **VERIFIED:** Fully implemented (992 LOC, v242.0) with batch upload, fallback, job tracking. No action needed.
-- [x] **Deployment signal verification** — DeploymentGate validates GGUF before deployment (v239.0). ProbationMonitor in J-Prime monitors post-deploy health with auto-rollback.
-- [x] **Integration test suite** — 3 end-to-end integration tests in JARVIS (`test_reactor_pipeline_e2e.py`) covering experience → training → deployment → feedback flow.
+- [ ] **Deployment signal verification** — Test the Reactor Core → Trinity Protocol → J-Prime `HotSwapManager` path end-to-end with a dummy GGUF (partially addressed in v239.0 smoke test)
+- [ ] **Integration test suite** — Automated test that writes a telemetry event in JARVIS Body format, ingests it in Reactor Core, runs a mock training step, exports a GGUF, and signals J-Prime for hot swap
 - [ ] **Monitoring dashboard** — Track pipeline health: events written/day, events ingested/day, training runs completed, models deployed, deployment feedback success rate
-- [x] **Model lineage tracking** — `LineageRecord` in `reactor_core/data/lineage.py` (v239.0). Records parent model, training method, dataset hash, eval scores, gate decision, probation result per training run.
-- [x] **Data versioning activation** — `DataHash.from_file()` computes SHA256 dataset version. Experience snapshots written to versioned JSONL files (`snapshot_{job_id}.jsonl`). Lineage records include dataset hash.
+- [ ] **Model lineage tracking** — Every deployed model records: base model, training method, training steps, dataset hash, evaluation scores, previous model scores
+- [ ] **Data versioning activation** — Content-addressed dataset storage with DVC-compatible lineage tracking (infrastructure exists, needs activation)
 
 ---
 
@@ -1985,16 +2009,10 @@ Built with ❤️ for the JARVIS AGI Ecosystem
 
 ### Known Gaps (In Roadmap)
 
-**Resolved in v239.0 (Feb 2026):**
-- ~~Training data pipeline built but never activated~~ — **RESOLVED.** Pipeline fully wired with supervisor-driven activation. 6 root-cause disconnects fixed, 67 new tests, all endpoint paths corrected.
-- ~~Deployment feedback loop is one-way~~ — **RESOLVED.** J-Prime writes `deployment_status.json` to `~/.jarvis/cross_repo/`. `ProbationMonitor` tracks 30-min post-deploy health with auto-rollback.
-- ~~No deployment quality gate~~ — **RESOLVED.** `DeploymentGate` (`reactor_core/deployment/gate.py`, 479 lines) validates GGUF magic bytes, version, file size, and optional inference before deployment.
-- ~~No real production training data yet~~ — **RESOLVED.** Quality-weighted experience scoring (7-tier) with auto-trigger, atomic snapshots, and DataHash versioning.
-
-**Remaining gaps:**
-- **JSONL event file rotation** — Pipeline event files (`pipeline_events.jsonl`) grow unbounded. Need rotation/archival strategy.
-- **`experience.emitted` event not emitted** — No emission point exists yet in the pipeline event chain.
-- **Event subscriptions not wired** — Events are published via TrinityEventBus/JSONL but no consumers subscribe to them yet.
-- **`datetime.utcnow()` deprecated** — Used in event timestamps. Should migrate to `datetime.now(timezone.utc)` for Python 3.12+ compatibility.
+- **Training data pipeline built but never activated** — All infrastructure exists and schemas are verified identical across repos (v1.0 canonical). `TelemetryEmitter`, `TelemetryIngestor`, `ReactorCoreBridge.upload_training_data()` (992 LOC, v242.0), `UnifiedTrainingPipeline`, and `ReactorCoreWatcher` are all built. The gap is activation: zero training jobs have ever run (`jobs.json` is empty). The Reactor Core API server on port 8090 needs to be verified as accepting POSTs, and the supervisor needs to call `initialize_reactor_core()` and `start_reactor_core_watcher()` during startup. Target: v239.0 (wiring, not building).
+- **Deployment feedback loop is one-way** — Reactor Core can export GGUF and deploy to J-Prime, and `ReactorCoreWatcher` in Prime can detect new models. But there is no feedback mechanism — Prime never tells Reactor Core "model deployed successfully" or "model caused regression, rolling back." A `deployment_status.json` feedback file is needed. Target: v239.0.
+- **No deployment quality gate** — The pipeline goes Training → GGUF export → Deploy with no validation step. A smoke test (load model, run test inference, verify non-garbage output) must be inserted before deployment. Must run in a subprocess to avoid OOM on 16GB Mac. Target: v239.0.
+- **No real production training data yet** — `UnifiedTrainingPipeline` has never run on actual user interaction data. Telemetry JSONL files exist in `~/.jarvis/telemetry/` but have never been ingested into a training run. Target: v239.0 (first run).
 - **LangGraph reasoning traces unavailable** — JARVIS Body's reasoning engine produces linear fallback traces, not rich graph-based reasoning data (depends on JARVIS Body v246.0)
 - **Agent Runtime training data schema undefined** — When autonomous goal pursuit generates multi-step traces, Reactor Core needs a new ingestion schema (v246.0 target)
+- **Voice conversation training data schema undefined** — JARVIS Body v238.0 generates multi-turn conversation traces, barge-in events, and turn detection logs. Reactor Core needs a conversation trace ingestion schema and conversational DPO pair generator (v248.0 target)
