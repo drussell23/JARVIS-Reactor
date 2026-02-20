@@ -242,6 +242,25 @@ from reactor_core.training.cognitive_modules import (
     create_cognitive_system,
 )
 
+# Online Learning (v238.0 — activated from sleeping)
+try:
+    from reactor_core.training.online_learning import (
+        OnlineLearningEngine,
+        create_online_learning_engine,
+        FeedbackIntegrator,
+        Experience as OnlineExperience,
+        LearningMetrics,
+        LearningMode,
+        FeedbackType,
+        ForgetPreventionMethod,
+        PrioritizedExperienceBuffer,
+        DriftDetector,
+        ElasticWeightConsolidation,
+    )
+    _ONLINE_LEARNING_AVAILABLE = True
+except ImportError:
+    _ONLINE_LEARNING_AVAILABLE = False
+
 __all__ = [
     # Trainer
     "Trainer",
@@ -430,4 +449,16 @@ __all__ = [
     "CognitiveModuleTrainer",
     # Utilities
     "create_cognitive_system",
+    # === ONLINE LEARNING (v238.0 — activated from sleeping) ===
+    "OnlineLearningEngine",
+    "create_online_learning_engine",
+    "FeedbackIntegrator",
+    "OnlineExperience",
+    "LearningMetrics",
+    "LearningMode",
+    "FeedbackType",
+    "ForgetPreventionMethod",
+    "PrioritizedExperienceBuffer",
+    "DriftDetector",
+    "ElasticWeightConsolidation",
 ]

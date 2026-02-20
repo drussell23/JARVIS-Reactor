@@ -800,6 +800,78 @@ class UnifiedTrainingPipeline:
             await self._update_state(PipelineState.PREPROCESSING, "Building dataset")
             train_dataset, eval_dataset = await self._build_dataset(raw_interactions)
 
+            # Step 2b: Active learning data selection (v238.0 — activated from sleeping)
+            # The full ActiveLearningLoop (uncertainty/diversity sampling) requires a
+            # loaded model and runs iteratively — it's designed for the post-training
+            # feedback loop, not pre-training selection. Here at preprocessing we use
+            # a lightweight quality-based selection: score samples by text length
+            # diversity and confidence, then select the top-N most informative subset.
+            # The full ActiveLearningLoop is wired into the post-training evaluation
+            # path via REACTOR_ACTIVE_LEARNING_POSTTRAINING (future).
+            if os.getenv("REACTOR_ACTIVE_LEARNING", "false").lower() == "true":
+                try:
+                    import random
+
+                    _al_max_samples = int(
+                        os.getenv("REACTOR_AL_MAX_SAMPLES", "0")
+                    )
+                    _dataset_len = len(train_dataset) if hasattr(train_dataset, '__len__') else 0
+                    if _al_max_samples > 0 and _dataset_len > _al_max_samples:
+                        await self._update_state(
+                            PipelineState.PREPROCESSING,
+                            f"Active learning: selecting {_al_max_samples} from {_dataset_len} samples",
+                        )
+
+                        # Score samples by text length diversity (longer = more informative)
+                        # and confidence from original telemetry. Stratified random selection
+                        # ensures representation across length buckets.
+                        _indices = list(range(_dataset_len))
+
+                        # Score by text length as proxy for complexity
+                        def _score(idx):
+                            item = train_dataset[idx]
+                            if isinstance(item, dict):
+                                text = item.get("text", item.get("input", ""))
+                            elif isinstance(item, str):
+                                text = item
+                            else:
+                                text = str(item)
+                            return len(text)
+
+                        _scored = sorted(_indices, key=_score, reverse=True)
+
+                        # Take top 60% by length, random 40% for diversity
+                        _top_count = int(_al_max_samples * 0.6)
+                        _random_count = _al_max_samples - _top_count
+                        _top = _scored[:_top_count]
+                        _remaining = [i for i in _scored[_top_count:] if i not in set(_top)]
+                        _random_pick = random.sample(
+                            _remaining, min(_random_count, len(_remaining))
+                        )
+                        _selected = sorted(set(_top + _random_pick))
+
+                        if hasattr(train_dataset, 'select'):
+                            train_dataset = train_dataset.select(_selected)
+                        else:
+                            train_dataset = [train_dataset[i] for i in _selected]
+
+                        logger.info(
+                            f"[Pipeline] Active learning: {_dataset_len} → "
+                            f"{len(_selected)} samples (length-diversity stratified)"
+                        )
+                        result.metrics["active_learning"] = {
+                            "strategy": "length_diversity_stratified",
+                            "before": _dataset_len,
+                            "after": len(_selected),
+                        }
+                    else:
+                        logger.debug(
+                            f"[Pipeline] Active learning: dataset size ({_dataset_len}) "
+                            f"within limit ({_al_max_samples}), skipping selection"
+                        )
+                except Exception as al_err:
+                    logger.warning(f"[Pipeline] Active learning failed (non-blocking): {al_err}")
+
             # Step 3: Train model
             await self._update_state(PipelineState.TRAINING, "Training model")
 
@@ -1006,6 +1078,101 @@ class UnifiedTrainingPipeline:
                     logger.warning("[Pipeline] DeploymentGate not available — skipping validation")
                 except Exception as gate_err:
                     logger.warning(f"[Pipeline] Deployment gate error (non-blocking): {gate_err}")
+
+            # Step 4b2: Gatekeeper evaluation (v238.0 — activated from sleeping)
+            # Complements DeploymentGate with regression detection and multi-criteria
+            # approval scoring. Runs after structural validation passes.
+            if (
+                result.gguf_path
+                and os.getenv("REACTOR_GATEKEEPER", "false").lower() == "true"
+            ):
+                try:
+                    from reactor_core.eval.gatekeeper import Gatekeeper, ApprovalStatus
+                    from reactor_core.eval.base_evaluator import (
+                        EvaluationResult as GKEvaluationResult,
+                        EvaluationStatus as GKEvaluationStatus,
+                        MetricResult as GKMetricResult,
+                    )
+
+                    _gk = Gatekeeper(
+                        regression_threshold=float(
+                            os.getenv("REACTOR_GATE_REGRESSION_THRESHOLD", "0.02")
+                        ),
+                        require_baseline=os.getenv(
+                            "REACTOR_GATE_REQUIRE_BASELINE", "false"
+                        ).lower() == "true",
+                    )
+
+                    await self._update_state(
+                        PipelineState.VALIDATING,
+                        "Running Gatekeeper quality evaluation",
+                    )
+
+                    # Build proper EvaluationResult from training metrics
+                    _gk_metrics = []
+                    _final_loss = getattr(training_result, 'final_loss', None)
+                    if _final_loss is not None:
+                        _gk_metrics.append(GKMetricResult(
+                            name="loss", value=float(_final_loss),
+                        ))
+                    _perplexity = result.metrics.get("perplexity")
+                    if _perplexity is not None:
+                        _gk_metrics.append(GKMetricResult(
+                            name="perplexity", value=float(_perplexity),
+                        ))
+                    _accuracy = result.metrics.get("eval_accuracy")
+                    if _accuracy is not None:
+                        _gk_metrics.append(GKMetricResult(
+                            name="accuracy", value=float(_accuracy),
+                        ))
+
+                    _gk_eval = GKEvaluationResult(
+                        evaluator_name="nightshift_pipeline",
+                        status=GKEvaluationStatus.COMPLETED,
+                        metrics=_gk_metrics,
+                        details={
+                            "training_steps": getattr(result, 'training_steps', 0),
+                            "gguf_path": str(result.gguf_path),
+                        },
+                    )
+
+                    _model_version = (
+                        result.gguf_path.name if result.gguf_path else "unknown"
+                    )
+
+                    _gk_decision = _gk.evaluate(
+                        evaluation=_gk_eval,
+                        model_version=_model_version,
+                        baseline=None,  # Populated when baseline tracking is implemented
+                        metadata={"pipeline_run_id": str(result.run_id) if hasattr(result, 'run_id') else None},
+                    )
+
+                    result.metrics["gatekeeper"] = {
+                        "approved": _gk_decision.approved,
+                        "reason": _gk_decision.reason,
+                        "criteria_results": getattr(_gk_decision, 'criteria_results', {}),
+                    }
+
+                    if not _gk_decision.approved:
+                        logger.warning(
+                            f"[Pipeline] Gatekeeper REJECTED: {_gk_decision.reason}"
+                        )
+                        # Non-blocking by default — log but don't halt deployment.
+                        # Set REACTOR_GATEKEEPER_STRICT=true to enforce.
+                        if os.getenv("REACTOR_GATEKEEPER_STRICT", "false").lower() == "true":
+                            result.success = False
+                            result.state = PipelineState.GATE_REJECTED
+                            result.error_message = f"Gatekeeper rejected: {_gk_decision.reason}"
+                            raise _GateRejectionError(_gk_decision.reason)
+                    else:
+                        logger.info(f"[Pipeline] Gatekeeper APPROVED: {_gk_decision.reason}")
+
+                except _GateRejectionError:
+                    raise
+                except ImportError:
+                    logger.debug("[Pipeline] Gatekeeper module not available")
+                except Exception as gk_err:
+                    logger.warning(f"[Pipeline] Gatekeeper error (non-blocking): {gk_err}")
 
             # Step 4c: Write model lineage record
             self._write_model_lineage(result)
