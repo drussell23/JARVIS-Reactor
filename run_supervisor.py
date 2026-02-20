@@ -2460,6 +2460,52 @@ class AGISupervisor:
 async def main():
     """Main entry point for AGI Supervisor with Trinity integration."""
 
+    # =========================================================================
+    # v238.0: ORCHESTRATION GUARD — Prevent duplicate supervisor startup
+    # =========================================================================
+    # If unified_supervisor.py already manages this repo, refuse to start
+    # a competing supervisor that would cause port conflicts, duplicate
+    # processes, and race conditions.
+    orchestrated_by = os.environ.get("JARVIS_ORCHESTRATED_BY")
+    if orchestrated_by:
+        supervisor_pid = os.environ.get("JARVIS_SUPERVISOR_PID", "unknown")
+        print("=" * 70)
+        print(f"  Reactor-Core is already managed by: {orchestrated_by} (PID {supervisor_pid})")
+        print()
+        print("  This repo-level supervisor cannot start while the unified")
+        print("  supervisor is orchestrating. To manage the JARVIS ecosystem,")
+        print("  use the single entry point:")
+        print()
+        print("    cd ~/Documents/repos/JARVIS-AI-Agent")
+        print("    python3 unified_supervisor.py")
+        print()
+        print("  To run Reactor-Core standalone (without orchestration):")
+        print("    python3 run_reactor.py --port 8090")
+        print("=" * 70)
+        return 0
+
+    # =========================================================================
+    # v238.0: DEPRECATION WARNING — Direct users to unified_supervisor
+    # =========================================================================
+    print("=" * 70)
+    print("  ⚠ DEPRECATION NOTICE (v238.0)")
+    print()
+    print("  This repo-level supervisor (reactor-core/run_supervisor.py) is")
+    print("  deprecated. The unified supervisor in JARVIS-AI-Agent now handles")
+    print("  all cross-repo orchestration with Trinity, health monitoring,")
+    print("  and dashboard support.")
+    print()
+    print("  Recommended:")
+    print("    cd ~/Documents/repos/JARVIS-AI-Agent")
+    print("    python3 unified_supervisor.py")
+    print()
+    print("  For standalone Reactor-Core server:")
+    print("    python3 run_reactor.py --port 8090")
+    print("=" * 70)
+    logger.warning(
+        "[run_supervisor.py] DEPRECATED — use unified_supervisor.py in JARVIS-AI-Agent"
+    )
+
     # ==========================================================================
     # PHASE 0: TRINITY INITIALIZATION (Before anything else)
     # ==========================================================================
