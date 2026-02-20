@@ -26,6 +26,27 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+def _parse_path_list(value: str, default_paths: List[str]) -> List[str]:
+    """Parse comma-separated endpoint paths and normalize to '/path' format."""
+    raw_items = value.split(",") if value else list(default_paths)
+    normalized: List[str] = []
+    seen: set = set()
+    for item in raw_items:
+        path = item.strip()
+        if not path:
+            continue
+        if "://" in path:
+            # Path list is path-only; ignore fully qualified URLs.
+            continue
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if path in seen:
+            continue
+        normalized.append(path)
+        seen.add(path)
+    return normalized or list(default_paths)
+
+
 class PrimeEventType(Enum):
     """Types of events from JARVIS Prime."""
     INTERACTION = "interaction"
@@ -95,14 +116,58 @@ class PrimeEvent:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PrimeEvent":
+        raw_type = str(data.get("event_type", "interaction")).lower()
+        try:
+            event_type = PrimeEventType(raw_type)
+        except ValueError:
+            # Normalize Prime websocket envelope types to connector semantics.
+            if raw_type in {"heartbeat", "health", "health_check"}:
+                event_type = PrimeEventType.HEALTH
+            elif raw_type in {"response", "inference_complete"}:
+                event_type = PrimeEventType.RESPONSE
+            elif raw_type in {"command", "inference_request"}:
+                event_type = PrimeEventType.COMMAND
+            else:
+                event_type = PrimeEventType.SYSTEM
+
+        timestamp_value: Any = data.get("timestamp", datetime.now().isoformat())
+        if isinstance(timestamp_value, str):
+            try:
+                parsed_timestamp = datetime.fromisoformat(timestamp_value)
+            except ValueError:
+                parsed_timestamp = datetime.now()
+        elif isinstance(timestamp_value, datetime):
+            parsed_timestamp = timestamp_value
+        else:
+            parsed_timestamp = datetime.now()
+
+        payload = data.get("data", {})
+
+        metadata: Dict[str, Any]
+        raw_metadata = data.get("metadata", {})
+        if isinstance(raw_metadata, dict):
+            metadata = dict(raw_metadata)
+        else:
+            metadata = {"value": raw_metadata}
+        if payload is not None:
+            metadata["payload"] = payload
+
+        success = data.get("success")
+        if success is None and isinstance(payload, dict):
+            payload_status = str(payload.get("status", "")).lower()
+            if payload_status:
+                success = payload_status in {"healthy", "ready", "ok", "starting"}
+        if success is None:
+            success = True
+
         return cls(
-            event_id=data["event_id"],
-            event_type=PrimeEventType(data.get("event_type", "interaction")),
-            timestamp=datetime.fromisoformat(data["timestamp"]) if isinstance(data["timestamp"], str) else data["timestamp"],
+            event_id=str(data.get("event_id", f"evt_{int(parsed_timestamp.timestamp() * 1000)}")),
+            event_type=event_type,
+            timestamp=parsed_timestamp,
             user_input=data.get("user_input", ""),
             assistant_response=data.get("assistant_response", ""),
             system_context=data.get("system_context", ""),
-            success=data.get("success", True),
+            success=bool(success),
             confidence=data.get("confidence", 1.0),
             latency_ms=data.get("latency_ms", 0.0),
             is_correction=data.get("is_correction", False),
@@ -110,7 +175,7 @@ class PrimeEvent:
             corrected_response=data.get("corrected_response", ""),
             session_id=data.get("session_id", ""),
             model_id=data.get("model_id", ""),
-            metadata=data.get("metadata", {}),
+            metadata=metadata,
         )
 
 
@@ -137,9 +202,29 @@ class PrimeConnectorConfig:
     # WebSocket settings
     enable_websocket: bool = True
     websocket_path: str = "/ws/events"
+    websocket_paths: List[str] = field(
+        default_factory=lambda: _parse_path_list(
+            os.getenv("JARVIS_PRIME_WEBSOCKET_PATHS", ""),
+            ["/ws/events"],
+        )
+    )
     reconnect_interval: float = 5.0
     max_reconnect_attempts: int = 10
     ping_interval: float = 30.0
+
+    # Health polling fallback settings
+    health_paths: List[str] = field(
+        default_factory=lambda: _parse_path_list(
+            os.getenv("JARVIS_PRIME_HEALTH_PATHS", ""),
+            ["/health"],
+        )
+    )
+    enable_health_poll_fallback: bool = field(
+        default_factory=lambda: os.getenv("PRIME_HEALTH_POLL_FALLBACK", "true").lower() == "true"
+    )
+    health_poll_interval: float = field(
+        default_factory=lambda: float(os.getenv("PRIME_HEALTH_POLL_INTERVAL", "5.0"))
+    )
 
     # Request settings
     timeout: float = 30.0
@@ -161,6 +246,11 @@ class PrimeConnectorConfig:
     def ws_url(self) -> str:
         protocol = "wss" if self.use_ssl else "ws"
         return f"{protocol}://{self.host}:{self.port}{self.websocket_path}"
+
+    @property
+    def ws_urls(self) -> List[str]:
+        protocol = "wss" if self.use_ssl else "ws"
+        return [f"{protocol}://{self.host}:{self.port}{path}" for path in self.websocket_paths]
 
 
 class PrimeConnector:
@@ -192,6 +282,10 @@ class PrimeConnector:
         if port:
             self.config.port = port
 
+        # Keep backwards compatibility with single-path configuration.
+        if self.config.websocket_path and self.config.websocket_path not in self.config.websocket_paths:
+            self.config.websocket_paths.insert(0, self.config.websocket_path)
+
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._ws_state = ConnectionState.DISCONNECTED
@@ -199,6 +293,7 @@ class PrimeConnector:
         self._event_queue: asyncio.Queue = asyncio.Queue()
         self._callbacks: List[Callable[[PrimeEvent], None]] = []
         self._reconnect_count = 0
+        self._ws_path_index = 0
 
     @property
     def is_connected(self) -> bool:
@@ -227,14 +322,31 @@ class PrimeConnector:
         """
         session = await self._get_session()
 
-        try:
-            url = urljoin(self.config.base_url, "/health")
-            async with session.get(url) as response:
-                if response.status == 200:
-                    return await response.json()
-                return {"status": "unhealthy", "code": response.status}
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        last_error: Optional[Exception] = None
+        for health_path in self.config.health_paths:
+            try:
+                url = urljoin(self.config.base_url, health_path)
+                async with session.get(url) as response:
+                    # 503 often means "starting" (service alive, not ready yet).
+                    if response.status in (200, 503):
+                        payload = await response.json(content_type=None)
+                        if isinstance(payload, dict):
+                            payload.setdefault("_health_path", health_path)
+                            payload.setdefault("_http_status", response.status)
+                            return payload
+                        return {
+                            "status": "healthy" if response.status == 200 else "starting",
+                            "value": payload,
+                            "_health_path": health_path,
+                            "_http_status": response.status,
+                        }
+                    last_error = RuntimeError(f"HTTP {response.status} on {health_path}")
+            except Exception as e:
+                last_error = e
+
+        if last_error is not None:
+            return {"status": "error", "error": str(last_error)}
+        return {"status": "error", "error": "No health endpoints configured"}
 
     async def get_recent_interactions(
         self,
@@ -330,6 +442,40 @@ class PrimeConnector:
             logger.error(f"Error fetching session history: {e}")
             return []
 
+    @staticmethod
+    def _is_ws_contract_error(exc: Exception) -> bool:
+        """Return True when the error suggests endpoint mismatch/forbidden route."""
+        msg = str(exc).lower()
+        exc_type = type(exc).__name__
+        return (
+            "404" in msg
+            or "403" in msg
+            or "not found" in msg
+            or "forbidden" in msg
+            or exc_type in ("WSServerHandshakeError", "InvalidStatusCode", "InvalidStatus")
+        )
+
+    def _rotated_ws_urls(self) -> List[str]:
+        base_urls = self.config.ws_urls
+        if not base_urls:
+            return []
+        idx = self._ws_path_index % len(base_urls)
+        return base_urls[idx:] + base_urls[:idx]
+
+    async def _build_health_event(self) -> Optional[PrimeEvent]:
+        """Create a synthetic HEALTH event from Prime's health endpoint."""
+        health = await self.check_health()
+        status = str(health.get("status", "unknown")).lower()
+        success = status in ("healthy", "ready", "ok", "starting")
+        return PrimeEvent(
+            event_id=f"health_{int(datetime.now().timestamp() * 1000)}",
+            event_type=PrimeEventType.HEALTH,
+            timestamp=datetime.now(),
+            success=success,
+            confidence=1.0 if success else 0.0,
+            metadata={"health": health},
+        )
+
     async def connect_websocket(self) -> None:
         """
         Connect to JARVIS Prime WebSocket for real-time events.
@@ -340,22 +486,39 @@ class PrimeConnector:
         self._ws_state = ConnectionState.CONNECTING
         session = await self._get_session()
 
-        try:
-            self._ws = await session.ws_connect(
-                self.config.ws_url,
-                heartbeat=self.config.ping_interval,
-            )
-            self._ws_state = ConnectionState.CONNECTED
-            self._reconnect_count = 0
-            logger.info(f"Connected to JARVIS Prime WebSocket at {self.config.ws_url}")
+        last_error: Optional[Exception] = None
+        for candidate_url in self._rotated_ws_urls():
+            try:
+                self._ws = await session.ws_connect(
+                    candidate_url,
+                    heartbeat=self.config.ping_interval,
+                )
+                self._ws_state = ConnectionState.CONNECTED
+                self._reconnect_count = 0
 
-            # Start listening
-            self._ws_task = asyncio.create_task(self._ws_listener())
+                # Persist chosen path for next connection.
+                for idx, known_url in enumerate(self.config.ws_urls):
+                    if known_url == candidate_url:
+                        self._ws_path_index = idx
+                        self.config.websocket_path = self.config.websocket_paths[idx]
+                        break
 
-        except Exception as e:
-            self._ws_state = ConnectionState.FAILED
-            logger.error(f"Failed to connect WebSocket: {e}")
-            raise
+                logger.info(f"Connected to JARVIS Prime WebSocket at {candidate_url}")
+
+                # Start listening
+                self._ws_task = asyncio.create_task(self._ws_listener())
+                return
+            except Exception as e:
+                last_error = e
+                if self._is_ws_contract_error(e):
+                    self._ws_path_index += 1
+                continue
+
+        self._ws_state = ConnectionState.FAILED
+        logger.error(f"Failed to connect WebSocket using all configured endpoints: {last_error}")
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No websocket endpoints configured")
 
     async def _ws_listener(self) -> None:
         """Listen for WebSocket messages."""
@@ -436,18 +599,62 @@ class PrimeConnector:
         Yields:
             PrimeEvent objects as they arrive
         """
-        if self._ws_state != ConnectionState.CONNECTED:
-            await self.connect_websocket()
+        connector_error: Optional[Exception] = None
 
-        while self._ws_state in (ConnectionState.CONNECTED, ConnectionState.RECONNECTING):
+        if self.config.enable_websocket:
             try:
-                event = await asyncio.wait_for(
-                    self._event_queue.get(),
-                    timeout=60.0,
+                if self._ws_state != ConnectionState.CONNECTED:
+                    await self.connect_websocket()
+
+                while self._ws_state in (ConnectionState.CONNECTED, ConnectionState.RECONNECTING):
+                    try:
+                        event = await asyncio.wait_for(
+                            self._event_queue.get(),
+                            timeout=max(5.0, self.config.health_poll_interval),
+                        )
+                        yield event
+                    except asyncio.TimeoutError:
+                        # Keep stream alive and optionally emit health snapshots when idle.
+                        if self.config.enable_health_poll_fallback:
+                            health_event = await self._build_health_event()
+                            if health_event:
+                                yield health_event
+                        continue
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                connector_error = exc
+                logger.warning(
+                    "WebSocket event stream unavailable; switching to health-poll fallback: %s",
+                    exc,
                 )
-                yield event
-            except asyncio.TimeoutError:
-                continue
+
+        if not self.config.enable_health_poll_fallback:
+            if connector_error is not None:
+                raise connector_error
+            return
+
+        # Deterministic fallback stream.
+        failures = 0
+        while True:
+            try:
+                health_event = await self._build_health_event()
+                if health_event is not None:
+                    failures = 0
+                    yield health_event
+                else:
+                    failures += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                if failures <= 3 or failures % 10 == 0:
+                    logger.debug("Health fallback poll failed: %s", exc)
+
+            interval = max(0.5, self.config.health_poll_interval)
+            backoff = min(interval * (1.0 + 0.25 * min(failures, 8)), interval * 4.0)
+            await asyncio.sleep(backoff)
 
     def add_event_callback(
         self,
