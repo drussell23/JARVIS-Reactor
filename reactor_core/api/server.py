@@ -230,6 +230,7 @@ class StatusResponse(BaseModel):
     telemetry_running: bool = False
     scheduler_running: bool = False
     health_aggregator_running: bool = False
+    tier2_runtime: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Training ---
@@ -589,6 +590,30 @@ class TrainingJobManager:
 
 # Global instances
 job_manager = TrainingJobManager()
+_tier2_orchestrator: Optional[Any] = None
+_tier2_orchestrator_load_failed = False
+
+
+def get_tier2_orchestrator() -> Optional[Any]:
+    """Lazily load Tier-2 runtime orchestrator."""
+    global _tier2_orchestrator, _tier2_orchestrator_load_failed
+
+    if _tier2_orchestrator_load_failed:
+        return None
+    if _tier2_orchestrator is not None:
+        return _tier2_orchestrator
+
+    try:
+        from reactor_core.training.tier2_runtime import Tier2RuntimeOrchestrator
+
+        _tier2_orchestrator = Tier2RuntimeOrchestrator.from_env()
+        logger.info("[Tier2Runtime] Orchestrator loaded")
+    except Exception as exc:
+        _tier2_orchestrator_load_failed = True
+        logger.warning("[Tier2Runtime] Orchestrator unavailable: %s", exc)
+        return None
+
+    return _tier2_orchestrator
 
 
 # ============================================================================
@@ -906,6 +931,7 @@ async def health_check():
     services["telemetry"] = "running" if telemetry._running else "stopped"
     services["scheduler"] = "running" if scheduler._running else "stopped"
     services["health_aggregator"] = "running" if health_agg._running else "stopped"
+    services["tier2_runtime"] = "enabled" if get_tier2_orchestrator() else "disabled"
 
     return HealthResponse(
         status="healthy",
@@ -923,6 +949,8 @@ async def get_status():
     telemetry = get_telemetry()
     scheduler = get_scheduler()
     health_agg = get_health_aggregator()
+    tier2_orchestrator = get_tier2_orchestrator()
+    tier2_status = tier2_orchestrator.get_status() if tier2_orchestrator else {"enabled": False}
 
     return StatusResponse(
         healthy=True,
@@ -935,6 +963,7 @@ async def get_status():
         telemetry_running=telemetry._running,
         scheduler_running=scheduler._running,
         health_aggregator_running=health_agg._running,
+        tier2_runtime=tier2_status,
     )
 
 
@@ -1066,6 +1095,15 @@ async def get_pipeline_state():
         last_updated=datetime.now().isoformat(),
         progress=job["progress"],
     )
+
+
+@app.get("/api/v1/training/tier2/status", tags=["Training"])
+async def get_tier2_runtime_status():
+    """Get Tier-2 runtime orchestration status."""
+    orchestrator = get_tier2_orchestrator()
+    if not orchestrator:
+        return {"enabled": False}
+    return orchestrator.get_status()
 
 
 # ============================================================================
@@ -2531,6 +2569,34 @@ async def run_nightshift_pipeline(job_id: str) -> None:
             "final_state": final_state,
             "total_time_seconds": time.time() - start_time,
         }
+
+        tier2_orchestrator = get_tier2_orchestrator()
+        if tier2_orchestrator:
+            tier2_overrides: Dict[str, Any] = {}
+            raw_tier2 = metadata.get("tier2")
+            if isinstance(raw_tier2, dict):
+                tier2_overrides = raw_tier2
+            try:
+                tier2_result = await tier2_orchestrator.run(
+                    job_id=job_id,
+                    snapshot_path=Path(metadata["snapshot_path"]).expanduser()
+                    if isinstance(metadata.get("snapshot_path"), str)
+                    else None,
+                    work_dir=config.work_dir,
+                    overrides=tier2_overrides,
+                    context={
+                        "mode": "nightshift",
+                        "triggered_by": job.get("triggered_by"),
+                    },
+                )
+                metrics["tier2_runtime"] = tier2_result
+            except Exception as tier2_exc:
+                logger.warning("[Tier2Runtime] NightShift integration failed: %s", tier2_exc)
+                metrics["tier2_runtime"] = {
+                    "status": "error",
+                    "error": str(tier2_exc),
+                }
+
         await job_manager.complete_job(job_id, metrics)
         await update_status("completed", 100.0, "NightShift pipeline complete", status="completed")
 
@@ -2703,6 +2769,31 @@ async def run_training_pipeline(job_id: str):
                 f"Ensure reactor_core.training.unified_pipeline is importable."
             )
             return
+
+        tier2_orchestrator = get_tier2_orchestrator()
+        if tier2_orchestrator:
+            tier2_overrides: Dict[str, Any] = {}
+            raw_tier2 = (job.get("metadata") or {}).get("tier2") if isinstance(job.get("metadata"), dict) else None
+            if isinstance(raw_tier2, dict):
+                tier2_overrides = raw_tier2
+            try:
+                tier2_result = await tier2_orchestrator.run(
+                    job_id=job_id,
+                    experiences=experiences,
+                    snapshot_path=snapshot_path if isinstance(snapshot_path, Path) else None,
+                    overrides=tier2_overrides,
+                    context={
+                        "mode": "unified",
+                        "triggered_by": job.get("triggered_by"),
+                    },
+                )
+                metrics["tier2_runtime"] = tier2_result
+            except Exception as tier2_exc:
+                logger.warning("[Tier2Runtime] Unified integration failed: %s", tier2_exc)
+                metrics["tier2_runtime"] = {
+                    "status": "error",
+                    "error": str(tier2_exc),
+                }
 
         metrics["output_model_path"] = output_model_path
         await job_manager.complete_job(job_id, metrics)
