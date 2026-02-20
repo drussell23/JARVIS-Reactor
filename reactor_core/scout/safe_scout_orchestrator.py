@@ -247,7 +247,7 @@ class SafeScoutOrchestrator:
 
         # Topic queue
         queue_config = TopicQueueConfig(
-            db_path=self.config.work_dir / "scout_queue.db",
+            storage_path=self.config.work_dir / "queue",
             max_concurrent_topics=self.config.url_concurrency,
         )
         self._queue = TopicQueue(queue_config)
@@ -292,8 +292,11 @@ class SafeScoutOrchestrator:
         """Cleanup all components."""
         if self._sandbox:
             await self._sandbox.cleanup()
-        if self._queue:
-            await self._queue.close()
+        if self._queue and hasattr(self._queue, "close"):
+            close_fn = getattr(self._queue, "close")
+            maybe_coro = close_fn()
+            if asyncio.iscoroutine(maybe_coro):
+                await maybe_coro
 
     async def _process_url(
         self,
@@ -421,9 +424,14 @@ class SafeScoutOrchestrator:
         try:
             await self._initialize_components()
 
-            # Get pending topics
+            # Dequeue pending topics up to configured limit
             self._update_stage(ScoutStage.FETCHING_TOPICS)
-            topics = await self._queue.get_pending_topics(limit=self.config.max_topics)
+            topics = []
+            for _ in range(self.config.max_topics):
+                topic = await self._queue.dequeue()
+                if not topic:
+                    break
+                topics.append(topic)
             self._progress.topics_total = len(topics)
 
             if not topics:
@@ -442,27 +450,31 @@ class SafeScoutOrchestrator:
                 if self._cancelled:
                     break
 
-                logger.info(f"Processing topic: {topic.name}")
-                await self._queue.mark_processing(topic.topic_id)
+                logger.info(f"Processing topic: {topic.title}")
 
                 # Get URLs for this topic
-                urls = topic.urls[:self.config.max_pages_per_topic]
+                urls = topic.seed_urls[:self.config.max_pages_per_topic]
                 self._progress.urls_total += len(urls)
 
                 # Process URLs in parallel
                 self._update_stage(ScoutStage.FETCHING_PAGES)
                 tasks = [
-                    self._process_url(url, topic.name, semaphore)
+                    self._process_url(url, topic.title, semaphore)
                     for url in urls
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 # Save results
                 self._update_stage(ScoutStage.SAVING_OUTPUT)
+                pages_scouted = 0
+                examples_generated = 0
                 for result in results:
                     if isinstance(result, Exception):
                         self._progress.errors.append(str(result))
                         continue
+
+                    if result and result.get("success"):
+                        pages_scouted += 1
 
                     if result and result.get("pairs"):
                         for pair in result["pairs"]:
@@ -470,8 +482,13 @@ class SafeScoutOrchestrator:
                             pair_file = output_dir / f"{pair_id}.json"
                             with open(pair_file, "w") as f:
                                 json.dump(pair, f, indent=2)
+                        examples_generated += len(result["pairs"])
 
-                await self._queue.mark_completed(topic.topic_id)
+                await self._queue.complete(
+                    topic.topic_id,
+                    pages_scouted=pages_scouted,
+                    examples_generated=examples_generated,
+                )
                 self._progress.topics_processed += 1
                 self._notify_progress()
 
@@ -533,29 +550,36 @@ class SafeScoutOrchestrator:
         category_map = {
             "documentation": TopicCategory.DOCUMENTATION,
             "tutorial": TopicCategory.TUTORIAL,
-            "api_reference": TopicCategory.API_REFERENCE,
+            "general": TopicCategory.DOCUMENTATION,
+            "api_reference": TopicCategory.REFERENCE,
+            "reference": TopicCategory.REFERENCE,
             "release_notes": TopicCategory.RELEASE_NOTES,
-            "blog": TopicCategory.BLOG,
-            "paper": TopicCategory.PAPER,
-            "other": TopicCategory.OTHER,
+            "best_practices": TopicCategory.BEST_PRACTICES,
+            "security": TopicCategory.SECURITY,
+            "research": TopicCategory.RESEARCH,
+            "paper": TopicCategory.RESEARCH,
+            "community": TopicCategory.COMMUNITY,
+            "blog": TopicCategory.COMMUNITY,
+            "other": TopicCategory.DOCUMENTATION,
         }
 
         topic = LearningTopic(
-            name=name,
+            topic_id="",
+            title=name,
             description=f"Topic: {name}",
-            urls=urls,
+            seed_urls=urls,
             priority=priority_map.get(priority, TopicPriority.NORMAL),
-            category=category_map.get(category, TopicCategory.OTHER),
+            category=category_map.get(category, TopicCategory.DOCUMENTATION),
         )
 
         # Initialize queue if needed
         if not self._queue:
             queue_config = TopicQueueConfig(
-                db_path=self.config.work_dir / "scout_queue.db"
+                storage_path=self.config.work_dir / "queue"
             )
             self._queue = TopicQueue(queue_config)
 
-        await self._queue.add_topic(topic)
+        await self._queue.enqueue(topic, deduplicate=True)
         return topic.topic_id
 
     async def get_statistics(self) -> Dict[str, Any]:

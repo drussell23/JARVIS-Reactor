@@ -59,7 +59,7 @@ from pathlib import Path
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Query, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -352,6 +352,25 @@ class ExperienceCountResponse(BaseModel):
     """Experience count response."""
     count: int
     last_ingested: Optional[str] = None
+
+
+class ScoutTopicRequest(BaseModel):
+    """Request to enqueue a Scout learning topic."""
+    topic: str = Field(min_length=1, max_length=512)
+    category: str = Field(default="general")
+    priority: Union[str, int] = Field(default="normal")
+    urls: List[str] = Field(default_factory=list)
+    added_by: str = Field(default="jarvis_agent")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ScoutTopicResponse(BaseModel):
+    """Response for Scout topic enqueue operations."""
+    added: bool
+    topic_id: Optional[str] = None
+    status: str = "queued"
+    queue_pending: Optional[int] = None
+    reason: Optional[str] = None
 
 
 # ============================================================================
@@ -1736,6 +1755,141 @@ async def get_loaded_models():
 
 
 # ============================================================================
+# Scout Topic Endpoints
+# ============================================================================
+
+def _normalize_scout_priority(priority: Union[str, int]) -> str:
+    """Normalize mixed priority formats to a canonical Scout priority string."""
+    if isinstance(priority, bool):
+        return "normal"
+
+    if isinstance(priority, int):
+        if priority <= 1:
+            return "critical"
+        if priority == 2:
+            return "high"
+        if priority == 3:
+            return "normal"
+        if priority == 4:
+            return "low"
+        return "background"
+
+    normalized = str(priority).strip().lower()
+    if normalized.isdigit():
+        return _normalize_scout_priority(int(normalized))
+
+    alias_map = {
+        "urgent": "critical",
+        "critical": "critical",
+        "high": "high",
+        "normal": "normal",
+        "medium": "normal",
+        "default": "normal",
+        "low": "low",
+        "background": "background",
+    }
+    return alias_map.get(normalized, "normal")
+
+
+def _normalize_scout_category(category: str) -> str:
+    """Normalize category aliases to TopicCategory-compatible values."""
+    normalized = str(category).strip().lower()
+    alias_map = {
+        "general": "documentation",
+        "documentation": "documentation",
+        "docs": "documentation",
+        "tutorial": "tutorial",
+        "api_reference": "reference",
+        "reference": "reference",
+        "release_notes": "release_notes",
+        "release-notes": "release_notes",
+        "best_practices": "best_practices",
+        "best-practices": "best_practices",
+        "security": "security",
+        "research": "research",
+        "paper": "research",
+        "community": "community",
+        "blog": "community",
+    }
+    return alias_map.get(normalized, "documentation")
+
+
+@app.post("/api/v1/scout/topics", response_model=ScoutTopicResponse, tags=["Scout"])
+async def enqueue_scout_topic(request: ScoutTopicRequest):
+    """Queue a learning topic for Scout processing."""
+    try:
+        from reactor_core.scout.topic_queue import (
+            LearningTopic,
+            TopicCategory,
+            TopicPriority,
+            TopicQueue,
+            TopicQueueConfig,
+        )
+    except Exception as e:
+        logger.error(f"[Scout] Queue subsystem unavailable: {e}")
+        raise HTTPException(status_code=503, detail="Scout queue subsystem unavailable")
+
+    priority_map = {
+        "critical": TopicPriority.CRITICAL,
+        "high": TopicPriority.HIGH,
+        "normal": TopicPriority.NORMAL,
+        "low": TopicPriority.LOW,
+        "background": TopicPriority.BACKGROUND,
+    }
+    category_map = {
+        "documentation": TopicCategory.DOCUMENTATION,
+        "tutorial": TopicCategory.TUTORIAL,
+        "reference": TopicCategory.REFERENCE,
+        "release_notes": TopicCategory.RELEASE_NOTES,
+        "best_practices": TopicCategory.BEST_PRACTICES,
+        "security": TopicCategory.SECURITY,
+        "research": TopicCategory.RESEARCH,
+        "community": TopicCategory.COMMUNITY,
+    }
+
+    normalized_priority = _normalize_scout_priority(request.priority)
+    normalized_category = _normalize_scout_category(request.category)
+
+    topic = LearningTopic(
+        topic_id="",
+        title=request.topic,
+        description=f"Topic: {request.topic}",
+        seed_urls=request.urls,
+        priority=priority_map[normalized_priority],
+        category=category_map[normalized_category],
+        metadata={
+            "added_by": request.added_by,
+            "source": "reactor_api",
+            **request.metadata,
+        },
+    )
+
+    queue = TopicQueue(TopicQueueConfig())
+    added = await queue.enqueue(topic, deduplicate=True)
+    stats = await queue.get_statistics()
+
+    if not added:
+        return ScoutTopicResponse(
+            added=False,
+            topic_id=topic.topic_id,
+            status="rejected",
+            queue_pending=stats.get("pending"),
+            reason="duplicate_or_queue_full",
+        )
+
+    logger.info(
+        f"[Scout] Queued topic: id={topic.topic_id}, priority={normalized_priority}, "
+        f"category={normalized_category}, added_by={request.added_by}"
+    )
+    return ScoutTopicResponse(
+        added=True,
+        topic_id=topic.topic_id,
+        status="queued",
+        queue_pending=stats.get("pending"),
+    )
+
+
+# ============================================================================
 # Experience Endpoints
 # ============================================================================
 
@@ -2582,6 +2736,7 @@ def main():
     print(f"    GET  /health                     - Health check")
     print(f"    GET  /api/v1/status              - Service status")
     print(f"    POST /api/v1/train               - Trigger training")
+    print(f"    POST /api/v1/scout/topics        - Queue Scout learning topic")
     print(f"    POST /api/v1/telemetry/ingest    - Ingest telemetry")
     print(f"    GET  /api/v1/scheduler/status    - Scheduler status")
     print(f"    GET  /api/v1/models/versions     - List model versions")
