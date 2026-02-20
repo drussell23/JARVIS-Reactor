@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -231,6 +232,7 @@ class StatusResponse(BaseModel):
     scheduler_running: bool = False
     health_aggregator_running: bool = False
     tier2_runtime: Dict[str, Any] = Field(default_factory=dict)
+    tier3_runtime: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Training ---
@@ -592,6 +594,8 @@ class TrainingJobManager:
 job_manager = TrainingJobManager()
 _tier2_orchestrator: Optional[Any] = None
 _tier2_orchestrator_load_failed = False
+_tier3_status_cache: Optional[Dict[str, Any]] = None
+_tier3_status_cache_time: float = 0.0
 
 
 def get_tier2_orchestrator() -> Optional[Any]:
@@ -614,6 +618,104 @@ def get_tier2_orchestrator() -> Optional[Any]:
         return None
 
     return _tier2_orchestrator
+
+
+def get_tier3_runtime_status(force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Build policy-driven status for optional Tier-3 training capabilities.
+
+    Tier-3 modules are intentionally optional and should be explicit in status
+    output so operators can verify what is available vs activated.
+    """
+    global _tier3_status_cache, _tier3_status_cache_time
+
+    refresh_interval = max(
+        1.0,
+        float(os.getenv("REACTOR_TIER3_STATUS_REFRESH_SECONDS", "60.0")),
+    )
+    now = time.time()
+    if (
+        not force_refresh
+        and _tier3_status_cache is not None
+        and (now - _tier3_status_cache_time) < refresh_interval
+    ):
+        return _tier3_status_cache
+
+    def _flag(name: str, default: str = "false") -> bool:
+        return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+    module_specs = {
+        "federated_learning": "reactor_core.training.federated_learning",
+        "fsdp_training": "reactor_core.training.fsdp_training",
+    }
+    module_availability: Dict[str, Dict[str, Any]] = {}
+    for module_name, module_path in module_specs.items():
+        available = importlib.util.find_spec(module_path) is not None
+        module_availability[module_name] = {
+            "module_path": module_path,
+            "available": available,
+        }
+
+    # Activation policy is explicit and environment-driven.
+    single_machine_mode = _flag("REACTOR_SINGLE_MACHINE_MODE", "true")
+    try:
+        cluster_nodes = int(os.getenv("REACTOR_CLUSTER_NODE_COUNT", "1"))
+    except ValueError:
+        cluster_nodes = 1
+    cluster_nodes = max(1, cluster_nodes)
+    gpu_count = 0
+    try:
+        import torch  # type: ignore
+
+        gpu_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        gpu_count = 0
+
+    federated_requested = _flag("REACTOR_TIER3_FEDERATED_ENABLED", "false")
+    federated_viable = cluster_nodes > 1 or _flag("REACTOR_TIER3_ALLOW_SINGLE_NODE_FEDERATED", "false")
+    federated_reason = (
+        "activated"
+        if (federated_requested and federated_viable)
+        else "inactive_single_node_policy"
+        if not federated_viable
+        else "disabled_by_policy"
+    )
+
+    fsdp_requested = _flag("REACTOR_TIER3_FSDP_ENABLED", "false")
+    fsdp_viable = gpu_count > 1 or _flag("REACTOR_TIER3_ALLOW_SINGLE_GPU_FSDP", "false")
+    fsdp_reason = (
+        "activated"
+        if (fsdp_requested and fsdp_viable)
+        else "inactive_insufficient_gpu"
+        if not fsdp_viable
+        else "disabled_by_policy"
+    )
+
+    status: Dict[str, Any] = {
+        "enabled": _flag("REACTOR_TIER3_ENABLED", "true"),
+        "single_machine_mode": single_machine_mode,
+        "cluster_nodes": cluster_nodes,
+        "gpu_count": gpu_count,
+        "modules": {
+            "federated_learning": {
+                **module_availability["federated_learning"],
+                "requested": federated_requested,
+                "active": federated_requested and federated_viable and module_availability["federated_learning"]["available"],
+                "policy_reason": federated_reason,
+            },
+            "fsdp_training": {
+                **module_availability["fsdp_training"],
+                "requested": fsdp_requested,
+                "active": fsdp_requested and fsdp_viable and module_availability["fsdp_training"]["available"],
+                "policy_reason": fsdp_reason,
+            },
+        },
+        "updated_at": datetime.now().isoformat(),
+    }
+
+    _tier3_status_cache = status
+    _tier3_status_cache_time = now
+    return status
 
 
 # ============================================================================
@@ -932,6 +1034,8 @@ async def health_check():
     services["scheduler"] = "running" if scheduler._running else "stopped"
     services["health_aggregator"] = "running" if health_agg._running else "stopped"
     services["tier2_runtime"] = "enabled" if get_tier2_orchestrator() else "disabled"
+    tier3_status = get_tier3_runtime_status()
+    services["tier3_runtime"] = "enabled" if tier3_status.get("enabled", False) else "disabled"
 
     return HealthResponse(
         status="healthy",
@@ -951,6 +1055,7 @@ async def get_status():
     health_agg = get_health_aggregator()
     tier2_orchestrator = get_tier2_orchestrator()
     tier2_status = tier2_orchestrator.get_status() if tier2_orchestrator else {"enabled": False}
+    tier3_status = get_tier3_runtime_status()
 
     return StatusResponse(
         healthy=True,
@@ -964,6 +1069,7 @@ async def get_status():
         scheduler_running=scheduler._running,
         health_aggregator_running=health_agg._running,
         tier2_runtime=tier2_status,
+        tier3_runtime=tier3_status,
     )
 
 
@@ -1104,6 +1210,12 @@ async def get_tier2_runtime_status():
     if not orchestrator:
         return {"enabled": False}
     return orchestrator.get_status()
+
+
+@app.get("/api/v1/training/tier3/status", tags=["Training"])
+async def get_tier3_status():
+    """Get Tier-3 optional capability status."""
+    return get_tier3_runtime_status(force_refresh=True)
 
 
 # ============================================================================
