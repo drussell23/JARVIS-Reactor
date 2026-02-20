@@ -662,6 +662,17 @@ class Tier2RuntimeOrchestrator:
             dtype=np.float64,
         )
 
+        def _ensure_variance(values: np.ndarray) -> np.ndarray:
+            if np.std(values) > 0:
+                return values
+            offsets = np.linspace(0.0, 1e-3, num=len(values), endpoint=False)
+            return values + offsets
+
+        prompt_lengths = _ensure_variance(prompt_lengths)
+        response_lengths = _ensure_variance(response_lengths)
+        diff_lengths = _ensure_variance(diff_lengths)
+        token_proxy = _ensure_variance(token_proxy)
+
         data = {
             "prompt_length": prompt_lengths,
             "response_length": response_lengths,
@@ -672,8 +683,24 @@ class Tier2RuntimeOrchestrator:
 
         graph = CausalGraph()
         try:
-            discovery = CausalDiscovery(method=os.getenv("REACTOR_TIER2_CAUSAL_METHOD", "pc"))
-            graph = await discovery.discover(data=data, variable_names=variable_names)
+            method = os.getenv("REACTOR_TIER2_CAUSAL_METHOD", "correlation").strip().lower()
+            if method in {"pc", "ges", "notears"}:
+                discovery = CausalDiscovery(method=method)
+                graph = await discovery.discover(data=data, variable_names=variable_names)
+            if not graph.edges:
+                threshold = _env_float("REACTOR_TIER2_CAUSAL_CORR_THRESHOLD", 0.15, 0.01)
+                for idx, source in enumerate(variable_names):
+                    for target in variable_names[idx + 1:]:
+                        corr = np.corrcoef(data[source], data[target])[0, 1]
+                        if np.isnan(corr):
+                            continue
+                        if abs(corr) > threshold:
+                            graph.add_edge(
+                                source,
+                                target,
+                                strength=float(abs(corr)),
+                                confidence=float(abs(corr)),
+                            )
         except Exception as exc:
             logger.debug("[Tier2Runtime] Causal discovery fallback engaged: %s", exc)
             for variable in variable_names:
