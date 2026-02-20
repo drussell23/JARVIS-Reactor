@@ -47,6 +47,27 @@ def _parse_path_list(value: str, default_paths: List[str]) -> List[str]:
     return normalized or list(default_paths)
 
 
+def _normalize_paths(paths: List[Any], default_paths: Optional[List[str]] = None) -> List[str]:
+    """Normalize path-like values to unique '/path' entries."""
+    normalized: List[str] = []
+    seen: set = set()
+    for item in paths:
+        if item is None:
+            continue
+        path = str(item).strip()
+        if not path or "://" in path:
+            continue
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if path in seen:
+            continue
+        seen.add(path)
+        normalized.append(path)
+    if normalized:
+        return normalized
+    return list(default_paths or [])
+
+
 class PrimeEventType(Enum):
     """Types of events from JARVIS Prime."""
     INTERACTION = "interaction"
@@ -211,6 +232,15 @@ class PrimeConnectorConfig:
     reconnect_interval: float = 5.0
     max_reconnect_attempts: int = 10
     ping_interval: float = 30.0
+    contract_paths: List[str] = field(
+        default_factory=lambda: _parse_path_list(
+            os.getenv("JARVIS_PRIME_CONTRACT_PATHS", ""),
+            ["/api/v1/integration/contracts/ws-events"],
+        )
+    )
+    contract_refresh_interval: float = field(
+        default_factory=lambda: float(os.getenv("JARVIS_PRIME_CONTRACT_REFRESH_INTERVAL", "30.0"))
+    )
 
     # Health polling fallback settings
     health_paths: List[str] = field(
@@ -285,6 +315,14 @@ class PrimeConnector:
         # Keep backwards compatibility with single-path configuration.
         if self.config.websocket_path and self.config.websocket_path not in self.config.websocket_paths:
             self.config.websocket_paths.insert(0, self.config.websocket_path)
+        self.config.websocket_paths = _normalize_paths(self.config.websocket_paths, ["/ws/events"])
+        self.config.health_paths = _normalize_paths(self.config.health_paths, ["/health"])
+        self.config.contract_paths = _normalize_paths(
+            self.config.contract_paths,
+            ["/api/v1/integration/contracts/ws-events"],
+        )
+        if self.config.websocket_paths:
+            self.config.websocket_path = self.config.websocket_paths[0]
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -294,6 +332,9 @@ class PrimeConnector:
         self._callbacks: List[Callable[[PrimeEvent], None]] = []
         self._reconnect_count = 0
         self._ws_path_index = 0
+        self._contract_lock = asyncio.Lock()
+        self._contract_last_refresh: float = 0.0
+        self._ws_contract: Optional[Dict[str, Any]] = None
 
     @property
     def is_connected(self) -> bool:
@@ -312,6 +353,135 @@ class PrimeConnector:
                 timeout=aiohttp.ClientTimeout(total=self.config.timeout),
             )
         return self._session
+
+    @staticmethod
+    def _merge_path_preference(new_paths: List[str], existing_paths: List[str]) -> List[str]:
+        merged = list(new_paths)
+        for path in existing_paths:
+            if path not in merged:
+                merged.append(path)
+        return merged
+
+    def _apply_ws_contract(
+        self,
+        payload: Dict[str, Any],
+        source: str,
+    ) -> bool:
+        """Apply websocket/health contract data if present."""
+        if not isinstance(payload, dict):
+            return False
+
+        changed = False
+
+        ws_payload = payload.get("websocket")
+        ws_candidates: List[Any] = []
+        heartbeat_seconds: Optional[float] = None
+
+        if isinstance(ws_payload, dict):
+            if ws_payload.get("primary_path"):
+                ws_candidates.append(ws_payload.get("primary_path"))
+            if ws_payload.get("path"):
+                ws_candidates.append(ws_payload.get("path"))
+            if isinstance(ws_payload.get("paths"), list):
+                ws_candidates.extend(ws_payload.get("paths", []))
+            raw_heartbeat = ws_payload.get("heartbeat_seconds")
+            try:
+                if raw_heartbeat is not None:
+                    heartbeat_seconds = float(raw_heartbeat)
+            except (TypeError, ValueError):
+                heartbeat_seconds = None
+
+        if payload.get("websocket_path"):
+            ws_candidates.append(payload.get("websocket_path"))
+        if isinstance(payload.get("websocket_paths"), list):
+            ws_candidates.extend(payload.get("websocket_paths", []))
+
+        normalized_ws_paths = _normalize_paths(ws_candidates)
+        if normalized_ws_paths:
+            merged_ws = self._merge_path_preference(normalized_ws_paths, self.config.websocket_paths)
+            if merged_ws != self.config.websocket_paths:
+                self.config.websocket_paths = merged_ws
+                self._ws_path_index = 0
+                changed = True
+            if merged_ws and self.config.websocket_path != merged_ws[0]:
+                self.config.websocket_path = merged_ws[0]
+                self._ws_path_index = 0
+                changed = True
+
+        health_payload = payload.get("health")
+        health_candidates: List[Any] = []
+        if isinstance(health_payload, dict) and isinstance(health_payload.get("paths"), list):
+            health_candidates.extend(health_payload.get("paths", []))
+        if isinstance(payload.get("health_paths"), list):
+            health_candidates.extend(payload.get("health_paths", []))
+        normalized_health_paths = _normalize_paths(health_candidates)
+        if normalized_health_paths:
+            merged_health = self._merge_path_preference(normalized_health_paths, self.config.health_paths)
+            if merged_health != self.config.health_paths:
+                self.config.health_paths = merged_health
+                changed = True
+
+        integrations = payload.get("integration_contracts")
+        if isinstance(integrations, dict):
+            ws_contract_path = integrations.get("ws_events")
+            normalized_contract_paths = _normalize_paths([ws_contract_path])
+            if normalized_contract_paths:
+                merged_contract = self._merge_path_preference(
+                    normalized_contract_paths,
+                    self.config.contract_paths,
+                )
+                if merged_contract != self.config.contract_paths:
+                    self.config.contract_paths = merged_contract
+                    changed = True
+
+        if heartbeat_seconds is not None and heartbeat_seconds > 0:
+            if abs(self.config.ping_interval - heartbeat_seconds) > 0.001:
+                self.config.ping_interval = heartbeat_seconds
+                changed = True
+
+        if changed:
+            logger.info(
+                "Prime websocket contract applied (%s): ws_paths=%s, health_paths=%s, ping=%.1fs",
+                source,
+                self.config.websocket_paths,
+                self.config.health_paths,
+                self.config.ping_interval,
+            )
+        return changed
+
+    async def discover_ws_contract(self, force: bool = False) -> Optional[Dict[str, Any]]:
+        """Discover websocket contract advertised by JARVIS Prime."""
+        if not self.config.contract_paths:
+            return None
+
+        now = asyncio.get_running_loop().time()
+        async with self._contract_lock:
+            if (
+                not force
+                and self._ws_contract is not None
+                and (now - self._contract_last_refresh) < max(1.0, self.config.contract_refresh_interval)
+            ):
+                return self._ws_contract
+
+            session = await self._get_session()
+            self._contract_last_refresh = now
+
+            for contract_path in self.config.contract_paths:
+                try:
+                    url = urljoin(self.config.base_url, contract_path)
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            continue
+                        payload = await response.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            continue
+                        self._apply_ws_contract(payload, source=f"contract:{contract_path}")
+                        self._ws_contract = payload
+                        return payload
+                except Exception:
+                    continue
+
+            return None
 
     async def check_health(self) -> Dict[str, Any]:
         """
@@ -333,6 +503,7 @@ class PrimeConnector:
                         if isinstance(payload, dict):
                             payload.setdefault("_health_path", health_path)
                             payload.setdefault("_http_status", response.status)
+                            self._apply_ws_contract(payload, source=f"health:{health_path}")
                             return payload
                         return {
                             "status": "healthy" if response.status == 200 else "starting",
@@ -483,9 +654,41 @@ class PrimeConnector:
         if not self.config.enable_websocket:
             raise RuntimeError("WebSocket is disabled in configuration")
 
+        await self.discover_ws_contract(force=False)
+
         self._ws_state = ConnectionState.CONNECTING
         session = await self._get_session()
 
+        last_error = await self._attempt_websocket_connect(session)
+        if self._ws_state == ConnectionState.CONNECTED:
+            return
+
+        # If all paths failed due endpoint mismatch, refresh contract and retry once.
+        if last_error is not None and self._is_ws_contract_error(last_error):
+            logger.warning(
+                "Prime websocket endpoint mismatch detected; forcing contract refresh before retry"
+            )
+            try:
+                await self.check_health()
+            except Exception:
+                pass
+            await self.discover_ws_contract(force=True)
+            self._ws_state = ConnectionState.CONNECTING
+            last_error = await self._attempt_websocket_connect(session)
+            if self._ws_state == ConnectionState.CONNECTED:
+                return
+
+        self._ws_state = ConnectionState.FAILED
+        logger.error(f"Failed to connect WebSocket using all configured endpoints: {last_error}")
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("No websocket endpoints configured")
+
+    async def _attempt_websocket_connect(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> Optional[Exception]:
+        """Attempt WebSocket connection across known candidate URLs once."""
         last_error: Optional[Exception] = None
         for candidate_url in self._rotated_ws_urls():
             try:
@@ -504,21 +707,14 @@ class PrimeConnector:
                         break
 
                 logger.info(f"Connected to JARVIS Prime WebSocket at {candidate_url}")
-
-                # Start listening
                 self._ws_task = asyncio.create_task(self._ws_listener())
-                return
-            except Exception as e:
-                last_error = e
-                if self._is_ws_contract_error(e):
+                return None
+            except Exception as exc:
+                last_error = exc
+                if self._is_ws_contract_error(exc):
                     self._ws_path_index += 1
                 continue
-
-        self._ws_state = ConnectionState.FAILED
-        logger.error(f"Failed to connect WebSocket using all configured endpoints: {last_error}")
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("No websocket endpoints configured")
+        return last_error
 
     async def _ws_listener(self) -> None:
         """Listen for WebSocket messages."""
