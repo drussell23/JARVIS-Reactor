@@ -181,6 +181,28 @@ class ServerConfig:
 
 
 # ============================================================================
+# Training Mode
+# ============================================================================
+
+SUPPORTED_TRAINING_MODES = {"unified", "nightshift"}
+DEFAULT_TRAINING_MODE = os.getenv("REACTOR_TRAINING_MODE_DEFAULT", "unified").strip().lower()
+if DEFAULT_TRAINING_MODE not in SUPPORTED_TRAINING_MODES:
+    logger.warning(
+        f"Invalid REACTOR_TRAINING_MODE_DEFAULT='{DEFAULT_TRAINING_MODE}', falling back to 'unified'"
+    )
+    DEFAULT_TRAINING_MODE = "unified"
+
+
+def _normalize_training_mode(mode: Optional[str]) -> str:
+    """Normalize and validate training mode."""
+    normalized = (mode or DEFAULT_TRAINING_MODE).strip().lower()
+    if normalized not in SUPPORTED_TRAINING_MODES:
+        logger.warning(f"Unknown training mode '{mode}', using '{DEFAULT_TRAINING_MODE}'")
+        return DEFAULT_TRAINING_MODE
+    return normalized
+
+
+# ============================================================================
 # Request/Response Models
 # ============================================================================
 
@@ -216,7 +238,10 @@ class TrainingTriggerRequest(BaseModel):
     """Training trigger request."""
     experience_count: int = Field(default=0, ge=0)
     priority: str = Field(default="normal", pattern="^(low|normal|high|urgent|critical)$")
+    mode: str = Field(default=DEFAULT_TRAINING_MODE, pattern="^(unified|nightshift)$")
     sources: List[str] = Field(default=["jarvis_experience", "scout"])
+    resume: bool = Field(default=False)
+    nightshift: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     triggered_by: str = Field(default="api")
 
@@ -225,6 +250,7 @@ class TrainingJobResponse(BaseModel):
     """Training job response."""
     job_id: str
     status: str
+    mode: str = DEFAULT_TRAINING_MODE
     stage: str
     progress: float = 0.0
     created_at: str
@@ -239,6 +265,7 @@ class TrainingJobResponse(BaseModel):
 class PipelineStateResponse(BaseModel):
     """Pipeline state response."""
     run_id: str
+    mode: str = DEFAULT_TRAINING_MODE
     stage: str
     started_at: str
     last_updated: str
@@ -430,13 +457,16 @@ class TrainingJobManager:
         sources: List[str],
         metadata: Dict[str, Any],
         triggered_by: str,
+        mode: str = DEFAULT_TRAINING_MODE,
     ) -> Dict[str, Any]:
         """Create a new training job."""
         async with self._lock:
             job_id = str(uuid.uuid4())[:8]
+            normalized_mode = _normalize_training_mode(mode)
             job = {
                 "job_id": job_id,
                 "status": "queued",
+                "mode": normalized_mode,
                 "stage": "idle",
                 "progress": 0.0,
                 "created_at": datetime.now().isoformat(),
@@ -785,14 +815,16 @@ async def lifespan(app: FastAPI):
         if ServerConfig.SCHEDULER_ENABLED:
             async def training_callback(**kwargs):
                 """Callback for scheduled training."""
+                callback_mode = _normalize_training_mode(kwargs.get("mode"))
                 job = await job_manager.create_job(
                     experience_count=job_manager.get_experience_count(),
                     priority=kwargs.get("priority", "normal"),
                     sources=["scheduled"],
                     metadata=kwargs.get("metadata", {}),
                     triggered_by="scheduler",
+                    mode=callback_mode,
                 )
-                asyncio.create_task(run_training_pipeline(job["job_id"]))
+                asyncio.create_task(run_training_job(job["job_id"]))
                 return job
 
             scheduler = await init_scheduler(training_callback)
@@ -917,6 +949,7 @@ async def get_broadcaster_status():
 # ============================================================================
 
 @app.post("/api/v1/train", response_model=TrainingJobResponse, tags=["Training"])
+@app.post("/api/v1/training/trigger", response_model=TrainingJobResponse, tags=["Training"])
 async def trigger_training(
     request: TrainingTriggerRequest,
     background_tasks: BackgroundTasks,
@@ -937,21 +970,29 @@ async def trigger_training(
             )
 
     # Create the job
+    mode = _normalize_training_mode(request.mode)
+    metadata = dict(request.metadata)
+    if request.nightshift:
+        metadata["nightshift"] = request.nightshift
+    if request.resume:
+        metadata["nightshift_resume"] = True
+
     job = await job_manager.create_job(
         experience_count=request.experience_count or job_manager.get_experience_count(),
         priority=request.priority,
         sources=request.sources,
-        metadata=request.metadata,
+        metadata=metadata,
         triggered_by=request.triggered_by,
+        mode=mode,
     )
 
     logger.info(
         f"Training triggered: job_id={job['job_id']}, "
-        f"experiences={job['experience_count']}, priority={request.priority}"
+        f"experiences={job['experience_count']}, priority={request.priority}, mode={mode}"
     )
 
     # Start the job in background
-    background_tasks.add_task(run_training_pipeline, job["job_id"])
+    background_tasks.add_task(run_training_job, job["job_id"])
 
     # v3.1: Emit pipeline event for cross-repo tracing
     emit_pipeline_event(
@@ -961,6 +1002,7 @@ async def trigger_training(
             "experience_count": job["experience_count"],
             "priority": request.priority,
             "triggered_by": request.triggered_by,
+            "mode": mode,
         },
         correlation_id=job["job_id"],
     )
@@ -971,7 +1013,12 @@ async def trigger_training(
         await telemetry.ingest_event(TelemetryEvent(
             event_type=EventType.CUSTOM,
             source="training",
-            data={"action": "job_created", "job_id": job["job_id"], "priority": request.priority},
+            data={
+                "action": "job_created",
+                "job_id": job["job_id"],
+                "priority": request.priority,
+                "mode": mode,
+            },
         ))
 
     return TrainingJobResponse(**job)
@@ -1013,6 +1060,7 @@ async def get_pipeline_state():
 
     return PipelineStateResponse(
         run_id=job["job_id"],
+        mode=_normalize_training_mode(job.get("mode")),
         stage=job["stage"],
         started_at=job["started_at"] or job["created_at"],
         last_updated=datetime.now().isoformat(),
@@ -2312,6 +2360,189 @@ def write_experience_snapshot(
 # ============================================================================
 # Background Training Task
 # ============================================================================
+
+async def run_training_job(job_id: str) -> None:
+    """Dispatch a training job to the requested runtime mode."""
+    job = await job_manager.get_job(job_id)
+    if not job:
+        logger.error(f"[Pipeline] Job not found for dispatch: {job_id}")
+        return
+
+    mode = _normalize_training_mode(job.get("mode"))
+    if mode == "nightshift":
+        await run_nightshift_pipeline(job_id)
+        return
+
+    await run_training_pipeline(job_id)
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """Best-effort bool parser for config payloads."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if value is None:
+        return default
+    return bool(value)
+
+
+async def run_nightshift_pipeline(job_id: str) -> None:
+    """
+    Run NightShift full pipeline as a background training job.
+
+    This activates the end-to-end path:
+    scout -> ingest -> format -> distill -> train -> eval -> quantize -> deploy.
+    """
+    await job_manager.start_job(job_id)
+    job = await job_manager.get_job(job_id)
+    start_time = time.time()
+
+    async def update_status(stage: str, progress: float, message: str, status: str = "running") -> None:
+        await job_manager.update_progress(job_id, stage, progress)
+        await broadcaster.notify_training_status(
+            job_id=job_id,
+            status=status,
+            progress=progress,
+            stage=stage,
+            message=message,
+        )
+        await ws_manager.broadcast(f"training:{job_id}", {
+            "status": status,
+            "stage": stage,
+            "progress": progress,
+            "message": message,
+        })
+
+    try:
+        from reactor_core.orchestration.pipeline import (
+            DataSource,
+            NightShiftPipeline,
+            PipelineConfig,
+            PipelineStage,
+        )
+
+        metadata = dict(job.get("metadata") or {})
+        ns_cfg = metadata.get("nightshift", {})
+        if not isinstance(ns_cfg, dict):
+            ns_cfg = {}
+
+        config = PipelineConfig()
+
+        if job.get("sources"):
+            enabled_sources: set = set()
+            for raw_source in job["sources"]:
+                try:
+                    enabled_sources.add(DataSource(str(raw_source).strip().lower()))
+                except ValueError:
+                    logger.warning(f"[NightShift] Ignoring unknown source: {raw_source}")
+            if enabled_sources:
+                config.enabled_sources = enabled_sources
+
+        if "work_dir" in ns_cfg:
+            config.work_dir = Path(str(ns_cfg["work_dir"])).expanduser()
+            config.work_dir.mkdir(parents=True, exist_ok=True)
+        if "output_dir" in ns_cfg:
+            config.output_dir = Path(str(ns_cfg["output_dir"])).expanduser()
+            config.output_dir.mkdir(parents=True, exist_ok=True)
+        if "log_dir" in ns_cfg:
+            config.log_dir = Path(str(ns_cfg["log_dir"])).expanduser()
+            config.log_dir.mkdir(parents=True, exist_ok=True)
+        if "enable_distillation" in ns_cfg:
+            config.enable_distillation = _to_bool(ns_cfg.get("enable_distillation"), True)
+        if "skip_quantization" in ns_cfg:
+            config.skip_quantization = _to_bool(ns_cfg.get("skip_quantization"), False)
+        if "prime_enabled" in ns_cfg:
+            config.prime_enabled = _to_bool(ns_cfg.get("prime_enabled"), config.prime_enabled)
+        if "min_examples" in ns_cfg:
+            try:
+                config.min_examples = max(1, int(ns_cfg["min_examples"]))
+            except (TypeError, ValueError):
+                logger.warning(f"[NightShift] Invalid min_examples: {ns_cfg.get('min_examples')}")
+
+        stop_after = ns_cfg.get("stop_after")
+        if stop_after:
+            try:
+                config.stop_after = PipelineStage(str(stop_after).strip().lower())
+            except ValueError:
+                logger.warning(f"[NightShift] Invalid stop_after stage: {stop_after}")
+
+        skip_stages = ns_cfg.get("skip_stages")
+        if isinstance(skip_stages, list):
+            parsed_skip = []
+            for raw_stage in skip_stages:
+                try:
+                    parsed_skip.append(PipelineStage(str(raw_stage).strip().lower()))
+                except ValueError:
+                    logger.warning(f"[NightShift] Invalid skip stage: {raw_stage}")
+            if parsed_skip:
+                config.skip_stages = parsed_skip
+
+        pipeline = NightShiftPipeline(config)
+        stage_sequence = [
+            PipelineStage.SCOUTING,
+            PipelineStage.INGESTING,
+            PipelineStage.FORMATTING,
+            PipelineStage.DISTILLING,
+            PipelineStage.TRAINING,
+            PipelineStage.EVALUATING,
+            PipelineStage.QUANTIZING,
+            PipelineStage.DEPLOYING,
+        ]
+        progress_by_stage = {
+            stage.value: round(((index + 1) / len(stage_sequence)) * 95, 1)
+            for index, stage in enumerate(stage_sequence)
+        }
+        progress_by_stage[PipelineStage.IDLE.value] = 0.0
+        progress_by_stage[PipelineStage.COMPLETED.value] = 100.0
+        progress_by_stage[PipelineStage.FAILED.value] = 0.0
+
+        def on_progress(state: Any) -> None:
+            stage = state.stage.value if hasattr(state.stage, "value") else str(state.stage)
+            progress = progress_by_stage.get(stage, 0.0)
+            message = f"NightShift stage: {stage}"
+            asyncio.create_task(update_status(stage, progress, message))
+
+        def on_error(exc: Exception, stage: Any) -> None:
+            stage_name = stage.value if hasattr(stage, "value") else str(stage)
+            asyncio.create_task(
+                update_status(stage_name, progress_by_stage.get(stage_name, 0.0), str(exc), status="failed")
+            )
+
+        pipeline.set_progress_callback(on_progress)
+        pipeline.set_error_callback(on_error)
+
+        await update_status("initializing", 0.0, "NightShift pipeline initiated")
+        resume = _to_bool(metadata.get("nightshift_resume"), False) or _to_bool(ns_cfg.get("resume"), False)
+        result = await pipeline.run(resume=resume)
+
+        if not result.success:
+            error_message = result.error or "NightShift pipeline failed"
+            await update_status("failed", 0.0, error_message, status="failed")
+            await job_manager.fail_job(job_id, error_message)
+            return
+
+        final_state = result.final_state.to_dict() if result.final_state else {}
+        metrics = {
+            "mode": "nightshift",
+            "duration_seconds": result.duration_seconds,
+            "artifacts": result.artifacts,
+            "pipeline_metrics": result.metrics,
+            "final_state": final_state,
+            "total_time_seconds": time.time() - start_time,
+        }
+        await job_manager.complete_job(job_id, metrics)
+        await update_status("completed", 100.0, "NightShift pipeline complete", status="completed")
+
+    except asyncio.CancelledError:
+        await job_manager.cancel_job(job_id)
+        logger.warning(f"[NightShift] Cancelled: job_id={job_id}")
+        raise
+    except Exception as e:
+        error_message = str(e)
+        await job_manager.fail_job(job_id, error_message)
+        logger.error(f"[NightShift] Failed: job_id={job_id}, error={error_message}")
+
 
 async def run_training_pipeline(job_id: str):
     """
