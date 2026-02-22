@@ -2,7 +2,7 @@
 
 **The Nerves of the AGI OS — training, fine-tuning, experience collection, and model deployment**
 
-JARVIS Reactor (Reactor-Core) is the **training and learning layer** of the JARVIS AGI ecosystem. It provides ML training (DPO, RLHF, curriculum, meta-learning, world models, causal reasoning), model serving with hot-reload, experience collection from JARVIS Body, model deployment to JARVIS-Prime, and **Trinity Protocol** integration for cross-repo coordination. It is started either **standalone** (`run_reactor.py`) or by the **unified supervisor** in JARVIS (`python3 unified_supervisor.py`).
+JARVIS Reactor (Reactor-Core) is the **training and learning layer** of the JARVIS AGI ecosystem. It provides ML training (DPO, RLHF, curriculum, meta-learning, world models, causal reasoning), model serving with hot-reload, experience collection from JARVIS Body, model deployment to JARVIS-Prime, and **Trinity Protocol** integration for cross-repo coordination. As of **v244.0** (JARVIS Body-side), command lifecycle events now flow through TrinityEventBus providing richer training signals (intent, domain, execution outcomes) for DPO pair generation, and brain vacuum fallback properly classifies commands during J-Prime downtime (producing valid telemetry even during outages). It is started either **standalone** (`run_reactor.py`) or by the **unified supervisor** in JARVIS (`python3 unified_supervisor.py`).
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -65,8 +65,10 @@ JARVIS Reactor is a production-grade ML infrastructure combining:
 - [Version History](#version-history)
 - [Roadmap](#roadmap--next-phases)
   - [v242.0 — Training Data Pipeline Activation](#v2420--training-data-pipeline-activation-planned)
-  - [v243.0 — Ouroboros Training Support](#v2430--ouroboros-training-support-planned)
-  - [v244.0 — Continuous Learning Loop](#v2440--continuous-learning-loop-planned)
+  - [v243.0/v243.1 — Command Lifecycle Events + Event Bus Lifecycle](#-v2430v2431--command-lifecycle-events--event-bus-lifecycle-completed--jarvis-body-side) ✅
+  - [v244.0 — Startup Warning Root Fix + Brain Vacuum Classification](#-v2440--startup-warning-root-fix--brain-vacuum-classification-completed--jarvis-body-side) ✅
+  - [Ouroboros Training Support](#ouroboros-training-support-planned--future-version)
+  - [Continuous Learning Loop](#continuous-learning-loop-planned--future-version)
   - [v245.0 — Distributed Training on GCP](#v2450--distributed-training-on-gcp-planned)
 - [Links](#links)
 
@@ -1756,7 +1758,71 @@ The JARVIS Body Unified Agent Runtime will generate a new class of training data
 
 ---
 
-### v243.0 — Ouroboros Training Support (Planned)
+### ✅ v243.0/v243.1 — Command Lifecycle Events + Event Bus Lifecycle (COMPLETED — JARVIS Body-side)
+
+v243.0/v243.1 shipped as **Command Lifecycle Events and Event Infrastructure Lifecycle Management** in the JARVIS Body repo. This directly impacts Reactor Core because command lifecycle events create a new source of training data.
+
+**What this means for Reactor Core:**
+
+Command lifecycle events (`command.received`, `command.classified`, `command.completed`, `command.failed`) now flow through TrinityEventBus. NeuralMesh's Knowledge Graph subscribes to these events, building semantic memory of command patterns. This creates **richer training signals** for the DPO pipeline:
+
+```
+BEFORE v243.0:
+  User command → J-Prime inference → response
+  Training data: (query, response) pairs only
+
+AFTER v243.0:
+  User command → command.received event
+    → J-Prime inference → command.classified event
+      → Execution → command.completed/failed event
+  Training data: (query, response, intent, domain, execution_outcome, latency)
+
+  → Reactor Core TelemetryIngestor can now consume:
+    - Successful vs failed executions as quality signals
+    - Intent classification accuracy as routing feedback
+    - Domain distribution for curriculum learning
+    - Latency metrics for performance optimization
+```
+
+**Impact on Reactor Core training pipeline:**
+- **DPO pair quality improvement** — Command outcomes (success/failure) provide ground truth for preference pairs. A response that correctly classified `intent="action"` and executed successfully is a stronger "chosen" signal than one based solely on response text quality.
+- **Curriculum learning data** — Domain distribution from `command.classified` events enables data-driven curriculum: train on high-frequency domains first (general, system), then expand to rare domains (smart_home, media).
+- **Drift detection signals** — `command.failed` events with `intent` metadata enable per-domain quality monitoring. A spike in failures for `domain="workspace"` suggests the workspace model needs retraining.
+
+**Event infrastructure lifecycle (v243.1):**
+- TrinityEventBus explicitly started in Phase 4 (before any subscriber)
+- Health checks registered with HealthAggregator
+- Graceful shutdown in correct dependency order
+- Boot-order races eliminated (NeuralMesh no longer needs 10s retry)
+
+**Files modified (all in JARVIS Body repo):**
+- `unified_supervisor.py` — Event state tracking, explicit startup, health checks, shutdown
+- `backend/core/trinity_event_bus.py` — Command lifecycle event types
+- `backend/api/unified_command_processor.py` — Event emission at each command stage
+- `backend/neural_mesh/neural_mesh_coordinator.py` — Knowledge Graph subscription
+
+---
+
+### ✅ v244.0 — Startup Warning Root Fix + Brain Vacuum Classification (COMPLETED — JARVIS Body-side)
+
+v244.0 shipped in the JARVIS Body repo with three fix categories. The **brain vacuum classification fix** is most relevant to Reactor Core's training pipeline:
+
+**Brain Vacuum Classification Fix:**
+
+When J-Prime is unreachable, `_brain_vacuum_fallback()` in `jarvis_prime_client.py` now includes a classification prompt prefix. The fallback LLM (Claude/Gemini) outputs a `CLASSIFICATION: {"intent", "domain", "requires_action", "suggested_actions"}` line before its response. This means:
+
+- **Better training data during downtime** — Fallback responses now include proper intent/domain classification, not hardcoded `intent="answer"`. Telemetry events from brain vacuum periods produce valid DPO pairs.
+- **Action commands execute** — "Lock my screen" during J-Prime downtime returns `intent="action"` and actually executes, instead of becoming a text explanation.
+
+**Other v244.0 changes:**
+- 858 lines of dead code removed (orphaned tiered routing system)
+- Cloud SQL proxy startup reduced from ~47s to ~3-5s (learning_database initializes faster)
+
+**Impact on Reactor Core:** Faster Cloud SQL proxy startup means the `learning_database` (which stores voiceprints, command history, and training metadata) initializes sooner, reducing the window where telemetry events might be lost during boot.
+
+---
+
+### Ouroboros Training Support (Planned — Future Version)
 
 Support the training side of JARVIS self-programming:
 
@@ -1765,7 +1831,7 @@ Support the training side of JARVIS self-programming:
 - [ ] **Architect/Implementer specialization** — Fine-tune DeepSeek-R1-14B on architectural reasoning traces and Qwen-Coder-14B on code generation from plans, using Ouroboros interaction data.
 - [ ] **Constitutional AI for code** — Apply Constitutional AI training to code generation: "Is this code safe? Does it follow the existing patterns? Does it handle errors?"
 
-### v244.0 — Continuous Learning Loop (Planned)
+### Continuous Learning Loop (Planned — Future Version)
 
 - [ ] **Night Shift automation** — `NightShiftScheduler` already exists. Wire it to trigger DPO training runs during off-peak hours using accumulated telemetry.
 - [ ] **Concept drift detection** — `PageHinkleyDriftDetector` already exists. Monitor model performance metrics and trigger retraining when quality degrades.
