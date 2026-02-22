@@ -188,6 +188,23 @@ class TelemetryIngestor(AbstractIngestor):
         # Calculate confidence from metrics
         confidence = self._calculate_confidence(metrics, properties)
 
+        # v242.0: Parse Trinity classification metadata
+        routing = item.get("x_jarvis_routing", {})
+        if routing:
+            properties["phi_intent"] = routing.get("intent", "")
+            properties["phi_domain"] = routing.get("domain", "")
+            properties["phi_complexity"] = routing.get("complexity", "")
+            properties["phi_confidence"] = routing.get("confidence", 0.0)
+            properties["escalated_to_claude"] = routing.get("escalated", False)
+            properties["classifier_model"] = routing.get("classifier_model", "")
+            properties["generator_model"] = routing.get("generator_model", "")
+            properties["classification_ms"] = routing.get("classification_ms", 0)
+            properties["generation_ms"] = routing.get("generation_ms", 0)
+
+            # Override confidence with Phi's classification confidence
+            if routing.get("confidence"):
+                confidence = routing["confidence"]
+
         # Parse timestamp
         timestamp = item.get("_parsed_timestamp")
         if not timestamp:
@@ -198,6 +215,18 @@ class TelemetryIngestor(AbstractIngestor):
                 )
             except ValueError:
                 timestamp = datetime.now()
+
+        # Build tags list
+        interaction_tags = list(item.get("tags", [])) + [f"event:{event_type}"]
+
+        # v242.0: Tag escalated queries as DPO training candidates
+        if routing.get("escalated"):
+            interaction_tags.append("escalated")
+            interaction_tags.append(
+                f"escalation_domain:{routing.get('domain', 'unknown')}"
+            )
+            # This is a DPO training signal: local model couldn't handle it
+            properties["dpo_candidate"] = True
 
         return RawInteraction(
             timestamp=timestamp,
@@ -212,7 +241,7 @@ class TelemetryIngestor(AbstractIngestor):
             outcome=outcome,
             confidence=confidence,
             properties=properties,
-            tags=list(item.get("tags", [])) + [f"event:{event_type}"],
+            tags=interaction_tags,
             environment=self._extract_environment(properties),
         )
 
