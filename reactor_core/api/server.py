@@ -217,6 +217,9 @@ class HealthResponse(BaseModel):
     services: Dict[str, str] = Field(default_factory=dict)
     pipeline_active: bool = False
     current_stage: Optional[str] = None
+    # v279.0: Contract parity with run_reactor.py health endpoint
+    training_ready: bool = False
+    trinity_connected: bool = False
 
 
 class StatusResponse(BaseModel):
@@ -1037,12 +1040,32 @@ async def health_check():
     tier3_status = get_tier3_runtime_status()
     services["tier3_runtime"] = "enabled" if tier3_status.get("enabled", False) else "disabled"
 
+    # v279.0: training_ready = core services running + job manager operational
+    core_services_running = (
+        telemetry._running
+        and scheduler._running
+        and health_agg._running
+    )
+    training_ready = core_services_running and status.get("initialized", True)
+
+    # v279.0: trinity_connected = check if Trinity experience receiver is healthy
+    trinity_connected = False
+    try:
+        from reactor_core.integration.trinity_experience_receiver import get_experience_receiver
+        receiver = await get_experience_receiver()
+        receiver_health = receiver.get_health()
+        trinity_connected = receiver_health.get("status") == "healthy"
+    except Exception:
+        pass
+
     return HealthResponse(
         status="healthy",
         timestamp=datetime.now().isoformat(),
         services=services,
         pipeline_active=status["pipeline_active"],
         current_stage=job_manager.jobs.get(status["current_job_id"], {}).get("stage") if status["current_job_id"] else None,
+        training_ready=training_ready,
+        trinity_connected=trinity_connected,
     )
 
 
