@@ -2049,6 +2049,37 @@ We welcome contributions! Please see our contributing guidelines:
 - **Type Hints**: Required for all functions
 - **Docstrings**: Google style
 
+## Autonomous Gmail Triage Integration (Nerves Role)
+
+Reactor-Core is the learning and adaptation layer for autonomous Gmail triage. It does not triage inboxes directly; it consumes outcome signals and feeds safe, bounded improvements back into scoring behavior.
+
+### Reactor-Core Responsibilities in Triage
+
+- Ingest behavioral outcomes (opened, replied, ignored, relabeled) with confidence controls.
+- Track sender/domain reputation and outcome distributions over time.
+- Drive bounded adaptive weight proposals for Body-side scoring.
+- Preserve auditability: explainable adaptation events, rollback capability, and deterministic safety bounds.
+
+### Cross-Repo Learning Loop
+
+```mermaid
+flowchart TD
+    A[Gmail triage decision in JARVIS Body] --> B[User behavior outcome observed]
+    B --> C[OutcomeCollector classification]
+    C --> D[Experience queue + reputation updates]
+    D --> E[Reactor-Core learning pipelines]
+    E --> F[Bounded adapted weights]
+    F --> G[Shadow validation + drift checks]
+    G --> H[Safe activation in Body scoring]
+```
+
+### What to Expect in Testing
+
+- Adaptation is not immediate/unsafe by default; it should run in bounded mode with guardrails.
+- Low-confidence outcomes are excluded from adaptation input.
+- Weight changes remain bounded (no runaway drift), and disagreements trigger rollback behavior.
+- User-facing notifications and UI delivery continue through Body-side channels; Reactor-Core influences prioritization quality over time.
+
 ## 📄 License
 
 MIT License - See [LICENSE](LICENSE) file for details.
