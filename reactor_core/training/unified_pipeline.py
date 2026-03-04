@@ -1347,8 +1347,23 @@ class UnifiedTrainingPipeline:
             raise ImportError("datasets required: pip install datasets")
 
         # Convert interactions to training format
+        # v300.0: Exclude INFRASTRUCTURE and DEFERRED outcomes from training.
+        # These represent policy/infra events (policy_denied, no_journal_lease)
+        # and unreconciled events (superseded) — not model quality signals.
+        from reactor_core.ingestion.base_ingestor import InteractionOutcome
+        _TRAINING_EXCLUDED_OUTCOMES = {
+            InteractionOutcome.INFRASTRUCTURE,
+            InteractionOutcome.DEFERRED,
+        }
+
         examples = []
+        _excluded = 0
         for interaction in interactions:
+            # Skip non-trainable autonomy events
+            if interaction.outcome in _TRAINING_EXCLUDED_OUTCOMES:
+                _excluded += 1
+                continue
+
             if interaction.user_input and interaction.assistant_output:
                 examples.append({
                     "messages": [
@@ -1357,6 +1372,9 @@ class UnifiedTrainingPipeline:
                     ],
                     "text": self._format_example(interaction),
                 })
+
+        if _excluded > 0:
+            logger.info("[Pipeline] Excluded %d infrastructure/deferred events from training", _excluded)
 
         if not examples:
             raise ValueError("No valid training examples found")

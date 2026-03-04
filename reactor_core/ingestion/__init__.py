@@ -25,6 +25,8 @@ from reactor_core.ingestion.feedback_ingestor import (
     FeedbackIngestor,
     AuthRecordIngestor,
 )
+from reactor_core.ingestion.autonomy_classifier import AutonomyEventClassifier
+from reactor_core.ingestion.autonomy_event_ingestor import AutonomyEventIngestor
 
 __all__ = [
     # Base types
@@ -41,4 +43,7 @@ __all__ = [
     "TelemetryIngestor",
     "FeedbackIngestor",
     "AuthRecordIngestor",
+    # Autonomy (Phase 2)
+    "AutonomyEventClassifier",
+    "AutonomyEventIngestor",
 ]

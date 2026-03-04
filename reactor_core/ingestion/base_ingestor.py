@@ -52,6 +52,7 @@ class InteractionOutcome(Enum):
     DISMISSED = "dismissed"
     DEFERRED = "deferred"
     CHALLENGED = "challenged"
+    INFRASTRUCTURE = "infrastructure"  # v300.0: Policy/infra events, not model quality
     UNKNOWN = "unknown"
 
 
