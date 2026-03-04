@@ -1110,6 +1110,88 @@ Reactor-Core is the **Nerves** in the three-repo Trinity architecture. It is **s
 - **Trinity Protocol:** Events and heartbeats flow via file IPC and/or WebSocket; Reactor participates in Trinity state sync and experience collection from JARVIS Body.
 - **DPO Training from Telemetry (v238.0+):** JARVIS Body's `TelemetryEmitter` captures every interaction — query, complexity classification, response, latency, and source. Reactor-Core uses this telemetry to build DPO preference pairs (e.g., chosen: `"10"`, rejected: `"Of course, the sum of five and five is ten..."`) for fine-tuning Mistral-7B. This training loop makes the v236.0/v238.0 adaptive prompt system's conciseness enforcement **permanent** — encoding terse-vs-detailed behavior in the model's weights instead of relying on prompt instructions. See the JARVIS-Prime README for the full training loop architecture.
 - **Voice Conversation Training Data (v238.0+):** JARVIS Body's real-time voice conversation pipeline generates a new class of training data: multi-turn conversation traces (20-turn sliding window sessions), barge-in events (proxy for response quality), turn detection accuracy logs, and conversation-mode-specific telemetry (`session_type: "conversation"`, `time_to_first_audio_ms`, `barge_in_count`). This data enables conversational DPO pairs (sustained-engagement vs. conversation-ending responses), conciseness training (shorter responses preferred in voice mode), and turn-detection classifier training (replacing the heuristic V1 with an ML-based V2). See v248.0 roadmap below.
+- **Autonomy Event Ingestion (Phase 2):** JARVIS Body emits 7 canonical autonomy lifecycle events (`intent_written`, `committed`, `failed`, `policy_denied`, `deduplicated`, `superseded`, `no_journal_lease`) through the existing experience forwarder. Reactor ingests these via `AutonomyEventIngestor` with strict validation (7 required metadata keys), composite-key deduplication (50K window), and disk-based quarantine for malformed events. The centralized `AutonomyEventClassifier` maps each event type to a training label — only `committed` and `failed` feed the training pipeline; infrastructure events (`policy_denied`, `no_journal_lease`) are excluded via `InteractionOutcome.INFRASTRUCTURE`.
+
+### Phase 2: Trinity Autonomy Wiring (Reactor Role)
+
+Reactor-Core serves as the **ingestion and classification layer** for autonomy events. It ensures only well-formed, non-duplicate, trainable events reach the training pipeline.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                REACTOR AUTONOMY ROLE                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Inbound (from Body via ExperienceForwarder):                    │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ ExperienceEvent (type=METRIC)                     │           │
+│  │   .metadata = {                                   │           │
+│  │       autonomy_event_type: "committed",           │           │
+│  │       autonomy_schema_version: "1.0",             │           │
+│  │       idempotency_key: "...",                     │           │
+│  │       trace_id: "...",                            │           │
+│  │       correlation_id: "...",                      │           │
+│  │       action: "workspace:send_email",             │           │
+│  │       request_kind: "autonomous"                  │           │
+│  │   }                                               │           │
+│  └─────────────────────┬────────────────────────────┘           │
+│                         │                                        │
+│                         ▼                                        │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ AutonomyEventIngestor                             │           │
+│  │                                                   │           │
+│  │   Step 1: VALIDATE                                │           │
+│  │   ├─ Check 7 required keys present               │           │
+│  │   ├─ Verify event_type ∈ known set               │           │
+│  │   ├─ Verify schema_version supported             │           │
+│  │   └─ Reject → quarantine to disk                 │           │
+│  │                                                   │           │
+│  │   Step 2: DEDUPLICATE                             │           │
+│  │   ├─ Composite key: (idempotency_key,            │           │
+│  │   │    autonomy_event_type, trace_id)             │           │
+│  │   ├─ 50K sliding window                           │           │
+│  │   └─ Duplicate → skip silently                    │           │
+│  │                                                   │           │
+│  │   Step 3: CLASSIFY                                │           │
+│  │   └─ AutonomyEventClassifier.classify()           │           │
+│  │       ├─ committed → POSITIVE (trainable=true)    │           │
+│  │       ├─ failed    → NEGATIVE (trainable=true)    │           │
+│  │       ├─ policy_denied → INFRASTRUCTURE (false)   │           │
+│  │       ├─ no_journal_lease → INFRASTRUCTURE (false)│           │
+│  │       ├─ deduplicated → NEUTRAL (false)           │           │
+│  │       ├─ intent_written → NEUTRAL (false)         │           │
+│  │       └─ superseded → NEUTRAL (false)             │           │
+│  │                                                   │           │
+│  │   Step 4: BUILD RawInteraction                    │           │
+│  │   └─ Passes to UnifiedPipeline                    │           │
+│  └──────────────────────┬───────────────────────────┘           │
+│                          │                                       │
+│                          ▼                                       │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │ UnifiedPipeline._build_dataset()                  │           │
+│  │                                                   │           │
+│  │   Training Exclusion Filter:                      │           │
+│  │   if outcome ∈ {INFRASTRUCTURE, DEFERRED}:        │           │
+│  │       skip (not trainable)                        │           │
+│  │   else:                                           │           │
+│  │       include in DPO/LoRA dataset                 │           │
+│  └──────────────────────────────────────────────────┘           │
+│                                                                   │
+│  Quarantine: ~/.jarvis/quarantine/autonomy_events/               │
+│    • Retention: 7 days                                            │
+│    • Max size: 100 MB                                             │
+│    • Alert threshold: 10 malformed events                        │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**New files:**
+- `reactor_core/ingestion/autonomy_classifier.py` — Centralized `AutonomyEventClassifier` (single source of truth for training eligibility)
+- `reactor_core/ingestion/autonomy_event_ingestor.py` — Full `AbstractIngestor` with validation, dedup, quarantine
+
+**Modified files:**
+- `reactor_core/ingestion/base_ingestor.py` — Added `INFRASTRUCTURE` to `InteractionOutcome` enum
+- `reactor_core/training/unified_pipeline.py` — Training exclusion filter for non-trainable outcomes
+- `reactor_core/ingestion/__init__.py` — Exports for new modules
 
 **run_reactor.py:**
 
