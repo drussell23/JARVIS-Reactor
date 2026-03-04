@@ -975,6 +975,11 @@ async def create_health_server(
             except Exception:
                 pass
 
+            # v300.0: Phase 2 — Expose autonomy schema version for boot
+            # contract validation by the unified supervisor.
+            health_data["autonomy_schema_version"] = "1.0"
+            health_data["contract_version"] = "1.0"
+
             return web.json_response(health_data)
 
         async def jobs_list_handler(request):
