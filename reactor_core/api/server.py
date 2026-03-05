@@ -167,7 +167,7 @@ def emit_pipeline_event(
 class ServerConfig:
     """API Server configuration."""
     HOST = os.getenv("REACTOR_CORE_HOST", "0.0.0.0")
-    PORT = int(os.getenv("REACTOR_CORE_PORT", "8003"))
+    PORT = int(os.getenv("REACTOR_PORT", os.getenv("REACTOR_CORE_PORT", "8090")))
     DEBUG = os.getenv("REACTOR_CORE_DEBUG", "false").lower() == "true"
     VERSION = "3.0.0"
 

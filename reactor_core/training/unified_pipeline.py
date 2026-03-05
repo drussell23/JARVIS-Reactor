@@ -931,16 +931,26 @@ class UnifiedTrainingPipeline:
                             dpo_model_path = Path(dpo_result["model_path"])
                             result.metrics["dpo_training_loss"] = dpo_result.get("final_loss", 0.0)
                             result.metrics["dpo_training_steps"] = dpo_result.get("total_steps", 0)
+                            result.metrics["dpo_skipped"] = False
                             logger.info(
                                 f"[Pipeline] DPO training complete: "
                                 f"{dpo_result.get('total_steps', 0)} steps, "
                                 f"loss={dpo_result.get('final_loss', 0):.4f}"
                             )
+                        else:
+                            result.metrics["dpo_skipped"] = True
+                            result.metrics["dpo_skip_reason"] = "dpo_training_returned_no_model"
                     else:
+                        result.metrics["dpo_skipped"] = True
+                        result.metrics["dpo_skip_reason"] = "lora_merge_failed"
                         logger.warning("[Pipeline] No mergeable model path for DPO — skipping DPO step")
                 except ImportError:
+                    result.metrics["dpo_skipped"] = True
+                    result.metrics["dpo_skip_reason"] = "dpo_trainer_not_available"
                     logger.info("[Pipeline] DPO trainer (advanced_training) not available — skipping DPO step")
                 except Exception as dpo_train_err:
+                    result.metrics["dpo_skipped"] = True
+                    result.metrics["dpo_skip_reason"] = f"dpo_training_error: {dpo_train_err}"
                     logger.warning(f"[Pipeline] DPO training failed (non-blocking, SFT model preserved): {dpo_train_err}")
 
             if not training_result.success:
