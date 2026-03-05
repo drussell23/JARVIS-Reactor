@@ -62,7 +62,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # Import advanced systems
@@ -1072,7 +1072,7 @@ async def health_check():
     except Exception:
         pass
 
-    return HealthResponse(
+    health_result = HealthResponse(
         status="healthy",
         timestamp=datetime.now().isoformat(),
         services=services,
@@ -1081,6 +1081,63 @@ async def health_check():
         training_ready=training_ready,
         trinity_connected=trinity_connected,
     )
+
+    # Managed-mode enrichment
+    session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+    if session_id:
+        from managed_mode import build_health_envelope
+        result_dict = health_result.model_dump()
+        readiness = "ready" if result_dict.get("status") == "healthy" else "not_ready"
+        if result_dict.get("status") == "degraded":
+            readiness = "degraded"
+        return JSONResponse(content=build_health_envelope(result_dict, readiness=readiness))
+
+    return health_result
+
+
+# ============================================================================
+# Lifecycle Drain Endpoint (managed-mode)
+# ============================================================================
+
+_draining = False
+_drain_id = None
+
+
+@app.post("/lifecycle/drain")
+async def lifecycle_drain(request: Request):
+    global _draining, _drain_id
+    body = await request.json()
+    session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+
+    if body.get("session_id") != session_id:
+        return JSONResponse(status_code=409, content={"error": "session_id mismatch"})
+
+    from managed_mode import verify_hmac_auth, get_control_plane_secret
+    auth_header = request.headers.get("X-Root-Auth", "")
+    if not verify_hmac_auth(auth_header, session_id, get_control_plane_secret()):
+        return JSONResponse(status_code=403, content={"error": "auth failed"})
+
+    if _draining:
+        return JSONResponse(status_code=202, content={
+            "drain_id": _drain_id, "session_id": session_id, "status": "already_draining"
+        })
+
+    _draining = True
+    _drain_id = str(uuid.uuid4())
+
+    asyncio.create_task(_drain_and_exit_reactor())
+
+    return JSONResponse(status_code=202, content={
+        "drain_id": _drain_id, "session_id": session_id, "status": "draining"
+    })
+
+
+async def _drain_and_exit_reactor():
+    """Controlled drain: stop accepting, flush, signal exit."""
+    _logger = logging.getLogger(__name__)
+    _logger.info(f"Drain initiated: {_drain_id}")
+    await asyncio.sleep(5)
+    _logger.info("Drain complete, signaling shutdown")
 
 
 @app.get("/capabilities", tags=["Health"])

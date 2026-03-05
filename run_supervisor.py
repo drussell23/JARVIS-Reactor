@@ -750,6 +750,10 @@ class SelfHealer:
         Returns:
             Tuple of (should_restart, delay_seconds)
         """
+        # Managed mode: never self-restart
+        if os.environ.get("JARVIS_ROOT_MANAGED", "").lower() == "true":
+            return (False, 0.0)
+
         count = self._restart_counts.get(component_name, 0)
 
         if count >= self.max_restarts:
