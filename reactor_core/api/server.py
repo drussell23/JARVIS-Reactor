@@ -425,6 +425,7 @@ class TrainingJobManager:
         self._persist_dir = Path(persist_dir) if persist_dir else Path.home() / ".jarvis" / "reactor_state"
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         self._load_jobs()
+        self._recover_stale_jobs()
 
     def _load_jobs(self) -> None:
         """Load persisted jobs from disk."""
@@ -437,6 +438,19 @@ class TrainingJobManager:
                     logger.info(f"[JobManager] Loaded {len(data)} persisted jobs")
             except Exception as e:
                 logger.warning(f"[JobManager] Failed to load jobs: {e}")
+
+    def _recover_stale_jobs(self) -> None:
+        """Transition any 'running' jobs to 'failed' — they were interrupted by a crash."""
+        recovered = 0
+        for job_id, job in self.jobs.items():
+            if job.get("status") == "running":
+                job["status"] = "failed"
+                job["error"] = "Process restarted while job was running (crash recovery)"
+                job["failed_at"] = datetime.now().isoformat()
+                recovered += 1
+        if recovered:
+            logger.warning(f"[JobManager] Crash recovery: marked {recovered} stale running job(s) as failed")
+            self._persist_jobs()
 
     def _persist_jobs(self) -> None:
         """Persist jobs to disk atomically."""
