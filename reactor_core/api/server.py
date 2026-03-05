@@ -1069,6 +1069,26 @@ async def health_check():
     )
 
 
+@app.get("/capabilities", tags=["Health"])
+async def get_capabilities():
+    """v310.0: Contract endpoint for supervisor version/capability negotiation."""
+    import hashlib as _hashlib
+
+    capabilities = ["event_bus", "trinity_bridge", "state_sync"]
+    cap_str = ",".join(sorted(capabilities))
+    cap_hash = _hashlib.sha256(cap_str.encode()).hexdigest()[:16]
+    schema_version = [0, 1, 0]
+    etag = f'"v{".".join(map(str, schema_version))}-{cap_hash}"'
+
+    return {
+        "provider_id": "reactor-core",
+        "capabilities": capabilities,
+        "schema_version": schema_version,
+        "capability_hash": f"sha256:{cap_hash}",
+        "etag": etag,
+    }
+
+
 @app.get("/api/v1/status", response_model=StatusResponse, tags=["Health"])
 async def get_status():
     """Get overall service status."""
