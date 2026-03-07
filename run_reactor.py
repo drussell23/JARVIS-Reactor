@@ -922,7 +922,7 @@ async def create_health_server(
 
         async def health_handler(request):
             """
-            v190.0: Enhanced health endpoint with semantic readiness detection.
+            v304.0: Enhanced health endpoint with semantic readiness detection.
 
             Returns detailed state information enabling intelligent readiness
             detection by the unified_supervisor:
@@ -931,21 +931,37 @@ async def create_health_server(
             - training_ready: True only when job manager is fully initialized
             - trinity_connected: Whether connected to Trinity mesh
             - phase: Current startup phase for progress tracking
+
+            v304.0 ROOT CAUSE FIX: Previously, training_ready required
+            is_running=True, which was only set after ALL initialization
+            including service registration and Trinity mesh connection.
+            This caused the supervisor to see training_ready=False for
+            10-30+ extra seconds after the training subsystem was actually
+            operational, often exceeding the startup timeout.
+
+            Now training_ready is True once the job manager is loaded and
+            the health server is accepting requests (startup_phase past
+            "starting_server"). Service registration and Trinity mesh
+            are supplementary — they enhance discoverability but are NOT
+            prerequisites for accepting training jobs.
             """
             is_running = state.get("running", False)
             startup_phase = state.get("startup_phase", "initializing")
 
-            # v190.0: training_ready is TRUE only when:
-            # 1. Service is running
-            # 2. Startup phase is "running" or "ready" (not "initializing")
-            # 3. Job manager is operational (tracked by startup completion)
-            training_ready = is_running and startup_phase in ("running", "ready", "operational")
+            # v304.0: training_ready = "can accept and process training jobs"
+            # True once health server is up and job manager is loaded, which
+            # is when startup_phase advances past "starting_server".
+            _SUBSYSTEM_READY_PHASES = (
+                "registering", "connecting_trinity",
+                "ready", "running", "operational",
+            )
+            training_ready = is_running or startup_phase in _SUBSYSTEM_READY_PHASES
 
             # Determine semantic status
-            if is_running and training_ready:
+            if training_ready:
                 status = "healthy"
-                phase = "ready"
-            elif is_running:
+                phase = "ready" if is_running else startup_phase
+            elif startup_phase in ("loading_jobs", "starting_server"):
                 status = "starting"
                 phase = startup_phase
             else:
@@ -1039,11 +1055,16 @@ async def create_health_server(
             bind_attempt += 1
             try:
                 # Wait for port availability before binding
+                # v304.0: Reduced from 15s to 5s. Port is already pre-checked
+                # by both the supervisor (_ensure_port_available) and reactor's
+                # own _check_port_available() in main(). A 5s wait is sufficient
+                # for any residual TIME_WAIT state to clear; 15s was consuming
+                # too much of the startup window.
                 port_available = await _wait_for_port_available(
                     config.host if config.host != "0.0.0.0" else "127.0.0.1",
                     actual_port,
-                    timeout=15.0,
-                    check_interval=1.0,
+                    timeout=5.0,
+                    check_interval=0.5,
                 )
 
                 if not port_available:
