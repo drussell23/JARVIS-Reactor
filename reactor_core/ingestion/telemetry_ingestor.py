@@ -62,6 +62,14 @@ EVENT_OUTCOME_MAP = {
     "VISION_OCR_EXECUTED": InteractionOutcome.PARTIAL,
     "FOLLOWUP_INITIATED": InteractionOutcome.PARTIAL,
     "LATENCY_RECORDED": InteractionOutcome.PARTIAL,
+
+    # Voice unlock / biometric authentication (v284.0 cross-repo telemetry)
+    # GRANTED = successful biometric auth → positive training signal for voice_unlock domain
+    # DENIED  = failed auth or routing error → negative signal / classifier correction
+    # ROUTING = routing decision metadata (which layer intercepted the command)
+    "auth.voice_unlock.granted": InteractionOutcome.SUCCESS,
+    "auth.voice_unlock.denied": InteractionOutcome.FAILURE,
+    "auth.voice_unlock.routing": InteractionOutcome.PARTIAL,
 }
 
 
