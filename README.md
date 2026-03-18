@@ -11,6 +11,47 @@ JARVIS Reactor (Reactor-Core) is the **training and learning layer** of the JARV
 
 ---
 
+## Session Update (2026-03-18): Voice Unlock Telemetry Integration and Ingestion Mapping
+
+This session extends Reactor-Core's Trinity ingestion surface so biometric unlock outcomes become first-class learning signals instead of being dropped or collapsed into generic events.
+
+### 1) New Telemetry Event Types (Body → Nerves Contract)
+
+`backend/core/telemetry/events.py` now defines three unlock-specific events:
+
+- `VOICE_UNLOCK_GRANTED`
+- `VOICE_UNLOCK_DENIED`
+- `VOICE_UNLOCK_ROUTING`
+
+These events distinguish route correctness from auth outcome, enabling cleaner causal analysis in training data.
+
+### 2) Body Emission Wiring
+
+`backend/api/unified_command_processor.py::_handle_voice_unlock_action()` now emits auth outcome telemetry after each unlock attempt using fire-and-forget semantics.
+
+- Preserves unlock UX latency while still producing training telemetry.
+- Captures both positive and negative authentication outcomes.
+
+### 3) Reactor Ingestion Classification
+
+`reactor_core/ingestion/telemetry_ingestor.py` now maps unlock event types to `InteractionOutcome` categories used by the training pipeline.
+
+This allows unlock routing/auth behavior to be represented in downstream datasets with consistent labels rather than ad hoc parsing.
+
+### 4) Training/Analytics Impact
+
+With unlock-specific event separation, Reactor can now support:
+
+- **Routing quality analysis:** detect cases where unlock intent took non-unlock routes before eventual correction.
+- **Auth outcome baselines:** track unlock grant/deny trends over time.
+- **Preference data hygiene:** avoid mixing biometric events into unrelated workspace/general quality metrics.
+
+### 5) Session Validation Context
+
+Cross-repo routing nuance tests for unlock phrasing completed with **50/50 pass rate** this session, indicating stable end-to-end routing for tested command variants.
+
+---
+
 ## What is JARVIS Reactor? (Trinity Role)
 
 | Role | Repository | Responsibility |
