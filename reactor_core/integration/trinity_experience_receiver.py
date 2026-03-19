@@ -526,6 +526,11 @@ EXPERIENCE_EVENT_TYPES = {
     "correction",
     "feedback",
     "experience_batch",
+    # v300.0+: CrossRepoExperienceForwarder event types from JARVIS
+    "workflow_completion",
+    "tier_routing_decision",
+    "tier_fallback",
+    "command_outcome",
 }
 
 
@@ -1145,6 +1150,40 @@ class TrinityExperienceReceiver:
                 "feedback_type": src.get("feedback_type", "implicit"),
                 "timestamp": src.get("timestamp", time.time()),
             }]
+        elif "input" in payload or "output" in payload:
+            # v300.0+: CrossRepoExperienceForwarder format
+            # input is a dict like {"command": "...", "intent": "...", "domain": "..."}
+            # output is a dict like {"response": "...", "status": "...", "assigned_agent": "..."}
+            input_data = payload.get("input", {})
+            output_data = payload.get("output", {})
+            user_input = ""
+            assistant_output = ""
+            if isinstance(input_data, dict):
+                user_input = (
+                    input_data.get("command", "")
+                    or input_data.get("query", "")
+                    or input_data.get("task_name", "")
+                    or str(input_data)[:200]
+                )
+            elif isinstance(input_data, str):
+                user_input = input_data
+            if isinstance(output_data, dict):
+                assistant_output = (
+                    output_data.get("response", "")
+                    or output_data.get("status", "")
+                    or output_data.get("assigned_agent", "")
+                    or str(output_data)[:200]
+                )
+            elif isinstance(output_data, str):
+                assistant_output = output_data
+            experiences = [{
+                "user_input": user_input,
+                "assistant_output": assistant_output,
+                "confidence": payload.get("confidence", 1.0),
+                "feedback_type": payload.get("feedback_type", "implicit"),
+                "timestamp": payload.get("timestamp", time.time()),
+                "metadata": payload.get("metadata", {}),
+            }]
 
         if not experiences:
             return
@@ -1182,6 +1221,32 @@ class TrinityExperienceReceiver:
                         "sequence": event.get("sequence_number", 0),
                         "source": event.get("source", "unknown"),
                     }
+
+                # v300.0+: Fallback for CrossRepoExperienceForwarder format
+                # where input/output are dicts with command/query/task info
+                if not normalized.get("user_input"):
+                    input_data = exp.get("input", {})
+                    if isinstance(input_data, dict):
+                        normalized["user_input"] = (
+                            input_data.get("command", "")
+                            or input_data.get("query", "")
+                            or input_data.get("task_name", "")
+                            or str(input_data)[:200]
+                        )
+                    elif isinstance(input_data, str):
+                        normalized["user_input"] = input_data
+
+                if not normalized.get("assistant_output"):
+                    output_data = exp.get("output", {})
+                    if isinstance(output_data, dict):
+                        normalized["assistant_output"] = (
+                            output_data.get("response", "")
+                            or output_data.get("status", "")
+                            or output_data.get("assigned_agent", "")
+                            or str(output_data)[:200]
+                        )
+                    elif isinstance(output_data, str):
+                        normalized["assistant_output"] = output_data
 
                 # Skip empty experiences
                 if normalized["user_input"] and normalized["assistant_output"]:
