@@ -531,6 +531,11 @@ EXPERIENCE_EVENT_TYPES = {
     "tier_routing_decision",
     "tier_fallback",
     "command_outcome",
+    # v295.0: InteractiveBrainRouter + screen awareness + goal chaining
+    "screen_observation",          # vision query results (what JARVIS saw + description)
+    "task_chain_execution",        # multi-step goal chain outcomes from TaskChainExecutor
+    "brain_routing_decision",      # InteractiveBrainRouter selection events
+    "goal_inference_result",       # GoalInferenceAgent inference results per command
 }
 
 
