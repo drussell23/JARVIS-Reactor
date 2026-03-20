@@ -1833,21 +1833,40 @@ class AGISupervisor:
         return None
 
     def _get_jprime_start_command(self, path: Path) -> Optional[List[str]]:
-        """Get command to start J-Prime."""
-        candidates = [
-            path / "run_server.py",
+        """Get command to start J-Prime.
+
+        Priority order:
+        1. ``python -m jarvis_prime.server`` — canonical package entrypoint.
+           Exposes /v1/reason/* (Mind-Body protocol) required by MindClient.
+        2. ``jarvis_prime/server.py`` — direct file fallback.
+        3. ``run_server.py`` — legacy quick-start (historically missing /v1/reason).
+           Used only as last resort.
+
+        NOTE: run_server.py is intentionally last.  It lacked the /v1/reason
+        reasoning endpoints needed by JARVIS-AI-Agent's MindClient until v296.0.
+        The module invocation (python -m jarvis_prime.server) is always preferred.
+        """
+        base_args = ["--port", str(self.config.jprime_port), "--trinity"]
+
+        # Strategy 1: module invocation — robust, no file-path guessing.
+        if (path / "jarvis_prime" / "server.py").exists():
+            return [sys.executable, "-m", "jarvis_prime.server"] + base_args
+
+        # Strategy 2: direct file paths in correct capability priority order.
+        file_candidates = [
+            path / "jarvis_prime" / "server.py",
             path / "server.py",
             path / "main.py",
-            path / "jprime" / "server.py",
+            path / "run_server.py",  # last resort
         ]
-
-        for candidate in candidates:
+        for candidate in file_candidates:
             if candidate.exists():
-                return [
-                    sys.executable, str(candidate),
-                    "--port", str(self.config.jprime_port),
-                    "--trinity",
-                ]
+                logger.warning(
+                    "[J-Prime] Falling back to file-path launch: %s "
+                    "(module invocation preferred — check PYTHONPATH)",
+                    candidate,
+                )
+                return [sys.executable, str(candidate)] + base_args
 
         return None
 
