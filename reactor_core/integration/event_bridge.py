@@ -150,6 +150,13 @@ class EventType(Enum):
     TRINITY_ABORT_PLAN = "trinity_abort_plan"
     TRINITY_PLAN_COMPLETE = "trinity_plan_complete"
 
+    # Multi-agent workflow lifecycle events
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_STEP_STARTED = "workflow_step_started"
+    WORKFLOW_STEP_COMPLETED = "workflow_step_completed"
+    WORKFLOW_COMPLETED = "workflow_completed"
+    WORKFLOW_FAILED = "workflow_failed"
+
 
 @dataclass
 class CrossRepoEvent:
