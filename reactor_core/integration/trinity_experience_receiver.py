@@ -536,6 +536,11 @@ EXPERIENCE_EVENT_TYPES = {
     "task_chain_execution",        # multi-step goal chain outcomes from TaskChainExecutor
     "brain_routing_decision",      # InteractiveBrainRouter selection events
     "goal_inference_result",       # GoalInferenceAgent inference results per command
+    # v295.0: Real-time vision action loop experience types
+    "vision_action_outcome",       # per-action success/failure + full provenance
+    "scene_graph_accuracy",        # L1 cache hit rate, position accuracy
+    "vision_model_performance",    # per-model accuracy, latency, confidence calibration
+    "knowledge_fabric_health",     # partition hit ratios, sync lag, merge conflicts
 }
 
 
