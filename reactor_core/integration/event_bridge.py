@@ -157,6 +157,15 @@ class EventType(Enum):
     WORKFLOW_COMPLETED = "workflow_completed"
     WORKFLOW_FAILED = "workflow_failed"
 
+    # Dynamic Agent Synthesis events (DAS) — mirrors JARVIS cross_repo.py
+    AGENT_SYNTHESIS_REQUESTED       = "agent_synthesis_requested"
+    AGENT_SYNTHESIS_CANARY_ACTIVE   = "agent_synthesis_canary_active"
+    AGENT_SYNTHESIS_COMPLETED       = "agent_synthesis_completed"
+    AGENT_SYNTHESIS_FAILED          = "agent_synthesis_failed"
+    CAPABILITY_GAP_UNRESOLVED       = "capability_gap_unresolved"
+    AGENT_SYNTHESIS_CONFLICT        = "agent_synthesis_conflict"
+    ROUTING_OSCILLATION_DETECTED    = "routing_oscillation_detected"
+
 
 @dataclass
 class CrossRepoEvent:
