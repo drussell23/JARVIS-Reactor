@@ -380,10 +380,11 @@ class DPOPairGenerator:
             normalized = ' '.join(prompt.lower().split())
             # Hash for consistent grouping
             prompt_key = hashlib.md5(normalized.encode()).hexdigest()[:16]
-            # Store original prompt for output
-            if prompt_key not in groups:
-                groups[prompt_key] = []
-                groups[prompt_key]._original_prompt = prompt  # type: ignore
+            # The original prompt travels ON the candidate (_prompt, set at
+            # ingest). It cannot be stashed on the group: `groups[key]` is a
+            # plain list, and `list` has no __dict__, so assigning an
+            # attribute to it raises AttributeError and killed every run
+            # that reached this line with 2+ interactions.
             groups[prompt_key].append(candidate)
 
         return groups
@@ -440,9 +441,11 @@ class DPOPairGenerator:
         scored = [(self._score_candidate(c), c) for c in candidates]
         scored.sort(key=lambda x: x[0], reverse=True)  # Best first
 
-        original_prompt = getattr(candidates, '_original_prompt', '')
-        if not original_prompt:
-            original_prompt = getattr(candidates[0], '_prompt', '')
+        # Every candidate in the group carries the same prompt by
+        # construction (that is what grouped them), so read it off the
+        # first one. The previous `getattr(candidates, ...)` read an
+        # attribute off the LIST, which could never be set.
+        original_prompt = getattr(candidates[0], '_prompt', '')
 
         pairs = []
         seen_pairs = set()
@@ -459,8 +462,19 @@ class DPOPairGenerator:
                 if (better_score - worse_score) < self._config.min_score_difference:
                     continue
 
-                # Skip if same model (no preference signal)
-                if better.model_id and better.model_id == worse.model_id:
+                # Same model is only a missing signal when the OUTCOMES
+                # also match — then the ranking rests on confidence and
+                # latency noise, which is not a preference. When one
+                # response succeeded and the other failed, the signal is
+                # the outcome itself and the model identity is irrelevant:
+                # that is the self-improvement case (one local model, a
+                # good patch and a broken one for the same prompt), and
+                # skipping it discarded every pair such a corpus can make.
+                if (
+                    better.model_id
+                    and better.model_id == worse.model_id
+                    and better.outcome == worse.outcome
+                ):
                     continue
 
                 # Skip duplicate response text
