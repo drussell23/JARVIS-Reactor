@@ -86,6 +86,13 @@ class SchedulerConfig:
     CPU_THRESHOLD = float(os.getenv("SCHEDULER_CPU_THRESHOLD", "80.0"))
     MEMORY_THRESHOLD = float(os.getenv("SCHEDULER_MEMORY_THRESHOLD", "85.0"))
     GPU_THRESHOLD = float(os.getenv("SCHEDULER_GPU_THRESHOLD", "90.0"))
+    # VRAM OCCUPANCY, not GPU utilization. A resident LLM holds its weights
+    # while computing nothing between requests, so utilization reads ~0% at
+    # 89% VRAM. Admitting training there OOMs the card, so this is a
+    # separate gate with a tighter default.
+    GPU_MEMORY_THRESHOLD = float(
+        os.getenv("SCHEDULER_GPU_MEMORY_THRESHOLD", "85.0")
+    )
 
     # Experience triggers
     EXPERIENCE_THRESHOLD = int(os.getenv("SCHEDULER_EXP_THRESHOLD", "100"))
@@ -205,6 +212,17 @@ class ResourceSnapshot:
             return False, f"Memory usage too high: {self.memory_percent:.1f}%"
         if self.gpu_percent is not None and self.gpu_percent > SchedulerConfig.GPU_THRESHOLD:
             return False, f"GPU usage too high: {self.gpu_percent:.1f}%"
+        # Checked separately from gpu_percent: an idle-but-resident model is
+        # invisible to utilization and fatal to an admitted training job.
+        if (
+            self.gpu_memory_percent is not None
+            and self.gpu_memory_percent > SchedulerConfig.GPU_MEMORY_THRESHOLD
+        ):
+            return False, (
+                f"GPU memory too high: {self.gpu_memory_percent:.1f}% "
+                f"(threshold {SchedulerConfig.GPU_MEMORY_THRESHOLD:.1f}%) — "
+                "deferring, another model is resident"
+            )
         return True, "Resources available"
 
 
@@ -403,12 +421,21 @@ class ResourceMonitor:
         return snapshot
 
     async def _get_gpu_metrics(self) -> Tuple[Optional[float], Optional[float]]:
-        """Get GPU utilization metrics."""
+        """Get (gpu_utilization_pct, vram_occupancy_pct).
+
+        The second value is VRAM OCCUPANCY — memory.used / memory.total —
+        NOT nvidia-smi's ``utilization.memory``, which reports the percent
+        of time the memory bus was being read or written. Those diverge
+        exactly where it matters: a resident LLM between requests measured
+        ``utilization.memory=0`` while holding 29078/32607 MiB (89.2%).
+        Gating on the bandwidth figure admits a training job onto a card
+        with 3 GiB free.
+        """
         # Try nvidia-smi
         try:
             proc = await asyncio.create_subprocess_exec(
                 "nvidia-smi",
-                "--query-gpu=utilization.gpu,utilization.memory",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -417,8 +444,11 @@ class ResourceMonitor:
 
             if proc.returncode == 0:
                 line = stdout.decode().strip().split("\n")[0]
-                gpu_util, mem_util = map(float, line.split(","))
-                return gpu_util, mem_util
+                gpu_util, mem_used, mem_total = map(float, line.split(","))
+                vram_pct = (
+                    100.0 * mem_used / mem_total if mem_total > 0 else None
+                )
+                return gpu_util, vram_pct
         except Exception:
             pass
 
