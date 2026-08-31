@@ -101,10 +101,14 @@ def main(argv: list) -> int:
              "belongs to neither format.",
     )
     ap.add_argument(
-        "--gptq-backend", default="torch",
+        "--gptq-backend", default="triton",
         help="GPTQ kernel for a pre-quantized checkpoint. Default "
-             "'torch' needs no JIT and no CUDA toolkit; 'marlin' is "
-             "faster but must compile a torch extension.",
+             "'triton' compiles through Triton's own LLVM at runtime, so "
+             "it needs no nvcc, and it stays in 4-bit. 'torch' also needs "
+             "no compiler but DEQUANTISES to bf16, which destroys the very "
+             "number this script measures. 'marlin' is fastest but "
+             "JIT-builds a CUDA extension, which needs a toolkit that can "
+             "target this card.",
     )
     ap.add_argument("--json-out", default="")
     args = ap.parse_args(argv)
@@ -198,11 +202,24 @@ def main(argv: list) -> int:
     # pipeline will use.
     load_kw = {"device_map": {"": 0}, "low_cpu_mem_usage": True}
     if args.pre_quantized:
-        # Kernel selection ONLY -- not a re-quantization. GPTQModel
-        # auto-selects Marlin, which JIT-compiles a torch extension and needs
-        # a CUDA toolkit; this box has none (no nvcc, no /usr/local/cuda), so
-        # the load died with "Marlin torch.ops kernels are not properly
-        # installed ... CUDA_HOME environment variable is not set".
+        # Kernel selection ONLY -- not a re-quantization.
+        #
+        # GPTQModel auto-selects Marlin, which JIT-builds a CUDA extension:
+        # "Marlin torch.ops kernels are not properly installed ... CUDA_HOME
+        # environment variable is not set". Getting a compiler onto this box
+        # turned out to be a dead end in three directions, all recorded so
+        # nobody re-walks them:
+        #   * apt `nvidia-cuda-toolkit` on Ubuntu 26.04 installs nvcc 12.4,
+        #     and 12.4 does not know this card at all --
+        #     "nvcc fatal: Value 'sm_120' is not defined for option
+        #     'gpu-architecture'". Blackwell needs >= 12.8.
+        #   * NVIDIA publishes no apt repo for Ubuntu 26.04.
+        #   * the `nvidia-cuda-nvcc-cu12` wheel ships ptxas and headers but
+        #     NO nvcc binary.
+        # Triton needs none of it: it compiles through its own LLVM at
+        # runtime and, unlike the `torch` backend, keeps the weights in
+        # 4-bit -- which is the difference between a memory profile and a
+        # measurement of a dequantised model.
         #
         # The quantization parameters are COPIED FROM THE CHECKPOINT rather
         # than retyped, so this cannot silently describe a different
