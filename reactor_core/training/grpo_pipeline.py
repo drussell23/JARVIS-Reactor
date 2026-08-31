@@ -231,13 +231,24 @@ def build_lora_config(**overrides: Any) -> Any:
     changes which experts fire, which is the one part of a MoE whose
     balance ``router_aux_loss_coef`` is simultaneously trying to hold
     steady.
+
+    ``lora_dropout`` is 0.0 because on THIS architecture it is not a free
+    hyperparameter. A Qwen3 MoE keeps its expert MLPs as fused
+    ``nn.Parameter`` tensors, so peft adapts them through ``ParamWrapper``
+    rather than a Linear layer, and ParamWrapper rejects dropout outright:
+
+        ValueError: lora.ParamWrapper does not work with lora_dropout != 0.
+
+    That is a hard constructor failure, not a warning -- 0.05 meant the
+    trainer could never be built for the model this pipeline exists to
+    train. Overridable for dense models, where dropout does work.
     """
     from peft import LoraConfig  # noqa: PLC0415
 
     kw: Dict[str, Any] = dict(
         r=16,
         lora_alpha=32,
-        lora_dropout=0.05,
+        lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=[

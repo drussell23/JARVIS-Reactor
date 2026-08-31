@@ -92,6 +92,20 @@ def main(argv: list) -> int:
     ap.add_argument("--max-completion-length", type=int, default=256)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--no-qlora", action="store_true")
+    ap.add_argument(
+        "--pre-quantized", action="store_true",
+        help="the checkpoint is ALREADY 4-bit (GPTQ/AWQ): keep the LoRA "
+             "adapter but do NOT attach a BitsAndBytesConfig. Quantizing an "
+             "already-quantized checkpoint is not a no-op -- it either "
+             "errors or silently produces a model whose memory profile "
+             "belongs to neither format.",
+    )
+    ap.add_argument(
+        "--gptq-backend", default="torch",
+        help="GPTQ kernel for a pre-quantized checkpoint. Default "
+             "'torch' needs no JIT and no CUDA toolkit; 'marlin' is "
+             "faster but must compile a torch extension.",
+    )
     ap.add_argument("--json-out", default="")
     args = ap.parse_args(argv)
 
@@ -109,6 +123,7 @@ def main(argv: list) -> int:
 
     # Import late so the idle mark is honest.
     from trl import GRPOTrainer
+    from transformers import AutoConfig, AutoModelForCausalLM, GPTQConfig
     from reactor_core.training.grpo_pipeline import (
         build_grpo_config, build_lora_config, build_qlora_config,
         build_prompt_dataset,
@@ -157,12 +172,60 @@ def main(argv: list) -> int:
     )
     kw = {}
     if not args.no_qlora:
-        kw["quantization_config"] = build_qlora_config()
+        # A pre-quantized checkpoint carries its own quantization_config in
+        # config.json; transformers reads it from there. Passing a second
+        # one describes a conversion that is not happening.
+        if not args.pre_quantized:
+            kw["quantization_config"] = build_qlora_config()
         kw["peft_config"] = build_lora_config()
+    quant = ("pre-quantized (checkpoint)" if args.pre_quantized
+             else "bnb-nf4 (at load)" if not args.no_qlora else "none (bf16)")
+    print(f"  quantization: {quant}")
 
     print("loading (this is the long part) ...")
+    # Load EXPLICITLY rather than handing GRPOTrainer a model string.
+    #
+    # The string path lets transformers load with no `device_map`, so every
+    # shard is materialised in HOST ram and only then moved. For this
+    # checkpoint that also drags GPTQModel's Marlin repack through CPU, and
+    # it was measured killing the run outright:
+    #
+    #   Out of memory: Killed process (python) anon-rss:48216856kB
+    #
+    # 48.2 GiB against WSL's 47. The card was never the constraint -- the
+    # profile died before it could report one. `device_map` streams shard
+    # by shard straight to the GPU, which is also the placement the real
+    # pipeline will use.
+    load_kw = {"device_map": {"": 0}, "low_cpu_mem_usage": True}
+    if args.pre_quantized:
+        # Kernel selection ONLY -- not a re-quantization. GPTQModel
+        # auto-selects Marlin, which JIT-compiles a torch extension and needs
+        # a CUDA toolkit; this box has none (no nvcc, no /usr/local/cuda), so
+        # the load died with "Marlin torch.ops kernels are not properly
+        # installed ... CUDA_HOME environment variable is not set".
+        #
+        # The quantization parameters are COPIED FROM THE CHECKPOINT rather
+        # than retyped, so this cannot silently describe a different
+        # quantization than the weights actually carry. Only `backend` is
+        # ours.
+        src = getattr(AutoConfig.from_pretrained(args.model),
+                      "quantization_config", {}) or {}
+        if not isinstance(src, dict):
+            src = getattr(src, "to_dict", dict)()
+        load_kw["quantization_config"] = GPTQConfig(
+            bits=int(src.get("bits", 4)),
+            group_size=int(src.get("group_size", 128)),
+            desc_act=bool(src.get("desc_act", False)),
+            sym=bool(src.get("sym", True)),
+            backend=args.gptq_backend,
+        )
+        print(f"  gptq kernel backend: {args.gptq_backend} "
+              f"(bits={src.get('bits')} group_size={src.get('group_size')})")
+    elif "quantization_config" in kw:
+        load_kw["quantization_config"] = kw.pop("quantization_config")
+    model_obj = AutoModelForCausalLM.from_pretrained(args.model, **load_kw)
     trainer = GRPOTrainer(
-        model=args.model, reward_funcs=candidate_reward,
+        model=model_obj, reward_funcs=candidate_reward,
         args=cfg, train_dataset=ds, **kw,
     )
     mark("1. weights + adapter resident", marks)
@@ -197,7 +260,7 @@ def main(argv: list) -> int:
             "total_gib": total, "peak_gib": peak,
             "num_generations": args.num_generations,
             "max_completion_length": args.max_completion_length,
-            "qlora": not args.no_qlora,
+            "qlora": not args.no_qlora, "quantization": quant,
             "dataset_source": source, "steps_run": steps, "marks": marks,
         }, indent=2), encoding="utf-8")
         print(f"\n  wrote {args.json_out}")
