@@ -216,22 +216,27 @@ from reactor_core.utils import (
 
 # === PHASE 2 - ADVANCED FEATURES (v79.0-v80.0) ===
 
-# Advanced Data Processing (v80.0)
-from reactor_core.data import (
-    # Preprocessing
-    PreprocessingPipeline,
-    PreprocessingConfig,
-    QualityScorer,
-    DeduplicationStrategy,
-    # Synthetic Data
-    SyntheticDataGenerator,
-    SyntheticDataConfig,
-    AugmentationStrategy,
-    # Active Learning
-    ActiveLearningLoop,
-    ActiveLearningConfig,
-    SamplingStrategy,
-)
+# Advanced Data Processing (v80.0) -- NOT SHIPPED.
+#
+# This block imported PreprocessingPipeline / PreprocessingConfig /
+# QualityScorer / DeduplicationStrategy / SyntheticDataGenerator /
+# SyntheticDataConfig / AugmentationStrategy / ActiveLearningLoop /
+# ActiveLearningConfig / SamplingStrategy from `reactor_core.data`.
+# NONE of those classes exists anywhere in the repo, and
+# `reactor_core/data/` contains only `lineage.py` with no `__init__.py`.
+#
+# So `import reactor_core` raised ImportError unconditionally: the
+# package was entirely unimportable, and every module inside it --
+# dpo_pair_generator, the scheduler, the trainers -- was reachable only
+# by loading its file by path. That is why the audit scripts and the
+# training tests all use importlib tricks; they were working around a
+# dead package, not around a heavy dependency.
+#
+# Removed rather than stubbed: a placeholder class that satisfies the
+# import would let `from reactor_core import PreprocessingPipeline`
+# succeed and then fail at the call site, which is strictly harder to
+# diagnose than an honest AttributeError at import. Restore this block
+# alongside the subsystem if it is ever written.
 
 # Advanced Training (v79.0-v80.0)
 from reactor_core.training import (
@@ -615,16 +620,6 @@ __all__ = [
     "async_retry",
     # === PHASE 2 - ADVANCED FEATURES (v79.0-v80.0) ===
     # Advanced Data Processing
-    "PreprocessingPipeline",
-    "PreprocessingConfig",
-    "QualityScorer",
-    "DeduplicationStrategy",
-    "SyntheticDataGenerator",
-    "SyntheticDataConfig",
-    "AugmentationStrategy",
-    "ActiveLearningLoop",
-    "ActiveLearningConfig",
-    "SamplingStrategy",
     # Advanced Training - Curriculum Learning
     "CurriculumLearner",
     "CurriculumConfig",

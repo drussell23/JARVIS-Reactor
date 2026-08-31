@@ -58,6 +58,32 @@ def mark(label: str, marks: list) -> None:
           f"peak={v['peak']:6.2f}  free={f:6.2f} / {t:.1f} GiB")
 
 
+def _pad_to(ds, n: int):
+    """Repeat rows until the dataset can fill one step.
+
+    Only ever used to make the MEMORY measurement possible — repeating a
+    prompt teaches nothing, but the profile is asking what a step costs,
+    not what it learns.
+    """
+    from datasets import Dataset
+    rows = [ds[i] for i in range(len(ds))]
+    while len(rows) < n:
+        rows.append(rows[len(rows) % len(ds)])
+    return Dataset.from_list(rows)
+
+
+def _step_ran(trainer) -> bool:
+    """Did a real optimisation step happen?
+
+    `trainer.train()` returns happily after zero steps when the epoch
+    iterator is empty, so the peak must not be trusted without this.
+    """
+    try:
+        return int(getattr(trainer.state, "global_step", 0) or 0) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main(argv: list) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -106,12 +132,28 @@ def main(argv: list) -> int:
         source = "SYNTHETIC (corpus unusable)"
     print(f"  dataset source: {source}\n")
 
+    # A GRPO step consumes `per_device_train_batch_size *
+    # gradient_accumulation_steps` prompts, and that product must be
+    # divisible by num_generations. The shipping config uses accum=8 for
+    # memory; with a thin corpus that needs 8 prompts and, short of them,
+    # transformers logs "not a single sample in your epoch_iterator" and
+    # exits at step 0 — reporting a peak that is only the loaded weights.
+    # A profile that silently measures nothing is worse than no profile,
+    # so the batch is collapsed to exactly one real step and the dataset
+    # padded to fill it.
+    need = args.num_generations
+    if len(ds) < need:
+        ds = _pad_to(ds, need)
+        print(f"  padded dataset to {len(ds)} row(s) so one full step can run")
+
     cfg = build_grpo_config(
         output_dir="/tmp/grpo_profile",
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         max_steps=args.steps,
         num_train_epochs=1,
+        per_device_train_batch_size=args.num_generations,
+        gradient_accumulation_steps=1,
     )
     kw = {}
     if not args.no_qlora:
@@ -129,13 +171,22 @@ def main(argv: list) -> int:
     trainer.train()
     mark("2. peak during training step", marks)
 
+    steps = int(getattr(trainer.state, "global_step", 0) or 0)
     peak = max(m["peak"] for m in marks)
     total = p.total_memory / GIB
     print(f"\n=== VERDICT ===")
+    print(f"  optimisation steps run : {steps}")
+    if not _step_ran(trainer):
+        # The failure mode this guard exists for: train() returns cleanly
+        # after zero steps, and the "peak" is then just resident weights.
+        # Reporting that as a memory profile would be a fabricated result.
+        print("  *** NO STEP RAN — the numbers below are RESIDENT WEIGHTS ONLY,")
+        print("      not a training peak. Do not read them as a memory profile.")
     print(f"  peak allocated : {peak:.2f} GiB")
     print(f"  card total     : {total:.1f} GiB")
     print(f"  headroom       : {total - peak:.2f} GiB")
-    print(f"  fits           : {'YES' if peak < total * 0.92 else 'TIGHT/NO'}")
+    print(f"  fits           : "
+          f"{('YES' if peak < total * 0.92 else 'TIGHT/NO') if _step_ran(trainer) else 'UNKNOWN (no step)'}")
     print(f"  config         : n_gen={args.num_generations} "
           f"max_completion={args.max_completion_length} "
           f"qlora={not args.no_qlora}")
@@ -147,7 +198,7 @@ def main(argv: list) -> int:
             "num_generations": args.num_generations,
             "max_completion_length": args.max_completion_length,
             "qlora": not args.no_qlora,
-            "dataset_source": source, "marks": marks,
+            "dataset_source": source, "steps_run": steps, "marks": marks,
         }, indent=2), encoding="utf-8")
         print(f"\n  wrote {args.json_out}")
     return 0
