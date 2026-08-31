@@ -72,6 +72,63 @@ def test_extraction_reaches_through_the_envelope() -> None:
 
 
 # --------------------------------------------------------------------------
+# Reason KINDS dispatch exactly — ordering is not the contract
+# --------------------------------------------------------------------------
+
+
+def test_reason_kind_is_the_text_before_the_first_colon() -> None:
+    assert gv._reason_kind("syntax_error:line3/9") == "syntax_error"
+    assert gv._reason_kind("no_source_by_shape") == "no_source_by_shape"
+    assert gv._reason_kind("no_content:full_content") == "no_content"
+
+
+def test_a_declined_noop_outranks_broken_code() -> None:
+    """THE inversion this ladder exists to prevent.
+
+    A noop is a WELL-FORMED answer that happens to contain no code. If it
+    scores at or below broken Python, the reward is telling the model that
+    emitting garbage is no worse than correctly saying "already done" --
+    and GRPO will act on exactly that.
+    """
+    noop = gv.verify_static(json.dumps({
+        "schema_version": gv.SCHEMA_NOOP,
+        "reason": "target file is already present and complete",
+    }))
+    assert gv._reason_kind(noop.reason) == "no_source_by_shape"
+    for broken in (BROKEN_EARLY, BROKEN_LATE):
+        assert noop.score > gv.verify_static(env(broken)).score
+    # ...but delivering still beats declining.
+    assert gv.verify_static(env(GOOD)).score > noop.score
+
+def test_a_new_no_prefixed_reason_cannot_swallow_the_noop() -> None:
+    """The regression that the old prefix test allowed.
+
+    `no_source_by_shape` and `no_content:...` both begin `no_`. Under the
+    old `reason.startswith("no_")` branch the ONLY thing keeping them
+    apart was that the specific check sat above the generic one -- so
+    reordering two `if`s, or adding any further `no_*` reason, silently
+    scored a correct decline beneath broken code. Kinds are exact, so
+    membership is the contract and order is not.
+    """
+    assert "no_content" in gv._SHAPE_FAULTS
+    assert "no_source_by_shape" not in gv._SHAPE_FAULTS
+    # a hypothetical future reason sharing the prefix stays out of both
+    assert gv._reason_kind("no_candidates_at_all:x") == "no_candidates_at_all"
+    assert "no_candidates_at_all" not in gv._SHAPE_FAULTS
+
+
+def test_missing_content_is_a_shape_fault_not_a_syntax_fault() -> None:
+    payload = json.dumps({
+        "schema_version": gv.SCHEMA_FULL,
+        "candidates": [{"candidate_id": "c1", "file_path": "m.py",
+                        "rationale": "r"}],
+    })
+    ver, sources, reason = gv.extract_sources(payload)
+    assert sources == []
+    assert gv._reason_kind(reason) == "no_content"
+    assert gv.verify_static(payload).tier == 1
+
+# --------------------------------------------------------------------------
 # The fence: a presentation fault must not be scored as a code fault
 # --------------------------------------------------------------------------
 

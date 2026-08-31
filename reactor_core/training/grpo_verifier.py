@@ -240,7 +240,10 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
                 if isinstance(fv, str) and fv.strip():
                     sources.append(_strip_code_fence(fv))
     if not sources:
-        return ver, [], f"no_{content_key}"
+        # kind is `no_content`, NOT `no_<key>`: the old form made the kind
+        # depend on the schema's content key, which is what let it collide
+        # with `no_source_by_shape` under a prefix test.
+        return ver, [], f"no_content:{content_key}"
     return ver, sources, ""
 
 
@@ -280,6 +283,32 @@ def _grade_source(src: str) -> Tuple[float, str]:
     return min(1.0, 0.7 + 0.06 * min(defs, 5)), f"{defs}defs/{len(stmts)}stmt"
 
 
+def _reason_kind(reason: str) -> str:
+    """The stable KIND of a reason string: everything before the first ':'.
+
+    Reasons are `kind` or `kind:detail`. Dispatching on the kind is an
+    EXACT match, so adding a reason can never silently change how an
+    existing one is scored.
+
+    The previous version tested string PREFIXES, and the ordering that
+    made it correct was invisible: `no_source_by_shape` and
+    `no_full_content` both start `no_`, so the generic test swallowed the
+    noop and scored a correct decline BENEATH broken code -- teaching the
+    model to emit garbage rather than say "already done". It was fixed by
+    putting the specific check first, which works and stays working only
+    for as long as nobody reorders two `if`s or adds another `no_*`.
+    Exact kinds remove the hazard instead of documenting it.
+    """
+    return reason.split(":", 1)[0]
+
+
+#: Envelope parsed and named a shape, but does not satisfy it.
+_SHAPE_FAULTS = frozenset({"missing_keys", "candidates_empty", "no_content"})
+
+#: The extracted source is not usable Python.
+_SYNTAX_FAULTS = frozenset({"syntax_error", "uncompilable", "empty_module"})
+
+
 def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     """Tiers 0-3. Pure, sub-millisecond, never raises."""
     w = weights or TierWeights()
@@ -287,16 +316,15 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         ver, sources, reason = extract_sources(text)
         if ver is None:
             return Verdict(w.envelope * 0.2, 0, reason or "envelope_invalid")
-        if reason.startswith("unknown_schema_version"):
+        kind = _reason_kind(reason)
+        if kind == "unknown_schema_version":
             return Verdict(w.envelope, 0, reason, ver)
-        if reason == "no_source_by_shape":
+        if kind == "no_source_by_shape":
             # A noop or tool call is a WELL-FORMED answer that contains no
-            # code. Checked BEFORE the generic `no_` prefix below, which
-            # would otherwise swallow it (`no_source_by_shape` and
-            # `no_full_content` both start `no_`) and score a correct
-            # decline beneath broken code -- teaching the model to emit
-            # garbage rather than say "already done", which is the exact
-            # inversion this reward exists to prevent.
+            # code. It is its own KIND now, so no other reason can swallow
+            # it and score a correct decline beneath broken code -- the
+            # exact inversion this reward exists to prevent. That used to
+            # depend on this branch sitting above a `no_` prefix test.
             #
             # Placed at the SYNTAX ceiling: strictly below anything that
             # parses, level with a syntax error that got almost all the way.
@@ -304,9 +332,8 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
             # beats declining" without inviting the noop-spam that
             # qwen3-coder:30b produced 209 times in one soak.
             return Verdict(w.syntax, 1, reason, ver)
-        if reason.startswith("missing_keys") or reason == "candidates_empty" \
-                or reason.startswith("no_"):
-            # Envelope parsed and named a shape, but does not satisfy it.
+        # Envelope parsed and named a shape, but does not satisfy it.
+        if kind in _SHAPE_FAULTS:
             return Verdict(w.shape * 0.6, 1, reason, ver)
 
         # Tier 2/3 — the whole point: grade the extracted SOURCE.
@@ -314,7 +341,7 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         # Worst-file semantics: a multi-file candidate is only as valid as
         # its weakest file, because APPLY is all-or-nothing.
         score, why = min(graded, key=lambda g: g[0])
-        if score <= 0.0 or why.startswith(("syntax_error", "uncompilable", "empty")):
+        if score <= 0.0 or _reason_kind(why) in _SYNTAX_FAULTS:
             span = w.syntax - w.shape
             return Verdict(w.shape + span * score, 2, why, ver)
         span = w.substance - w.syntax
