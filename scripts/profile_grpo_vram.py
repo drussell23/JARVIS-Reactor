@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -109,6 +110,11 @@ def main(argv: list) -> int:
              "number this script measures. 'marlin' is fastest but "
              "JIT-builds a CUDA extension, which needs a toolkit that can "
              "target this card.",
+    )
+    ap.add_argument(
+        "--no-warmup", action="store_true",
+        help="skip the kernel warm-up. The measured peak then includes "
+             "Triton JIT compilation workspace, and the report says so.",
     )
     ap.add_argument("--json-out", default="")
     args = ap.parse_args(argv)
@@ -247,6 +253,43 @@ def main(argv: list) -> int:
     )
     mark("1. weights + adapter resident", marks)
 
+    if not args.no_warmup:
+        # Triton compiles its kernels on FIRST USE, through its own LLVM.
+        # That compile allocates scratch, and it would otherwise land
+        # inside the window this script exists to measure -- reporting
+        # compiler workspace as if it were training memory, on the single
+        # step we take. Force it to resolve here, then reset the peak so
+        # mark 2 is a clean training measurement.
+        #
+        # This is NOT a race fix: Triton compiles synchronously inside the
+        # forward pass and nothing else is running. It buys measurement
+        # fidelity, and it keeps an unbounded first-step compile out of a
+        # step someone may have wrapped in a timeout.
+        print("\nwarming up (compiling kernels; first pass is the slow one) ...")
+        t0 = time.time()
+        try:
+            tok = trainer.processing_class
+            m = trainer.model
+            enc = tok("def f():\n    return 1\n", return_tensors="pt")
+            enc = {k: v.to(m.device) for k, v in enc.items()}
+            with torch.no_grad():
+                m(**enc)
+            warm = {"ok": True, "seconds": round(time.time() - t0, 1)}
+            print(f"  kernels compiled in {warm['seconds']}s")
+        except Exception as exc:  # noqa: BLE001
+            # A warm-up must never decide the run. If it fails the step
+            # still runs; the peak then includes compilation, and the
+            # report SAYS so rather than passing a polluted number off as
+            # a clean one.
+            warm = {"ok": False, "seconds": round(time.time() - t0, 1),
+                    "error": f"{type(exc).__name__}: {exc}"[:160]}
+            print(f"  warm-up FAILED ({warm['error']}) -- "
+                  f"mark 2 will INCLUDE kernel compilation")
+        mark("1b. after warm-up", marks)
+        torch.cuda.reset_peak_memory_stats()
+    else:
+        warm = {"ok": False, "seconds": 0.0, "error": "skipped (--no-warmup)"}
+
     print("\nrunning one real GRPO step (generate x N, reward, backward) ...")
     trainer.train()
     mark("2. peak during training step", marks)
@@ -279,6 +322,7 @@ def main(argv: list) -> int:
             "max_completion_length": args.max_completion_length,
             "qlora": not args.no_qlora, "quantization": quant,
             "dataset_source": source, "steps_run": steps, "marks": marks,
+            "warmup": warm,
         }, indent=2), encoding="utf-8")
         print(f"\n  wrote {args.json_out}")
     return 0
