@@ -62,6 +62,7 @@ _ENV_ROLLBACK_TAG = "REACTOR_OLLAMA_ROLLBACK_TAG"
 _ENV_NUM_CTX = "REACTOR_OLLAMA_NUM_CTX"
 _ENV_CREATE_TIMEOUT_S = "REACTOR_OLLAMA_CREATE_TIMEOUT_S"
 _ENV_BIN = "REACTOR_OLLAMA_BIN"
+_ENV_DRAFT_MODEL = "REACTOR_OLLAMA_DRAFT_MODEL"
 
 _DEFAULT_HOST = "http://127.0.0.1:11434"
 _DEFAULT_TAG = "jprime-latest"
@@ -147,6 +148,7 @@ class OllamaDeployer:
         num_ctx: Optional[int] = None,
         gate: Optional[Any] = None,
         lease_factory: Optional[Callable[..., Any]] = None,
+        draft_model: Optional[str] = None,
     ) -> None:
         self.host = (host or _env_str(_ENV_HOST, _DEFAULT_HOST)).rstrip("/")
         self.tag = tag or _env_str(_ENV_TAG, _DEFAULT_TAG)
@@ -158,6 +160,13 @@ class OllamaDeployer:
         )
         self._gate = gate
         self._lease_factory = lease_factory
+        # Empty = no speculative decoding. Left empty by default because a
+        # draft model with a mismatched tokenizer is worse than none, and
+        # only the operator knows which pairing is valid.
+        self.draft_model = (
+            draft_model if draft_model is not None
+            else _env_str(_ENV_DRAFT_MODEL, "")
+        )
 
     def _lease(self, *, reason: str) -> Any:
         """Resolve the GPU lease context manager (lazily, see module note)."""
@@ -213,16 +222,35 @@ class OllamaDeployer:
             return []
 
     # -- helpers ----------------------------------------------------------
-    def build_modelfile(self, gguf_path: Path) -> str:
-        """Render the Modelfile. Kept pure so tests can assert on it."""
-        return (
-            f"FROM {gguf_path.resolve()}\n"
-            f"PARAMETER num_ctx {self.num_ctx}\n"
+    def build_modelfile(self, gguf_path: Path, *, draft_model: str = "") -> str:
+        """Render the Modelfile. Kept pure so tests can assert on it.
+
+        ``draft_model`` emits a ``DRAFT`` instruction for speculative
+        decoding. It is bound HERE, at deploy time, because DRAFT is a
+        Modelfile instruction baked into the tag -- not a per-request
+        option. The request-time counterpart is ``draft_num_predict``,
+        which belongs to the generation lane.
+
+        The caller is responsible for only passing a draft model that
+        shares the target's TOKENIZER: speculation verifies draft token
+        IDs, so a mismatched vocabulary does not merely perform badly, it
+        validates against the wrong symbols. On this host
+        qwen2.5-coder:7b (vocab pre=qwen2, BOS 151643) can draft for
+        qwen2.5-coder:32b, and CANNOT draft for qwen3.8:27b
+        (pre=qwen35, BOS 248044). qwen3.8 uses Multi-Token Prediction
+        instead -- self-speculative, no draft model, so no DRAFT line.
+        """
+        lines = [
+            f"FROM {gguf_path.resolve()}",
+            f"PARAMETER num_ctx {self.num_ctx}",
             # Deterministic generation: O+V's pipeline judges candidates by
             # whether they parse and pass tests, so sampling entropy here
             # is noise in the evaluation signal, not diversity.
-            "PARAMETER temperature 0\n"
-        )
+            "PARAMETER temperature 0",
+        ]
+        if draft_model:
+            lines.append(f"DRAFT {draft_model}")
+        return "\n".join(lines) + "\n"
 
     async def _gate_result(self, gguf_path: Path) -> Any:
         gate = self._gate
@@ -298,13 +326,36 @@ class OllamaDeployer:
             tmpdir = Path(tempfile.mkdtemp(prefix="reactor-modelfile-"))
             try:
                 modelfile = tmpdir / "Modelfile"
+                draft = self.draft_model
                 modelfile.write_text(
-                    self.build_modelfile(gguf_path), encoding="utf-8",
+                    self.build_modelfile(gguf_path, draft_model=draft),
+                    encoding="utf-8",
                 )
                 rc, out = await self._run(
                     ["create", self.tag, "-f", str(modelfile)],
                     timeout_s=timeout_s,
                 )
+                if rc != 0 and draft:
+                    # Speculative decoding is an OPTIMISATION. A tag that
+                    # will not build with a draft model must still ship
+                    # without one -- degrading to single-token generation
+                    # is strictly better than failing the deployment and
+                    # leaving O+V on the previous model.
+                    logger.warning(
+                        "[OllamaDeploy] create failed with DRAFT %s (rc=%d: "
+                        "%s) -- retrying without speculative decoding",
+                        draft, rc, out.strip()[:160],
+                    )
+                    res.checks.append(f"draft:rejected:{draft}")
+                    modelfile.write_text(
+                        self.build_modelfile(gguf_path), encoding="utf-8",
+                    )
+                    rc, out = await self._run(
+                        ["create", self.tag, "-f", str(modelfile)],
+                        timeout_s=timeout_s,
+                    )
+                elif draft:
+                    res.checks.append(f"draft:{draft}")
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 

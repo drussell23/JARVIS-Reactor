@@ -194,7 +194,7 @@ class _Recorder:
         return [c[0] for c in self.calls]
 
 
-def _deployer(rec: _Recorder, *, gate_ok=True, lease_held=True, **kw):
+def _deployer(rec, *, gate_ok=True, lease_held=True, **kw):
     d = OllamaDeployer(
         gate=_FakeGate(passed=gate_ok),
         lease_factory=_lease_factory(held=lease_held),
@@ -311,6 +311,75 @@ async def test_num_ctx_is_configurable(gguf: Path) -> None:
     d = _deployer(rec, num_ctx=8192)
     await d.deploy(gguf)
     assert "PARAMETER num_ctx 8192" in rec.modelfiles[0]
+
+
+# ---------------------------------------------------------------------------
+# Speculative decoding: DRAFT is bound at deploy time, and is optional
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_draft_model_emits_no_draft_line(gguf: Path) -> None:
+    rec = _Recorder(tags_before=[], tags_after=["jprime-latest:latest"])
+    await _deployer(rec).deploy(gguf)
+    assert "DRAFT" not in rec.modelfiles[0]
+
+
+@pytest.mark.asyncio
+async def test_draft_model_is_baked_into_the_tag(gguf: Path) -> None:
+    """DRAFT is a Modelfile instruction, not a per-request option."""
+    rec = _Recorder(tags_before=[], tags_after=["jprime-latest:latest"])
+    d = _deployer(rec, draft_model="qwen2.5-coder:7b")
+    res = await d.deploy(gguf)
+    assert res.ok is True
+    assert "DRAFT qwen2.5-coder:7b" in rec.modelfiles[0]
+    assert "draft:qwen2.5-coder:7b" in res.checks
+
+
+@pytest.mark.asyncio
+async def test_draft_rejection_degrades_to_single_token(gguf: Path) -> None:
+    """Speculation is an optimisation: a tag that will not build WITH a
+    draft must still ship without one, rather than leaving O+V stranded on
+    the previous model."""
+
+    class _DraftHostileRecorder(_Recorder):
+        async def run(self, args, timeout_s):
+            self.calls.append(tuple(args))
+            if args[0] == "create":
+                mf = Path(args[3])
+                body = mf.read_text(encoding="utf-8") if mf.is_file() else ""
+                self.modelfiles.append(body)
+                if "DRAFT" in body:
+                    return 1, "unknown instruction: DRAFT"
+                return 0, ""
+            return 0, ""
+
+    rec = _DraftHostileRecorder(
+        tags_before=[], tags_after=["jprime-latest:latest"],
+    )
+    d = _deployer(rec, draft_model="mismatched:7b")
+    res = await d.deploy(gguf)
+
+    assert res.ok is True, "deployment must survive a rejected draft"
+    assert len(rec.modelfiles) == 2, "expected a retry without DRAFT"
+    assert "DRAFT" in rec.modelfiles[0]
+    assert "DRAFT" not in rec.modelfiles[1]
+    assert "draft:rejected:mismatched:7b" in res.checks
+
+
+@pytest.mark.asyncio
+async def test_draft_model_read_from_env(
+    gguf: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REACTOR_OLLAMA_DRAFT_MODEL", "qwen2.5-coder:7b")
+    rec = _Recorder(tags_before=[], tags_after=["jprime-latest:latest"])
+    d = OllamaDeployer(
+        gate=_FakeGate(), lease_factory=_lease_factory(held=True),
+    )
+    d._run = rec.run          # type: ignore[method-assign]
+    d._tags = rec.tags        # type: ignore[method-assign]
+    await d.deploy(gguf)
+    assert "DRAFT qwen2.5-coder:7b" in rec.modelfiles[0]
 
 
 @pytest.mark.asyncio
