@@ -1,31 +1,30 @@
-"""GRPO rewards over O+V sibling groups, and the zero-variance trap.
+"""GRPO reward over sibling groups: verification is the signal.
 
-GRPO normalises rewards WITHIN a group: ``Â_i = (r_i - mean(r)) / std(r)``.
-When every sibling scores identically the standard deviation is 0 and the
-advantage is 0/0 — the degenerate case, and the common one here, because
-"all three candidates failed" is the modal outcome of a farming soak.
+The first version of this reward made `_score_candidate` primary. A live
+profiling run proved that wrong: its inputs (`outcome`, `confidence`,
+`latency_ms`) are columns of the DATASET ROW, so TRL hands the SAME
+metadata to every completion in a group. The scorer returned N identical
+values by construction, every group was flat before the model had said
+anything, and the run logged `rewards/candidate_reward/mean: None`,
+`loss: 0`, `grad_norm: 0`.
 
-The tempting fix is to subtract a penalty from the group. **That is
-arithmetically inert**: shifting every member by the same constant leaves
-the variance exactly where it was. Only a term that DIFFERS between
-siblings can produce a non-zero advantage.
+Those fields describe a historical generation, not the completion being
+scored. Verification of the completion is now the signal; the historical
+scorer survives only as a small nudge.
 
-So the tiebreaker is a real per-candidate measurement — structural
-severity — and when even that ties, the group is DROPPED rather than
-given a fabricated winner. Inventing a preference between
-indistinguishable answers is noise with a gradient attached, and it is
-the same failure the recorder already refuses when it labels an unseen
-outcome ``unknown`` instead of guessing.
+The structural LADDER lives in `grpo_verifier` and is tested in
+`test_grpo_verifier.py`. It is deliberately not duplicated here — it WAS
+duplicated once (as `structural_severity`), and two graders of the same
+candidate are two things free to disagree.
 
-Loaded by path: ``reactor_core/__init__`` imports ``PreprocessingPipeline``
-from ``reactor_core.data``, which contains only ``lineage.py`` — so the
-package raises ImportError and nothing inside it is reachable normally.
+Loaded by path so these tests do not depend on the package `__init__`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import statistics
 import sys
 from pathlib import Path
@@ -40,7 +39,22 @@ sys.modules["grpo_reward_under_test"] = grpo_reward
 _spec.loader.exec_module(grpo_reward)
 
 candidate_reward = grpo_reward.candidate_reward
-structural_severity = grpo_reward.structural_severity
+
+GOOD = "def page(items, n):\n    return items[:n]\n"
+BROKEN = "def broken(:\n" + "x = 1\n" * 20
+INERT = '"""just a docstring"""\n'
+
+
+def env(code: str) -> str:
+    """What the model ACTUALLY emits: the 2b.1 envelope, code inside.
+
+    Feeding bare Python would not resemble a completion, and testing a
+    grader on input it will never see is how the envelope-blind defect
+    survived in the first place.
+    """
+    return json.dumps({"schema_version": "2b.1", "candidates": [
+        {"candidate_id": "c1", "file_path": "m.py", "rationale": "r",
+         "full_content": code}]})
 
 
 def _advantage(rewards: List[Optional[float]]):
@@ -55,156 +69,105 @@ def _advantage(rewards: List[Optional[float]]):
     return [(v - m) / sd for v in vals]
 
 
-def _run(**kw):
-    n = len(kw["completions"])
-    kw.setdefault("outcome", ["failure"] * n)
-    kw.setdefault("confidence", [0.0] * n)
-    kw.setdefault("latency_ms", [1000.0] * n)
+def _run(codes: List[str], **kw):
+    """One group, with metadata IDENTICAL across siblings — the real case."""
+    n = len(codes)
+    kw.setdefault("outcome", ["partial"] * n)
+    kw.setdefault("confidence", [0.5] * n)
+    kw.setdefault("latency_ms", [115537.9] * n)
     kw.setdefault("model_id", ["qwen3-coder:30b"] * n)
     kw.setdefault("task_type", ["code_repair"] * n)
-    return asyncio.run(candidate_reward(**kw))
+    return asyncio.run(candidate_reward(completions=[env(c) for c in codes], **kw))
 
 
 # --------------------------------------------------------------------------
-# The severity ladder — the measurement that breaks ties
+# The defect this reward was rebuilt around
 # --------------------------------------------------------------------------
 
 
-def test_severity_is_a_ladder_not_a_boolean() -> None:
-    """A binary pass/fail is what CREATED the flat group.
+def test_identical_metadata_still_separates_on_code_quality() -> None:
+    """THE regression.
 
-    Grading has to be ordered, or it cannot separate two candidates that
-    the coarse label already called equal.
+    All three siblings carry the same outcome/confidence/latency, because
+    that is what TRL passes. Separation must come from the completions.
     """
-    empty = structural_severity("")
-    garbage = structural_severity("!!! not python")
-    inert = structural_severity('"""only a docstring"""\n')
-    stmts = structural_severity("x = 1\ny = 2\n")
-    real = structural_severity("def page(items, n):\n    return items[:n]\n")
-
-    assert empty.score < garbage.score < inert.score < stmts.score < real.score
-
-
-def test_a_late_syntax_error_outranks_an_early_one() -> None:
-    """Where the parse dies is real signal.
-
-    A file that fails on its last line got almost everything right; one
-    that fails on line 1 is not code. Both are "syntax_error" to a
-    boolean check.
-    """
-    late = structural_severity("def f():\n    return 1\n" * 20 + "def broken(:\n")
-    early = structural_severity("def broken(:\n" + "x = 1\n" * 40)
-    assert late.score > early.score
-    assert "syntax_error" in late.reason and "syntax_error" in early.reason
-
-
-def test_no_syntax_error_can_outrank_a_parsing_candidate() -> None:
-    """The bands must not overlap.
-
-    A nearly-complete broken file is still broken; ranking it above
-    working code would invert the thing being taught.
-    """
-    best_broken = structural_severity("x = 1\n" * 500 + "def broken(:\n")
-    worst_parsing = structural_severity("pass\n")
-    assert best_broken.score < worst_parsing.score
-
-
-def test_a_parsing_no_op_does_not_score_as_working_code() -> None:
-    """The Quine-class candidate: valid syntax, says nothing."""
-    assert structural_severity('"""doc"""\n').score < structural_severity(
-        "def f():\n    return 1\n"
-    ).score
-
-
-def test_severity_never_raises() -> None:
-    for bad in ("", "\x00\x01", "def f(:\n" * 500, ""):
-        s = structural_severity(bad)
-        assert 0.0 <= s.score <= 1.0
-
-
-# --------------------------------------------------------------------------
-# The zero-variance interceptor
-# --------------------------------------------------------------------------
-
-
-def test_a_normal_group_passes_through_untouched() -> None:
-    """When outcomes already differ, no tiebreak is needed or applied."""
-    r = _run(
-        completions=["def f(): return 1", "def g(): return 2", "broken(:"],
-        outcome=["success", "failure", "failure"],
-        confidence=[1.0, 0.0, 0.0],
-    )
-    assert all(x is not None for x in r)
-    assert _advantage(r) is not None
-
-
-def test_all_siblings_failed_but_differently_yields_a_real_advantage() -> None:
-    """THE trap. Same coarse label, genuinely different quality.
-
-    Without the tiebreak these three are identical to the scorer and the
-    group is wasted. With it, the difference is recovered from a
-    measurement rather than invented.
-    """
-    r = _run(completions=[
-        "def page(items, n):\n    return items[:n]\n" * 3 + "def x(:\n",  # late break
-        "def x(:\n" + "y = 1\n" * 40,                                     # early break
-        '"""nothing at all"""\n',                                         # inert
-    ])
-    assert all(x is not None for x in r), "group was dropped despite a real difference"
+    r = _run([GOOD, BROKEN, INERT])
+    assert all(x is not None for x in r), "group dropped despite differing code"
     adv = _advantage(r)
-    assert adv is not None, "still degenerate — the tiebreak did not separate them"
-    assert max(adv) - min(adv) > 0.5
+    assert adv is not None
+    assert adv[0] == max(adv), "best code did not get the highest advantage"
+    assert adv[1] == min(adv), "broken code did not get the lowest advantage"
 
 
-def test_identical_failures_are_dropped_not_fabricated() -> None:
-    """No signal exists, so none is invented.
+def test_history_alone_cannot_carry_a_group() -> None:
+    """With identical metadata the historical term is a constant.
 
-    Three byte-identical answers cannot have a best one. Returning a
-    manufactured ordering would train the model on noise.
+    A constant cannot create variance, so when verification ties the
+    group is dropped no matter what the history says.
     """
-    same = "def x(:\n"
-    r = _run(completions=[same, same, same])
-    assert r == [None, None, None]
+    assert _run([GOOD, GOOD, GOOD]) == [None, None, None]
 
 
-def test_identical_successes_are_also_dropped() -> None:
-    """Symmetry: a flat GOOD group is just as empty of preference."""
-    ok = "def page(items, n):\n    return items[:n]\n"
-    r = _run(completions=[ok, ok, ok], outcome=["success"] * 3, confidence=[1.0] * 3)
-    assert r == [None, None, None]
+def test_history_nudge_cannot_overturn_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nudge must stay a nudge.
+
+    Here history FAVOURS the broken candidate (success/1.0) and opposes
+    the good one (failure/0.0). Better code must still win, or the reward
+    is back to scoring a historical generation.
+    """
+    monkeypatch.setenv("REACTOR_GRPO_HISTORY_WEIGHT", "0.10")
+    r = _run([GOOD, BROKEN], outcome=["failure", "success"], confidence=[0.0, 1.0])
+    assert r[0] > r[1], "history overturned a verification difference"
+
+
+def test_history_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REACTOR_GRPO_HISTORY_WEIGHT", "0")
+    r = _run([GOOD, BROKEN])
+    assert all(x is not None for x in r)
+    assert r[0] > r[1]
+
+
+# --------------------------------------------------------------------------
+# The zero-variance rule
+# --------------------------------------------------------------------------
+
+
+def test_indistinguishable_group_is_dropped_not_fabricated() -> None:
+    """No signal exists, so none is invented."""
+    assert _run([BROKEN, BROKEN, BROKEN]) == [None, None, None]
 
 
 def test_a_uniform_shift_would_not_have_worked() -> None:
-    """Pins the arithmetic the design rests on.
+    """Pins the arithmetic the whole design rests on.
 
-    If the interceptor subtracted a constant instead of a per-candidate
-    measurement, variance would stay zero and the group would still be
-    degenerate. This asserts the property directly so nobody
-    "simplifies" the tiebreak into a flat penalty later.
+    A flat penalty leaves variance at zero. Only a per-candidate term
+    helps — which is why the verifier grades in BANDS rather than
+    pass/fail. Asserted directly so nobody "simplifies" it later.
     """
     flat = [0.5, 0.5, 0.5]
-    shifted = [v - 0.3 for v in flat]
-    assert _advantage(shifted) is None, (
-        "a uniform penalty leaves std=0 — only a per-candidate term helps"
-    )
-
-
-def test_tiebreak_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Off -> flat groups are dropped without the structural pass."""
-    monkeypatch.setenv("REACTOR_GRPO_STRUCTURAL_TIEBREAK", "false")
-    r = _run(completions=["def x(:\n", '"""doc"""\n', "y = 1\n"])
-    assert r == [None, None, None]
+    assert _advantage([v - 0.3 for v in flat]) is None
 
 
 def test_empty_group_is_handled() -> None:
     assert asyncio.run(candidate_reward(completions=[])) == []
 
 
-def test_single_completion_group_is_degenerate_by_definition() -> None:
-    """n=1 cannot support a group-relative advantage at all.
+def test_single_completion_cannot_support_an_advantage() -> None:
+    """n=1 is degenerate by definition — the state before sibling drawing."""
+    assert _advantage(_run([GOOD])) is None
 
-    Worth pinning: it is exactly the state the generation lane was in
-    before sibling drawing, and it is why GRPO needs n>=2.
-    """
-    r = _run(completions=["def f(): return 1"])
-    assert _advantage(r) is None
+
+@pytest.mark.parametrize("junk", [
+    [""], ["not json"], ["{}"], ["```"], ["null", "[]"],
+    ['{"schema_version": "2b.1"}', '{"candidates": []}'],
+])
+def test_malformed_completions_never_raise(junk: List[str]) -> None:
+    """A reward function that raises kills the whole training run."""
+    n = len(junk)
+    out = asyncio.run(candidate_reward(
+        completions=junk, outcome=["unknown"] * n, confidence=[0.5] * n,
+        latency_ms=[0.0] * n, model_id=["m"] * n, task_type=["t"] * n,
+    ))
+    assert len(out) == n

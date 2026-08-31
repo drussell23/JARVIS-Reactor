@@ -1,4 +1,4 @@
-"""GRPO reward functions over O+V candidates — the group IS the sibling draw.
+"""GRPO reward over O+V sibling groups — the group IS the sibling draw.
 
 ## Why GRPO and not more DPO
 
@@ -7,69 +7,64 @@ way: a pair needs two responses to ONE prompt plus a verdict that
 separates them, and the pipeline kept not producing both at once.
 
 GRPO does not need pairs. It needs prompts, generates ``num_generations``
-completions per prompt itself, and scores each with a reward function,
-normalising within the group:
+completions itself, and normalises reward within the group:
 
     Â_i = (r_i - mean(r)) / std(r)
 
-That is the shape O+V already produces. The group is the n>=3 sibling
-draw; the reward is the per-candidate VALIDATE verdict the orchestrator
-already computes. The pair requirement — the thing that has blocked every
-run — simply stops existing.
+The group is the n>=3 sibling draw. The reward is what
+:mod:`reactor_core.training.grpo_verifier` can establish about each
+completion. The pair requirement — the thing that blocked every run —
+stops existing.
 
-## The zero-variance trap, and why this does NOT fabricate variance
+## The reward measures the COMPLETION, and only the completion
 
-When every sibling gets the same reward (all three failed, the common
-case here) the group standard deviation is 0 and the advantage is 0/0.
-The tempting fix is to shift the whole group by some penalty. **That does
-nothing**: subtracting the same constant from every member leaves the
-variance exactly where it was. Only a term that DIFFERS between siblings
-can produce a non-zero advantage.
+The first version of this module made `_score_candidate` the primary
+signal. That was wrong, and a live profiling run proved it: its inputs
+(`outcome`, `confidence`, `latency_ms`) are columns of the DATASET ROW,
+so TRL hands the SAME metadata to every completion in a group. The
+scorer therefore returned N identical values by construction and every
+group was flat before the model had said anything. Those fields describe
+a historical generation, not the one being scored.
 
-So the tiebreaker has to be a real per-candidate MEASUREMENT, and
-:func:`structural_severity` is one — it grades how badly a candidate is
-broken, and two candidates that both "failed" usually fail differently
-(one does not parse at all, one parses but is a no-op, one truncates
-mid-function). That difference is genuine signal the coarse
-success/failure label threw away.
+Verification is primary. The historical scorer survives only as a small,
+env-tunable nudge for the case where two completions verify identically
+— weak evidence about the PROMPT, never enough to outrank a verification
+difference.
 
-And when it does not differ — three byte-identical failures, say — there
-is **no preference signal in that group at all**, and this returns
-``None`` to drop it. TRL's contract allows exactly that ("None excludes
-that sample from that reward function"). Manufacturing an advantage out
-of a tie would teach the model that one of two indistinguishable answers
-is better, which is noise presented as gradient. It is the same principle
-the trajectory recorder already states about labels: a mislabelled sample
-is worse than a missing one. A quiet group is a fact about the group, not
-a defect to paper over.
+## The zero-variance rule
+
+When every sibling scores the same, std is 0 and the advantage is 0/0.
+Shifting the whole group by a penalty is arithmetically inert: subtract
+the same constant from every member and the variance is exactly where it
+was. Only a term that DIFFERS between siblings can help, which is why the
+verifier grades in BANDS rather than pass/fail — two completions that
+both failed usually failed differently, and that difference is real
+signal a boolean discards.
+
+When they are genuinely indistinguishable, the group is DROPPED (TRL's
+contract: "None excludes that sample"). Manufacturing a winner between
+identical answers is noise with a gradient attached — the same refusal
+the trajectory recorder makes when it labels an unseen outcome
+``unknown`` rather than guessing. A quiet group is a fact about the
+group.
 """
 from __future__ import annotations
 
-import ast
-import asyncio
 import logging
 import os
-import statistics
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-#: Below this spread a group is treated as degenerate. Not exactly 0.0:
-#: float noise in the latency term produces spreads like 1e-17 that are
-#: not real signal but would pass an `== 0` test and yield an advantage of
-#: ~1e17 after division by a near-zero std.
+#: Below this spread a group is degenerate. Not exactly 0.0: float noise
+#: produces spreads like 1e-17 that are not signal but would pass an
+#: `== 0` test and then explode when divided by a near-zero std.
 _FLAT_EPS = 1e-6
 
-_ENV_TIEBREAK = "REACTOR_GRPO_STRUCTURAL_TIEBREAK"
-_ENV_TIEBREAK_WEIGHT = "REACTOR_GRPO_TIEBREAK_WEIGHT"
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+#: Weight of the HISTORICAL scorer, demoted from primary signal to a
+#: nudge. Its inputs describe a past generation, not the completion being
+#: scored — see the module docstring.
+_ENV_HISTORY_WEIGHT = "REACTOR_GRPO_HISTORY_WEIGHT"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -79,111 +74,41 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# ---------------------------------------------------------------------------
-# Structural severity — the per-candidate measurement that breaks flat groups
-# ---------------------------------------------------------------------------
+def _load_scorer() -> Any:
+    """Get ``(DPOConfig, DPOPairGenerator, ResponseCandidate)``.
 
+    Tries the package import, then falls back to loading
+    ``dpo_pair_generator`` BY PATH. The fallback earns its place: this
+    package's ``__init__`` was unimportable for a long time, and the
+    training modules must not become unusable again if it regresses.
+    ``dpo_pair_generator`` is stdlib-only and loads cleanly alone.
 
-@dataclass(frozen=True)
-class Severity:
-    """How badly one candidate is broken, and why.
-
-    ``score`` is in [0.0, 1.0], HIGHER IS BETTER, so it composes with the
-    reward directly rather than needing a sign flip at the call site.
-    """
-
-    score: float
-    reason: str
-
-    def __repr__(self) -> str:  # pragma: no cover — debugging aid
-        return f"Severity({self.score:.3f}, {self.reason!r})"
-
-
-def structural_severity(text: str) -> Severity:
-    """Grade a candidate's structural health from the text alone.
-
-    Deliberately a LADDER rather than a boolean, because the whole job of
-    this function is to separate candidates that a binary pass/fail
-    already declared equal. "Does not parse" and "parses but is empty" are
-    both failures and are not equally bad, and a file that dies on line 3
-    is more broken than one that dies on line 300 — the second got
-    almost everything right.
-
-    Cheap: one `ast.parse`, no imports, no execution. Pure; NEVER raises.
+    ONE loader, so the scorer is still imported from exactly one place.
     """
     try:
-        if text is None:
-            return Severity(0.0, "none")
-        body = str(text)
-        if not body.strip():
-            return Severity(0.0, "empty")
-
-        try:
-            tree = ast.parse(body)
-        except SyntaxError as exc:
-            # Where the parse died is a real gradient: a file that fails
-            # at the last line is nearly right; one that fails at line 1
-            # is not code at all. Normalised over the candidate's own
-            # length so long and short files are comparable.
-            total = max(1, body.count("\n") + 1)
-            line = int(getattr(exc, "lineno", 1) or 1)
-            reached = max(0.0, min(1.0, (line - 1) / total))
-            # Capped below the "parses" band so a syntax error can never
-            # outrank a candidate that actually compiles.
-            return Severity(0.05 + 0.25 * reached,
-                            f"syntax_error:line{line}/{total}")
-        except (ValueError, RecursionError) as exc:
-            return Severity(0.02, f"unparseable:{type(exc).__name__}")
-
-        # It compiles. Now grade what it CONTAINS -- a syntactically
-        # perfect empty module is a valid parse and a useless patch.
-        defs = sum(
-            1 for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        from reactor_core.training.dpo_pair_generator import (  # noqa: PLC0415
+            DPOConfig, DPOPairGenerator, ResponseCandidate,
         )
-        stmts = len(getattr(tree, "body", []) or [])
-        if stmts == 0:
-            return Severity(0.35, "parses:empty_module")
-        # A body that is only a docstring / `pass` / `...` parses and says
-        # nothing -- the Quine-class no-op the BG/SPEC filter also hunts.
-        inert = all(
-            isinstance(n, ast.Pass)
-            or (isinstance(n, ast.Expr)
-                and isinstance(getattr(n, "value", None), ast.Constant))
-            for n in tree.body
+        return DPOConfig, DPOPairGenerator, ResponseCandidate
+    except Exception:  # noqa: BLE001
+        import importlib.util as _ilu  # noqa: PLC0415
+        import pathlib  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+
+        name = "_reactor_dpo_pair_generator"
+        cached = _sys.modules.get(name)
+        if cached is not None:
+            return cached.DPOConfig, cached.DPOPairGenerator, cached.ResponseCandidate
+        spec = _ilu.spec_from_file_location(
+            name, pathlib.Path(__file__).with_name("dpo_pair_generator.py"),
         )
-        if inert:
-            return Severity(0.40, "parses:inert_body")
-        if defs == 0:
-            return Severity(0.60, f"parses:{stmts}stmt_no_defs")
-        # Saturating: past a handful of definitions "more" stops meaning
-        # "better", and rewarding size would reintroduce the length bias
-        # the SimPO loss is configured to remove.
-        return Severity(min(1.0, 0.70 + 0.06 * min(defs, 5)),
-                        f"parses:{defs}defs/{stmts}stmt")
-    except Exception as exc:  # noqa: BLE001 — a grader must never break training
-        logger.debug("structural_severity failed: %s", exc, exc_info=True)
-        return Severity(0.5, "grader_fault")
-
-
-async def structural_severities(texts: Sequence[str]) -> List[Severity]:
-    """Grade a whole group, off the event loop.
-
-    `ast.parse` on a multi-KB source file is CPU-bound, and a group is
-    `num_generations` of them. Awaiting them on the loop would stall the
-    trainer's other coroutines for the duration; a thread offload is what
-    makes this honestly asynchronous rather than an `async def` that
-    blocks anyway.
-    """
-    loop = asyncio.get_running_loop()
-    return await asyncio.gather(*(
-        loop.run_in_executor(None, structural_severity, t) for t in texts
-    ))
-
-
-# ---------------------------------------------------------------------------
-# The reward function TRL calls
-# ---------------------------------------------------------------------------
+        mod = _ilu.module_from_spec(spec)
+        # Register BEFORE exec: @dataclass resolves cls.__module__ through
+        # sys.modules, and a module absent from it raises on the first
+        # decorated class.
+        _sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod.DPOConfig, mod.DPOPairGenerator, mod.ResponseCandidate
 
 
 def _is_flat(values: Sequence[float]) -> bool:
@@ -195,48 +120,7 @@ def _is_flat(values: Sequence[float]) -> bool:
         return True
 
 
-def _load_scorer() -> Any:
-    """Get ``(DPOConfig, DPOPairGenerator, ResponseCandidate)``.
-
-    Tries the ordinary package import first, then falls back to loading
-    ``dpo_pair_generator`` BY PATH. The fallback is not defensive
-    paranoia: ``reactor_core/__init__`` imports ``PreprocessingPipeline``
-    from ``reactor_core.data``, which holds only ``lineage.py`` — so the
-    package raises ImportError on import and every module inside it is
-    unreachable through the normal path. ``dpo_pair_generator`` is
-    stdlib-only and loads cleanly on its own; the audit scripts and the
-    reactor tests already use this same by-path trick for the same
-    reason.
-
-    Kept as ONE loader so the scorer is still imported from exactly one
-    place — the point of reusing it at all.
-    """
-    try:
-        from reactor_core.training.dpo_pair_generator import (  # noqa: PLC0415
-            DPOConfig, DPOPairGenerator, ResponseCandidate,
-        )
-        return DPOConfig, DPOPairGenerator, ResponseCandidate
-    except Exception:  # noqa: BLE001 — broken package __init__, not our bug
-        import importlib.util as _ilu  # noqa: PLC0415
-        import pathlib  # noqa: PLC0415
-        import sys as _sys  # noqa: PLC0415
-
-        mod_name = "_reactor_dpo_pair_generator"
-        cached = _sys.modules.get(mod_name)
-        if cached is not None:
-            return cached.DPOConfig, cached.DPOPairGenerator, cached.ResponseCandidate
-        path = pathlib.Path(__file__).with_name("dpo_pair_generator.py")
-        spec = _ilu.spec_from_file_location(mod_name, path)
-        mod = _ilu.module_from_spec(spec)
-        # Register BEFORE exec: @dataclass resolves cls.__module__ through
-        # sys.modules, and a module absent from it raises AttributeError
-        # on the first decorated class.
-        _sys.modules[mod_name] = mod
-        spec.loader.exec_module(mod)
-        return mod.DPOConfig, mod.DPOPairGenerator, mod.ResponseCandidate
-
-
-def base_rewards(
+def history_rewards(
     completions: Sequence[str],
     *,
     outcome: Optional[Sequence[str]] = None,
@@ -245,16 +129,19 @@ def base_rewards(
     model_id: Optional[Sequence[str]] = None,
     task_type: Optional[Sequence[str]] = None,
 ) -> List[float]:
-    """Score each completion with the EXISTING DPO scorer.
+    """The EXISTING DPO scorer, applied to each row's historical metadata.
 
-    Reuses `DPOPairGenerator._score_candidate` rather than restating its
-    weights (outcome .50 / confidence .25 / specialist .15 / latency .10).
-    A second copy of that formula is a second thing to keep in step, and
-    the two would rank candidates differently the first time either moved.
+    Reused rather than restated: a second copy of its weights (outcome
+    .50 / confidence .25 / specialist .15 / latency .10) would rank
+    candidates differently the first time either moved.
+
+    Note what this can and cannot do. Within one group these values are
+    usually identical, because they come from the dataset row rather than
+    the completion — which is exactly why this is a nudge and not the
+    signal.
     """
     DPOConfig, DPOPairGenerator, ResponseCandidate = _load_scorer()
     gen = DPOPairGenerator(DPOConfig())
-    n = len(completions)
 
     def _at(seq: Optional[Sequence[Any]], i: int, default: Any) -> Any:
         try:
@@ -271,15 +158,13 @@ def base_rewards(
             outcome=str(_at(outcome, i, "unknown")),
             latency_ms=float(_at(latency_ms, i, 0.0) or 0.0),
             task_type=_at(task_type, i, None),
-            timestamp="",
-            event_id="",
+            timestamp="", event_id="",
         )
         try:
             out.append(float(gen._score_candidate(cand)))
         except Exception as exc:  # noqa: BLE001
             logger.debug("scorer fault on candidate %d: %s", i, exc)
             out.append(0.5)
-    _ = n
     return out
 
 
@@ -288,73 +173,68 @@ async def candidate_reward(
     prompts: Optional[Sequence[Any]] = None,  # noqa: ARG001 — TRL passes it
     **kwargs: Any,
 ) -> Optional[List[Optional[float]]]:
-    """TRL-compatible reward function over one group of sibling candidates.
+    """TRL-compatible reward over one group of sibling candidates.
 
-    Signature follows TRL's contract: keyword arguments, returning a list
-    of floats (or None entries) one per completion. Extra dataset columns
-    — ``outcome``, ``confidence``, ``latency_ms``, ``model_id``,
-    ``task_type`` — arrive through ``**kwargs`` and are exactly the fields
-    the trajectory corpus already carries.
+    Keyword-argument signature per TRL's contract, returning one float (or
+    None) per completion. Extra dataset columns arrive through
+    ``**kwargs`` and are exactly the fields the trajectory corpus carries.
 
-    Flow:
-
-    1. Score every sibling with the existing DPO scorer.
-    2. If the group is FLAT, add a structural-severity term. That term is
-       a per-candidate measurement, so it can separate siblings the coarse
-       success/failure label called equal — which is the only way to get a
-       non-zero advantage honestly.
-    3. If it is STILL flat, return ``None`` per sibling so TRL drops the
-       group. See the module docstring: inventing a winner between
-       indistinguishable answers is noise with a gradient attached.
+    1. Verify every completion — the primary and usually the only signal.
+    2. Add a small historical nudge, if configured.
+    3. If the group is still flat, return None per sibling and let TRL
+       drop it rather than fabricate a winner.
     """
     texts = [str(c or "") for c in (completions or [])]
     if not texts:
         return []
 
-    rewards = base_rewards(
-        texts,
-        outcome=kwargs.get("outcome"),
-        confidence=kwargs.get("confidence"),
-        latency_ms=kwargs.get("latency_ms"),
-        model_id=kwargs.get("model_id"),
-        task_type=kwargs.get("task_type"),
-    )
     log_metric = kwargs.get("log_metric")
     log_extra = kwargs.get("log_extra")
+
+    # Grades the CODE inside the envelope, in bands, across a tiered
+    # ladder (envelope -> shape -> syntax -> substance -> authority).
+    from reactor_core.training.grpo_verifier import verify_batch  # noqa: PLC0415
+
+    verdicts = await verify_batch(texts)
+    rewards: List[float] = [v.score for v in verdicts]
+    _emit(log_extra, "verify_reason", [v.reason for v in verdicts])
+    _emit(log_extra, "verify_tier", [v.tier for v in verdicts])
+    _emit(log_metric, "verify/mean_tier",
+          sum(v.tier for v in verdicts) / max(1, len(verdicts)))
+    _emit(log_metric, "verify/authoritative",
+          1.0 if any(v.authoritative for v in verdicts) else 0.0)
+
+    hist_w = _env_float(_ENV_HISTORY_WEIGHT, 0.10)
+    if hist_w > 0.0:
+        try:
+            hist = history_rewards(
+                texts,
+                outcome=kwargs.get("outcome"),
+                confidence=kwargs.get("confidence"),
+                latency_ms=kwargs.get("latency_ms"),
+                model_id=kwargs.get("model_id"),
+                task_type=kwargs.get("task_type"),
+            )
+            rewards = [r + hist_w * h for r, h in zip(rewards, hist)]
+        except Exception as exc:  # noqa: BLE001 — the nudge is optional
+            logger.debug("history nudge unavailable: %s", exc)
 
     if not _is_flat(rewards):
         _emit(log_metric, "reward/flat_group", 0.0)
         return list(rewards)
 
-    # ── Degenerate group: every sibling scored the same. ──
-    if not _env_flag(_ENV_TIEBREAK, True):
-        _emit(log_metric, "reward/flat_group", 1.0)
-        return [None] * len(texts)
-
-    sev = await structural_severities(texts)
-    weight = _env_float(_ENV_TIEBREAK_WEIGHT, 0.30)
-    adjusted = [r + weight * s.score for r, s in zip(rewards, sev)]
-    _emit(log_extra, "severity_reason", [s.reason for s in sev])
-
-    if _is_flat(adjusted):
-        # Genuinely indistinguishable. Dropping is the honest answer; the
-        # log names it so a corpus full of these is diagnosable rather
-        # than silently absent from training.
-        _emit(log_metric, "reward/dropped_flat_group", 1.0)
-        logger.info(
-            "[GRPO] group of %d has no separable signal (all %s) — dropped "
-            "rather than assigned a fabricated advantage",
-            len(texts), sev[0].reason if sev else "?",
-        )
-        return [None] * len(texts)
-
+    # Every sibling verified identically. There is no preference signal in
+    # this group, and there is nothing further to consult -- the verifier
+    # already graded structure in bands and, when configured, asked the
+    # authoritative validator. Dropping is the honest answer.
     _emit(log_metric, "reward/flat_group", 1.0)
-    _emit(log_metric, "reward/tiebreak_rescued", 1.0)
-    logger.debug(
-        "[GRPO] flat group rescued by structural severity: %s",
-        [f"{s.score:.2f}:{s.reason}" for s in sev],
+    _emit(log_metric, "reward/dropped_flat_group", 1.0)
+    logger.info(
+        "[GRPO] group of %d verified identically (%s) — dropped rather than "
+        "assigned a fabricated advantage",
+        len(texts), verdicts[0].reason if verdicts else "?",
     )
-    return adjusted
+    return [None] * len(texts)
 
 
 def _emit(fn: Any, name: str, value: Any) -> None:
@@ -366,10 +246,4 @@ def _emit(fn: Any, name: str, value: Any) -> None:
         pass
 
 
-__all__ = [
-    "Severity",
-    "base_rewards",
-    "candidate_reward",
-    "structural_severities",
-    "structural_severity",
-]
+__all__ = ["candidate_reward", "history_rewards"]
