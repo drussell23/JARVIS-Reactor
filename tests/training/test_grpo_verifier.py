@@ -72,6 +72,61 @@ def test_extraction_reaches_through_the_envelope() -> None:
 
 
 # --------------------------------------------------------------------------
+# The fence: a presentation fault must not be scored as a code fault
+# --------------------------------------------------------------------------
+
+
+FENCE = '```'
+
+
+def test_fenced_good_code_scores_exactly_like_unfenced_good_code() -> None:
+    """The second defect of the same shape as grading the envelope.
+
+    A model that wraps `full_content` in a markdown fence is sending
+    CORRECT Python. Before the fix the backticks reached `ast.parse` and
+    it scored `syntax_error:line1` == 0.250 -- the SAME number genuinely
+    broken code gets. The reward could not tell a correct patch from a
+    broken one, so it graded FORMATTING.
+    """
+    clean = gv.verify_static(env(GOOD))
+    fenced = gv.verify_static(env(FENCE + "python\n" + GOOD + FENCE))
+    assert fenced.score == clean.score
+    assert fenced.tier == clean.tier
+    assert fenced.reason == clean.reason
+
+
+def test_a_fence_does_not_rescue_broken_code() -> None:
+    """Stripping the fence must REVEAL the real fault, never hide it."""
+    fenced_broken = gv.verify_static(
+        env(FENCE + "python\n" + BROKEN_EARLY + FENCE))
+    assert fenced_broken.score < gv.verify_static(env(GOOD)).score
+
+
+def test_bare_fence_without_a_language_tag_is_stripped() -> None:
+    fenced = gv.verify_static(env(FENCE + "\n" + GOOD + FENCE))
+    assert fenced.score == gv.verify_static(env(GOOD)).score
+
+
+def test_unfenced_source_is_returned_byte_identical() -> None:
+    """The guard on the fix itself.
+
+    An unconditional `.strip()` here silently ate a trailing newline and
+    broke extraction's round-trip (caught by the suite, not by review).
+    Only a genuinely fenced value may be rewritten; every other value is
+    the model's bytes, untouched.
+    """
+    for src in (GOOD, INERT, BROKEN_LATE, "   \n\nx = 1\n\n   "):
+        assert gv.extract_sources(env(src))[1] == [src]
+
+
+def test_backticks_inside_a_docstring_are_not_a_fence() -> None:
+    """Only a value that BEGINS with a fence is touched."""
+    src = ("def f():\n"
+           '    """see ' + FENCE + 'code' + FENCE + ' here."""\n'
+           "    return 1\n")
+    assert gv.extract_sources(env(src))[1] == [src]
+
+# --------------------------------------------------------------------------
 # Ordering — the contract
 # --------------------------------------------------------------------------
 

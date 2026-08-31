@@ -151,6 +151,43 @@ class TierWeights:
 # ---------------------------------------------------------------------------
 
 
+_FENCE = '```'
+
+
+def _strip_code_fence(text: str) -> str:
+    """Remove ONE wrapping markdown fence, if the value is entirely fenced.
+
+    A fence is a presentation fault, not a code fault. It is stripped in
+    TWO places, which is why this is a function and not the inline block
+    it used to be: around the envelope, and around each extracted source.
+
+    The second is the load-bearing one, and it was missing. A
+    ``full_content`` carrying fenced-but-CORRECT Python reached
+    ``ast.parse`` with the backticks still attached and scored
+    ``syntax_error:line1`` -- byte-identical to the score for genuinely
+    broken Python (both 0.250, measured). Correct work and broken work
+    collapsed onto one number, so the reward graded FORMATTING and taught
+    nothing. That is the same defect class as grading the JSON envelope
+    instead of the code inside it.
+
+    Only a value that BEGINS with a fence is touched, so a legitimate
+    source that merely mentions backticks in a docstring is left alone.
+    """
+    body = text or ""
+    if not body.lstrip().startswith(_FENCE):
+        # NOT fenced: return it byte-identical. Stripping here silently ate
+        # a trailing newline and broke extraction's round-trip guarantee --
+        # the graded text must be the model's text wherever nothing is wrong
+        # with it.
+        return body
+    body = body.strip()
+    nl = body.find(chr(10))
+    body = body[nl + 1:] if nl >= 0 else body[len(_FENCE):]
+    if body.rstrip().endswith(_FENCE):
+        body = body.rstrip()[:-len(_FENCE)]
+    return body.strip()
+
+
 def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
     """``(schema_version, [source, ...], reason)`` from a completion.
 
@@ -160,18 +197,9 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
 
     Fail-soft at every step; never raises.
     """
-    body = (text or "").strip()
+    body = _strip_code_fence(text or "")
     if not body:
         return None, [], "empty"
-    # Models fence JSON despite being told not to; the fence is a
-    # presentation fault, not a code fault, and rejecting it here would
-    # score a good patch as unparseable.
-    if body.startswith("```"):
-        nl = body.find("\n")
-        body = body[nl + 1:] if nl >= 0 else body
-        if body.rstrip().endswith("```"):
-            body = body.rstrip()[:-3]
-        body = body.strip()
     try:
         obj = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -202,7 +230,7 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
             continue
         v = c.get(content_key)
         if isinstance(v, str) and v.strip():
-            sources.append(v)
+            sources.append(_strip_code_fence(v))
         # A multi-file candidate carries the rest under `files`; each entry
         # is graded like the primary, or a patch that split its work across
         # files would be judged on a fraction of itself.
@@ -210,7 +238,7 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
             if isinstance(f, dict):
                 fv = f.get(content_key)
                 if isinstance(fv, str) and fv.strip():
-                    sources.append(fv)
+                    sources.append(_strip_code_fence(fv))
     if not sources:
         return ver, [], f"no_{content_key}"
     return ver, sources, ""
