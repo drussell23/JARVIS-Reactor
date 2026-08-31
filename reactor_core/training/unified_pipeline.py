@@ -48,6 +48,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
+_ENV_OLLAMA_PUBLISH = "REACTOR_OLLAMA_PUBLISH_ENABLED"
+
+
+def _ollama_publish_enabled() -> bool:
+    """Whether a staged GGUF is also registered as a servable ollama tag.
+
+    Default TRUE: staging a file without registering it means the pipeline
+    reports a successful deployment for a model O+V cannot call, which is
+    worse than a loud failure. Set falsey to restore the stage-only
+    behaviour (a deployment target that loads from disk rather than
+    through ollama).
+    """
+    raw = os.getenv(_ENV_OLLAMA_PUBLISH, "true").strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
 # =============================================================================
 # Singleton Pattern for Trinity Integration
 # =============================================================================
@@ -328,6 +343,9 @@ class UnifiedTrainingPipeline:
         # State
         self._progress = PipelineProgress()
         self._start_time: Optional[float] = None
+        # Outcome of the last ollama tag registration. Kept so an operator
+        # can distinguish "staged but deferred on a busy GPU" from "live".
+        self.last_publish_result: Optional[Any] = None
         self._trinity = TrinityHeartbeat(
             enabled=self.config.trinity_enabled,
             interval=self.config.heartbeat_interval,
@@ -1804,8 +1822,38 @@ class UnifiedTrainingPipeline:
         except Exception as e:
             logger.warning(f"[Pipeline] Lineage record write failed (non-blocking): {e}")
 
+    async def _publish_to_ollama(self, gguf_path: Path):
+        """Register a staged GGUF as the tag O+V routes to.
+
+        Returns the ``DeployResult``, or None when the deployer is
+        unavailable (an older checkout / a trimmed install) -- in which
+        case the caller keeps the pre-existing stage-only behaviour rather
+        than failing a deployment over a missing optional component.
+
+        The GPU mutex lives inside the deployer's lease, not here: one
+        place decides whether the card is free, and it is the same place
+        for a training job, a conversion and a hot-swap.
+        """
+        try:
+            from reactor_core.deployment.ollama_deployer import (  # noqa: PLC0415
+                OllamaDeployer,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Pipeline] ollama deployer unavailable (%s) -- model staged "
+                "on disk but NOT registered as a servable tag", exc,
+            )
+            return None
+        try:
+            result = await OllamaDeployer().deploy(gguf_path)
+            logger.info("[Pipeline] %s", result.summary())
+            return result
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Pipeline] ollama publish raised: %s", exc)
+            return None
+
     async def _deploy_to_jprime(self, model_path: Path) -> Optional[Path]:
-        """Deploy model to J-Prime."""
+        """Stage a model for J-Prime and register it as a servable tag."""
         try:
             # Determine J-Prime models directory
             jprime_dir = self.config.jprime_models_dir
@@ -1847,7 +1895,41 @@ class UnifiedTrainingPipeline:
                 current_link.symlink_to(dest_path.name)
                 logger.info(f"[Pipeline] Updated current.gguf symlink")
 
-            logger.info(f"[Pipeline] Deployed to J-Prime: {dest_path}")
+            logger.info(f"[Pipeline] Staged for J-Prime: {dest_path}")
+
+            # Staging a file is not deployment. O+V reaches a local model
+            # through ollama's API at 127.0.0.1:11434, and a .gguf sitting in
+            # a directory behind a current.gguf symlink is not registered
+            # there -- so up to this point the pipeline reports success for a
+            # model nothing can actually call. Registering the tag is what
+            # makes it reachable.
+            #
+            # OllamaDeployer is composed rather than reimplemented: it brings
+            # the deployment gate, the cross-process GPU lease (so a swap
+            # cannot land while an O+V generation holds the card), the
+            # rollback snapshot, and verification that the tag is SERVED
+            # rather than merely written.
+            publish = _ollama_publish_enabled()
+            if publish and dest_path.suffix == ".gguf":
+                deploy_result = await self._publish_to_ollama(dest_path)
+                self.last_publish_result = deploy_result
+                if deploy_result is not None and not deploy_result.ok:
+                    if deploy_result.stage == "gpu_lease":
+                        # Retryable, and the artifact is correctly staged:
+                        # report the path but never claim it is live.
+                        logger.warning(
+                            "[Pipeline] staged but NOT serving -- %s",
+                            deploy_result.reason,
+                        )
+                    else:
+                        # Gate rejection / create failure / unservable tag are
+                        # real deployment failures. Returning a path here
+                        # would be the very lie this block exists to remove.
+                        logger.error(
+                            "[Pipeline] deployment FAILED at %s: %s",
+                            deploy_result.stage, deploy_result.reason,
+                        )
+                        return None
 
             # v242.0: Notify J-Prime that a new model is available via Trinity event
             try:
