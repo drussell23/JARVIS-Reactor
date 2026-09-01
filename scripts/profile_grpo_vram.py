@@ -136,7 +136,7 @@ def main(argv: list) -> int:
     from transformers import AutoConfig, AutoModelForCausalLM, GPTQConfig
     from reactor_core.training.grpo_pipeline import (
         build_grpo_config, build_lora_config, build_qlora_config,
-        build_prompt_dataset,
+        build_prompt_dataset, detect_quantization, load_training_model,
     )
     from reactor_core.training.grpo_reward import candidate_reward
 
@@ -206,47 +206,18 @@ def main(argv: list) -> int:
     # profile died before it could report one. `device_map` streams shard
     # by shard straight to the GPU, which is also the placement the real
     # pipeline will use.
-    load_kw = {"device_map": {"": 0}, "low_cpu_mem_usage": True}
-    if args.pre_quantized:
-        # Kernel selection ONLY -- not a re-quantization.
-        #
-        # GPTQModel auto-selects Marlin, which JIT-builds a CUDA extension:
-        # "Marlin torch.ops kernels are not properly installed ... CUDA_HOME
-        # environment variable is not set". Getting a compiler onto this box
-        # turned out to be a dead end in three directions, all recorded so
-        # nobody re-walks them:
-        #   * apt `nvidia-cuda-toolkit` on Ubuntu 26.04 installs nvcc 12.4,
-        #     and 12.4 does not know this card at all --
-        #     "nvcc fatal: Value 'sm_120' is not defined for option
-        #     'gpu-architecture'". Blackwell needs >= 12.8.
-        #   * NVIDIA publishes no apt repo for Ubuntu 26.04.
-        #   * the `nvidia-cuda-nvcc-cu12` wheel ships ptxas and headers but
-        #     NO nvcc binary.
-        # Triton needs none of it: it compiles through its own LLVM at
-        # runtime and, unlike the `torch` backend, keeps the weights in
-        # 4-bit -- which is the difference between a memory profile and a
-        # measurement of a dequantised model.
-        #
-        # The quantization parameters are COPIED FROM THE CHECKPOINT rather
-        # than retyped, so this cannot silently describe a different
-        # quantization than the weights actually carry. Only `backend` is
-        # ours.
-        src = getattr(AutoConfig.from_pretrained(args.model),
-                      "quantization_config", {}) or {}
-        if not isinstance(src, dict):
-            src = getattr(src, "to_dict", dict)()
-        load_kw["quantization_config"] = GPTQConfig(
-            bits=int(src.get("bits", 4)),
-            group_size=int(src.get("group_size", 128)),
-            desc_act=bool(src.get("desc_act", False)),
-            sym=bool(src.get("sym", True)),
-            backend=args.gptq_backend,
-        )
-        print(f"  gptq kernel backend: {args.gptq_backend} "
-              f"(bits={src.get('bits')} group_size={src.get('group_size')})")
-    elif "quantization_config" in kw:
-        load_kw["quantization_config"] = kw.pop("quantization_config")
-    model_obj = AutoModelForCausalLM.from_pretrained(args.model, **load_kw)
+    # DRY: the adaptive loader lives in the pipeline, because the REAL
+    # training path had both defects this script found (a model string,
+    # so shards materialise in host RAM; and a bnb config attached to an
+    # already-quantized checkpoint). Fixing them only here would have
+    # left `build_trainer` broken while the measurement looked healthy.
+    model_obj = load_training_model(
+        args.model,
+        use_qlora=not args.no_qlora,
+        gptq_backend=args.gptq_backend if args.pre_quantized else "",
+    )
+    quant_detected = detect_quantization(args.model)["method"] or "none(base)"
+    print(f"  checkpoint quantization: {quant_detected}")
     trainer = GRPOTrainer(
         model=model_obj, reward_funcs=candidate_reward,
         args=cfg, train_dataset=ds, **kw,
@@ -320,7 +291,7 @@ def main(argv: list) -> int:
             "total_gib": total, "peak_gib": peak,
             "num_generations": args.num_generations,
             "max_completion_length": args.max_completion_length,
-            "qlora": not args.no_qlora, "quantization": quant,
+            "qlora": not args.no_qlora, "quantization": quant_detected,
             "dataset_source": source, "steps_run": steps, "marks": marks,
             "warmup": warm,
         }, indent=2), encoding="utf-8")

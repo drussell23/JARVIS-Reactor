@@ -260,6 +260,87 @@ def build_lora_config(**overrides: Any) -> Any:
     return LoraConfig(**kw)
 
 
+def detect_quantization(model_id: str) -> Dict[str, Any]:
+    """What quantization does this checkpoint ALREADY carry?
+
+    Returns ``{"method": <str|"">, "config": <dict>}``. ``method`` is empty
+    for an unquantized checkpoint. Never raises -- an unreadable config
+    means "assume base weights", which is the conservative answer because
+    it attaches a quantizer rather than skipping one.
+    """
+    try:
+        from transformers import AutoConfig  # noqa: PLC0415
+        raw = getattr(AutoConfig.from_pretrained(model_id),
+                      "quantization_config", None) or {}
+        if not isinstance(raw, dict):
+            raw = getattr(raw, "to_dict", dict)()
+        return {"method": str(raw.get("quant_method", "") or ""), "config": raw}
+    except Exception:  # noqa: BLE001
+        logger.debug("[GRPO] no readable quantization_config on %s", model_id,
+                     exc_info=True)
+        return {"method": "", "config": {}}
+
+
+def load_training_model(
+    model_id: str,
+    *,
+    use_qlora: bool = True,
+    device_map: Optional[Any] = None,
+    gptq_backend: str = "",
+) -> Any:
+    """Load a model for training, adapting to what the checkpoint IS.
+
+    Two failure modes this exists to prevent, both measured on this box:
+
+    **Host-RAM OOM.** Handing `GRPOTrainer` a model STRING lets transformers
+    load with no ``device_map``, so every shard is materialised in host RAM
+    before anything reaches the GPU. For a 30B that was
+    ``Killed process (python) anon-rss:48216856kB`` -- 48.2 GiB against 47.
+    A ``device_map`` streams shard-by-shard straight to the device, which is
+    also the placement training will use anyway.
+
+    **Double quantization.** Attaching a BitsAndBytes config to a checkpoint
+    that is ALREADY 4-bit (GPTQ/AWQ) describes a conversion that is not
+    happening: it either errors or produces a model whose memory profile
+    belongs to neither format. The checkpoint is asked what it is, and its
+    own config is honoured; only the runtime KERNEL may be overridden.
+
+    NOTE for GPTQ specifically: on transformers 5.16.1 + gptqmodel 7.3.5,
+    both the `torch` and `triton` backends DEQUANTISE to bf16 at load --
+    59.38 GiB resident for a 30B "4-bit" checkpoint, measured. A GPTQ
+    checkpoint is therefore NOT a route to a small footprint on this stack;
+    bnb-NF4 over base bf16 weights is.
+    """
+    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+
+    quant = detect_quantization(model_id)
+    kw: Dict[str, Any] = {
+        # Never None: the whole point is to avoid a host-RAM materialisation.
+        "device_map": device_map if device_map is not None else {"": 0},
+        "low_cpu_mem_usage": True,
+    }
+
+    if quant["method"]:
+        # Pre-quantized. Honour the checkpoint; override only the kernel.
+        if gptq_backend and quant["method"].lower() == "gptq":
+            from transformers import GPTQConfig  # noqa: PLC0415
+            src = quant["config"]
+            kw["quantization_config"] = GPTQConfig(
+                bits=int(src.get("bits", 4)),
+                group_size=int(src.get("group_size", 128)),
+                desc_act=bool(src.get("desc_act", False)),
+                sym=bool(src.get("sym", True)),
+                backend=gptq_backend,
+            )
+        logger.info("[GRPO] %s is pre-quantized (%s); not re-quantizing",
+                    model_id, quant["method"])
+    elif use_qlora:
+        kw["quantization_config"] = build_qlora_config()
+        logger.info("[GRPO] %s is base weights; attaching bnb-NF4", model_id)
+
+    return AutoModelForCausalLM.from_pretrained(model_id, **kw)
+
+
 def build_trainer(
     model_id: str,
     telemetry_dir: Path,
@@ -269,6 +350,8 @@ def build_trainer(
     max_prompts: Optional[int] = None,
     trainable_only: bool = True,
     use_qlora: bool = True,
+    device_map: Optional[Any] = None,
+    gptq_backend: str = "",
     **config_overrides: Any,
 ) -> Any:
     """Assemble the GRPOTrainer over the live corpus."""
@@ -284,10 +367,14 @@ def build_trainer(
     )
     kwargs: Dict[str, Any] = {}
     if use_qlora:
-        kwargs["quantization_config"] = build_qlora_config()
         kwargs["peft_config"] = build_lora_config()
+    # A model OBJECT, never the id: see load_training_model for the host-RAM
+    # OOM and the double-quantization this avoids.
     return GRPOTrainer(
-        model=model_id,
+        model=load_training_model(
+            model_id, use_qlora=use_qlora,
+            device_map=device_map, gptq_backend=gptq_backend,
+        ),
         reward_funcs=candidate_reward,
         args=args,
         train_dataset=dataset,
@@ -296,6 +383,8 @@ def build_trainer(
 
 
 __all__ = [
+    "detect_quantization",
+    "load_training_model",
     "build_grpo_config",
     "build_lora_config",
     "build_prompt_dataset",
