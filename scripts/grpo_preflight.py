@@ -112,6 +112,7 @@ def analyse(
     *,
     min_group: int,
     trainable_only: bool,
+    min_spread: float = 0.0,
 ) -> Dict[str, Any]:
     """Group the corpus by prompt and score each group. Never raises."""
     pipeline = _load("grpo_pipeline")
@@ -139,16 +140,38 @@ def analyse(
             singleton += 1
             continue
         scores = [
-            float(verifier.verify_static(str(r.get("assistant_output") or "")).score)
+            float(verifier.verify_any(str(r.get("assistant_output") or "")).score)
             for r in rows
         ]
         entry = {
             "prompt_head": prompt[:80],
             "responses": len(rows),
-            "scores": [round(s, 4) for s in scores],
-            "spread": round(max(scores) - min(scores), 4) if scores else 0.0,
+            "scores": [round(s, 6) for s in scores],
+            # 6dp, not 4: _FLAT_EPS is 1e-06, so a group can be legitimately
+            # non-flat and still display as "0.0" at 4dp -- a report that
+            # contradicts its own verdict.
+            "spread": round(max(scores) - min(scores), 6) if scores else 0.0,
         }
-        (flat if reward._is_flat(scores) else trainable).append(entry)
+        # Two thresholds, not one. `_is_flat` is the TRAINER's guard and
+        # answers "is there any difference at all" (_FLAT_EPS = 1e-06).
+        # That is necessary and not sufficient: GRPO normalises advantage by
+        # the group's standard deviation, so a spread of 3e-05 yields the
+        # SAME magnitude advantage as a spread of 0.5. Admitting such a
+        # group does not train on a weak signal -- it amplifies measurement
+        # noise to full scale and backpropagates it.
+        #
+        # `min_spread` is therefore a separate, operator-set floor on what
+        # counts as a MEANINGFUL difference. Default 0.0 preserves the
+        # trainer's own semantics exactly; raise it to demand real
+        # separation.
+        span = (max(scores) - min(scores)) if scores else 0.0
+        if reward._is_flat(scores) or span < min_spread:
+            entry["excluded_by"] = (
+                "flat" if reward._is_flat(scores) else "below_min_spread"
+            )
+            flat.append(entry)
+        else:
+            trainable.append(entry)
 
     return {
         "telemetry_dir": str(telemetry_dir),
@@ -159,6 +182,7 @@ def analyse(
         "trainable_groups": len(trainable),
         "flat_eps": getattr(reward, "_FLAT_EPS", None),
         "min_group": min_group,
+        "min_spread": min_spread,
         "trainable_only": trainable_only,
         "verdict_sources": dict(verdict_sources),
         "examples": trainable[:5],
@@ -182,6 +206,14 @@ def main(argv: Optional[List[str]] = None) -> int:
              "(env TRINITY_GRPO_MIN_GROUP_SIZE)",
     )
     ap.add_argument(
+        "--min-spread", type=float,
+        default=float(_env("TRINITY_GRPO_MIN_SPREAD", "0") or 0.0),
+        help="minimum MEANINGFUL reward spread. _is_flat only asks whether "
+             "a difference exists; GRPO divides advantage by group std, so "
+             "a 3e-05 spread trains as hard as a 0.5 one "
+             "(env TRINITY_GRPO_MIN_SPREAD)",
+    )
+    ap.add_argument(
         "--include-untrainable", action="store_true",
         help="count rows the classifier excluded from training. Diagnostic "
              "only -- it deliberately disagrees with the trainer.",
@@ -195,6 +227,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             tdir,
             min_group=args.min_group_size,
             trainable_only=not args.include_untrainable,
+            min_spread=args.min_spread,
         )
     except Exception as exc:  # noqa: BLE001 — a gate must explain itself
         err = {"error": f"{type(exc).__name__}: {exc}", "telemetry_dir": str(tdir)}

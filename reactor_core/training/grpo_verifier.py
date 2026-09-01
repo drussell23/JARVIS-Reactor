@@ -247,6 +247,131 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
     return ver, sources, ""
 
 
+#: Floor of the passing band. Above `no_defs` (0.50) and `inert` (0.15),
+#: so a wider range for working code can never outrank a later tier.
+_PASS_FLOOR = _envf("PASS_FLOOR", 0.60)
+
+#: Relative weights of the quality sub-metrics. Env-tunable because what
+#: "better code" means is a policy, not a constant -- a docs-focused batch
+#: and a refactor batch do not want the same emphasis.
+_Q_WEIGHTS = {
+    "docs": _envf("Q_W_DOCS", 1.0),
+    "types": _envf("Q_W_TYPES", 1.0),
+    "density": _envf("Q_W_DENSITY", 0.6),
+    "simplicity": _envf("Q_W_SIMPLICITY", 0.8),
+    "concision": _envf("Q_W_CONCISION", 0.6),
+}
+
+#: Chars-per-statement beyond which a file reads as padded. Not a hard cap:
+#: the sub-metric decays smoothly so one verbose function cannot zero a file.
+_CONCISION_TARGET = _envf("CONCISION_TARGET_CPS", 90.0)
+
+#: Decision points per definition treated as "reasonably simple".
+_SIMPLICITY_TARGET = _envf("SIMPLICITY_TARGET_BRANCHES", 4.0)
+
+_BRANCH_NODES = (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
+    ast.With, ast.AsyncWith, ast.BoolOp, ast.IfExp,
+)
+
+
+def _soft(value: float, target: float) -> float:
+    """1.0 at zero, decaying toward 0 as `value` passes `target`.
+
+    Hyperbolic rather than a cliff: a step function would put every
+    candidate on one side or the other and reintroduce exactly the ties
+    this exists to break.
+    """
+    if target <= 0:
+        return 1.0
+    return float(target) / (float(target) + max(0.0, float(value)))
+
+
+def _quality(tree, src, defs, stmts):
+    """Continuous quality of code that already PARSES. Returns (q, detail).
+
+    ## Why this replaces a def-count step
+
+    The previous score was `min(1.0, 0.7 + 0.06 * min(defs, 5))` -- five
+    reachable values, pinned above five definitions. Two candidates with
+    the same number of defs scored IDENTICALLY no matter how different
+    they were, so a GRPO group of passing siblings had a reward spread of
+    exactly 0.0 and was dropped by the equal-reward guard. Measured on the
+    live corpus: 19 groups with 2+ responses, all 19 flat, 0 trainable.
+    The reward could rank failure modes finely and could not rank success
+    at all.
+
+    ## What it measures, and why each one is real
+
+    Every sub-metric is a MEASUREMENT of the candidate, never a tiebreak
+    invented to manufacture difference. Two byte-identical candidates still
+    score identically -- they ARE identical, and dropping that group is
+    correct. Different code now almost always differs, because five
+    continuous signals collide far less than one integer did.
+
+      * docs      -- fraction of definitions carrying a docstring
+      * types     -- fraction of annotatable positions (params + returns)
+        that are annotated
+      * density   -- definitions per statement, saturating: structure is
+        good, but "more defs" without bound is the length bias
+        `loss_type="dr_grpo"` was chosen to remove
+      * simplicity-- decision points per definition, decaying past a
+        target, so a tangle of branches scores below the same behaviour
+        expressed plainly
+      * concision -- characters per statement, decaying past a target, so
+        padding a file cannot buy reward
+
+    Weights are env-tunable: what "better" means is policy, not constant.
+    """
+    n_defs = len(defs)
+    n_stmts = max(1, len(stmts))
+
+    documented = sum(1 for d in defs if ast.get_docstring(d))
+    docs = documented / n_defs
+
+    annotatable = 0
+    annotated = 0
+    for d in defs:
+        if not isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        a = d.args
+        params = list(a.args) + list(a.kwonlyargs) + list(getattr(a, "posonlyargs", []))
+        for arg in params:
+            if arg.arg in ("self", "cls"):
+                continue
+            annotatable += 1
+            annotated += 1 if arg.annotation is not None else 0
+        annotatable += 1                                  # the return
+        annotated += 1 if d.returns is not None else 0
+    types = (annotated / annotatable) if annotatable else 1.0
+
+    density = min(1.0, n_defs / n_stmts)
+
+    branches = sum(1 for n in ast.walk(tree) if isinstance(n, _BRANCH_NODES))
+    simplicity = _soft(branches / n_defs, _SIMPLICITY_TARGET)
+
+    # `src.strip()`, not `src`: surrounding whitespace is PRESENTATION, and
+    # letting it move the score reintroduces the defect the fence stripper
+    # exists to remove -- two candidates whose code is byte-identical would
+    # score differently because one arrived with a trailing newline. Caught
+    # by the fence tests, which assert stripped and clean score the SAME.
+    concision = _soft(len(src.strip()) / n_stmts, _CONCISION_TARGET)
+
+    parts = {
+        "docs": docs, "types": types, "density": density,
+        "simplicity": simplicity, "concision": concision,
+    }
+    total_w = sum(_Q_WEIGHTS.values()) or 1.0
+    q = sum(parts[k] * _Q_WEIGHTS[k] for k in parts) / total_w
+    q = max(0.0, min(1.0, q))
+    detail = (
+        f"q={q:.3f},docs={docs:.2f},types={types:.2f},den={density:.2f},"
+        f"simp={simplicity:.2f},con={concision:.2f},defs={n_defs},"
+        f"stmt={n_stmts}"
+    )
+    return q, detail
+
+
 def _grade_source(src: str) -> Tuple[float, str]:
     """Graded syntax/substance for ONE extracted source. In [0, 1]."""
     try:
@@ -272,15 +397,18 @@ def _grade_source(src: str) -> Tuple[float, str]:
     )
     if inert:
         return 0.15, "inert_body"
-    defs = sum(
-        1 for n in ast.walk(tree)
+    defs = [
+        n for n in ast.walk(tree)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    )
-    if defs == 0:
+    ]
+    if not defs:
         return 0.5, f"{len(stmts)}stmt_no_defs"
-    # Saturating: rewarding "more definitions" without bound reintroduces
-    # the length bias `loss_type="dr_grpo"` was chosen to remove.
-    return min(1.0, 0.7 + 0.06 * min(defs, 5)), f"{defs}defs/{len(stmts)}stmt"
+    q, detail = _quality(tree, src, defs, stmts)
+    # Mapped into [_PASS_FLOOR, 1.0]. The floor sits ABOVE the no-defs 0.5
+    # and the inert 0.15, so widening the range for passing code cannot
+    # promote a candidate past one that reached a later tier -- the
+    # non-overlap contract in TierWeights holds unchanged.
+    return _PASS_FLOOR + (1.0 - _PASS_FLOOR) * q, f"quality:{detail}"
 
 
 def _reason_kind(reason: str) -> str:
@@ -349,6 +477,48 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     except Exception as exc:  # noqa: BLE001 — a grader must never break training
         logger.debug("verify_static fault: %s", exc, exc_info=True)
         return Verdict(w.envelope * 0.2, 0, "grader_fault")
+
+
+def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
+    """Grade a response whose LAYER is not known in advance.
+
+    `verify_static` grades a COMPLETION -- the O+V response envelope, which
+    is what a live GRPO rollout produces and what the reward sees during
+    training. A CORPUS row is a different layer: the recorder stores the
+    already-extracted source in `assistant_output`, so the envelope is long
+    gone by the time anything reads the corpus back.
+
+    Handing corpus text to `verify_static` therefore fails `json.loads` and
+    returns the tier-0 constant for EVERY row -- measured on the live
+    corpus, all 74 rows scored 0.02 / tier 0 / `envelope_unparseable`, a
+    perfectly flat reward that had nothing to do with the code. The same 74
+    graded as source give 67 distinct scores.
+
+    This is the fourth appearance of one defect: grading the JSON envelope
+    instead of the code, grading the markdown fence instead of the code,
+    dispatching on string shape, and now grading the wrong layer entirely.
+    The lesson each time is the same -- be explicit about WHAT is being
+    measured, because every one of these failures was silent and produced a
+    confident, uniform number.
+
+    Envelope first (a real envelope must still be reached through, or a
+    JSON object would be graded as the Python dict literal it also is);
+    source only when the text is demonstrably not an envelope.
+    """
+    v = verify_static(text, weights)
+    if _reason_kind(v.reason) != "envelope_unparseable":
+        return v
+    w = weights or TierWeights()
+    try:
+        score, why = _grade_source(text or "")
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        logger.debug("verify_any source fault", exc_info=True)
+        return v
+    if score <= 0.0 or _reason_kind(why) in _SYNTAX_FAULTS:
+        span = w.syntax - w.shape
+        return Verdict(w.shape + span * score, 2, why)
+    span = w.substance - w.syntax
+    return Verdict(w.syntax + span * score, 3, why)
 
 
 # ---------------------------------------------------------------------------
@@ -522,5 +692,5 @@ __all__ = [
     "AdaptiveBudget", "SCHEMA_DIFF", "SCHEMA_FULL", "SCHEMA_NOOP",
     "SCHEMA_TOOL", "TierWeights", "Verdict", "authoritative_command",
     "extract_sources", "verify", "verify_authoritative", "verify_batch",
-    "verify_static",
+    "verify_static", "verify_any",
 ]

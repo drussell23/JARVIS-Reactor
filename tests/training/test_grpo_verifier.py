@@ -72,6 +72,100 @@ def test_extraction_reaches_through_the_envelope() -> None:
 
 
 # --------------------------------------------------------------------------
+# Reward RANGE — passing siblings must be separable
+# --------------------------------------------------------------------------
+
+
+BARE = 'def page(items, n):\n    return items[:n]\n'
+RICH = 'def page(items: list, n: int) -> list:\n    """Return the first n items."""\n    return items[:n]\n'
+BRANCHY = 'def page(items, n):\n    out = []\n    for i, x in enumerate(items):\n        if i < n:\n            if x is not None:\n                out.append(x)\n    return out\n'
+
+
+def test_passing_siblings_do_not_all_score_the_same() -> None:
+    """THE regression. This spread was exactly 0.0 before.
+
+    The old score was `min(1.0, 0.7 + 0.06 * min(defs, 5))` -- five
+    reachable values, pinned above five defs. Siblings with the same def
+    count scored IDENTICALLY however different their code, so a GRPO group
+    of PASSING candidates was flat and the equal-reward guard dropped it.
+    Measured on the live corpus: 19 multi-response groups, 19 flat, 0
+    trainable. The reward ranked failure finely and success not at all.
+    """
+    scores = [gv.verify_static(env(c)).score for c in (BARE, RICH, BRANCHY)]
+    assert len(set(round(s, 6) for s in scores)) == 3
+    assert max(scores) - min(scores) > 0.01
+
+
+def test_documented_and_typed_outranks_bare_which_outranks_branchy() -> None:
+    """The ORDER is the claim, not merely that they differ."""
+    rich = gv.verify_static(env(RICH)).score
+    bare = gv.verify_static(env(BARE)).score
+    branchy = gv.verify_static(env(BRANCHY)).score
+    assert rich > bare > branchy
+
+
+def test_identical_code_still_scores_identically() -> None:
+    """Variance must be MEASURED, never manufactured.
+
+    Two byte-identical candidates are identical, and dropping that group
+    is the correct answer -- the same refusal the recorder makes when it
+    labels an unseen outcome `unknown` rather than guessing.
+    """
+    a = gv.verify_static(env(RICH)).score
+    b = gv.verify_static(env(RICH)).score
+    assert a == b
+
+
+def test_surrounding_whitespace_cannot_move_the_score() -> None:
+    """Presentation is not quality.
+
+    `concision` first divided by `len(src)`, which counts the whitespace
+    around the code -- so a trailing newline moved the reward and the
+    fence-stripped path scored differently from the identical clean one.
+    That is the defect the fence stripper exists to remove, reintroduced
+    one metric deeper. Caught by the fence tests, fixed at the metric.
+    """
+    base = gv.verify_static(env(RICH)).score
+    nl = chr(10)
+    for variant in (RICH + nl + nl, nl + RICH, "   " + nl + RICH + "  " + nl):
+        assert gv.verify_static(env(variant)).score == base
+
+
+def test_padding_a_file_does_not_buy_reward() -> None:
+    """`concision` decays past a target, so bloat cannot be farmed.
+
+    Same behaviour, same definitions, more characters -- must not score
+    higher. This is the length bias `loss_type="dr_grpo"` was chosen to
+    remove, and it must not re-enter through the reward instead.
+    """
+    padded = RICH.replace(
+        '"""Return the first n items."""',
+        '"""Return the first n items. ' + ("padding words " * 40) + '"""',
+    )
+    assert gv.verify_static(env(padded)).score < gv.verify_static(env(RICH)).score
+
+
+def test_passing_code_never_outranked_by_a_lower_tier() -> None:
+    """Widening the passing band must not break the non-overlap contract."""
+    noop = gv.verify_static(json.dumps({
+        "schema_version": gv.SCHEMA_NOOP, "reason": "already complete"}))
+    broken = gv.verify_static(env(BROKEN_EARLY))
+    for c in (BARE, RICH, BRANCHY):
+        assert gv.verify_static(env(c)).score > noop.score > broken.score
+
+
+def test_weights_are_policy_not_constants(monkeypatch) -> None:
+    """Emphasis is env-tunable: a docs batch and a refactor batch differ."""
+    import importlib
+    monkeypatch.setenv("REACTOR_GRPO_Q_W_DOCS", "0")
+    spec = importlib.util.spec_from_file_location("gv_reweighted", _SRC)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["gv_reweighted"] = mod
+    spec.loader.exec_module(mod)
+    # with docs weighted to zero, the documented variant loses its edge
+    assert mod._Q_WEIGHTS["docs"] == 0.0
+
+# --------------------------------------------------------------------------
 # Reason KINDS dispatch exactly — ordering is not the contract
 # --------------------------------------------------------------------------
 
