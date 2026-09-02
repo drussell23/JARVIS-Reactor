@@ -506,3 +506,125 @@ def test_batch_grades_a_whole_group() -> None:
     out = asyncio.run(gv.verify_batch([env(GOOD), env(BROKEN_EARLY), "garbage"]))
     assert len(out) == 3
     assert out[0].score > out[1].score > out[2].score
+
+
+# --------------------------------------------------------------------------
+# Band geometry — the passing band must have room to SAY something
+# --------------------------------------------------------------------------
+
+
+def test_passing_band_is_derived_from_the_authority_margin() -> None:
+    """The ceiling is computed, not declared.
+
+    A rigid `substance = 0.70` left everything from 0.70 to the authority
+    band unused and squeezed working code into 0.10 of range. Measured
+    over soaks 13 and 14: every passing sibling scored 0.65-0.672 and no
+    group ever cleared `--min-spread 0.01`, because 0.01 was a tenth of
+    the entire space the reward had to express quality in.
+    """
+    w = gv.TierWeights()
+    assert w.substance == pytest.approx(w.authority - w.authority_margin)
+    width = w.substance - w.passing_floor
+    assert width > 0.30, f"passing band is only {width:.3f} wide"
+    # And the margin is real: an authoritative pass must still outrank the
+    # best statically-graded candidate.
+    assert w.substance < w.authority
+
+
+def test_an_explicit_substance_pins_the_old_ceiling() -> None:
+    """The derivation is a default, not a mandate."""
+    w = gv.TierWeights(substance=0.70)
+    assert w.substance == pytest.approx(0.70)
+
+
+def test_misordered_bands_degrade_to_a_monotonic_ladder() -> None:
+    """A typo'd env var must not invert the reward.
+
+    Refusing to construct would stop training entirely over a bad value,
+    which is strictly worse than grading on a clamped-but-ordered ladder.
+    """
+    w = gv.TierWeights(envelope=0.9, shape=0.1, syntax=0.2,
+                       passing_floor=0.05, substance=0.3, authority=0.4)
+    edges = [w.envelope, w.shape, w.syntax, w.passing_floor,
+             w.substance, w.authority]
+    assert edges == sorted(edges), edges
+    assert all(0.0 <= e <= 1.0 for e in edges)
+
+
+def test_widened_band_did_not_break_the_ladder() -> None:
+    """Every rung still outranks the one below it, with the band 3.5x wider."""
+    passing = gv.verify_static(env(GOOD)).score
+    noop = gv.verify_static(json.dumps({
+        "schema_version": gv.SCHEMA_NOOP, "reason": "already complete"})).score
+    inert = gv.verify_static(env(INERT)).score
+    broken = gv.verify_static(env(BROKEN_EARLY)).score
+    assert passing > inert > broken, (passing, inert, broken)
+    assert passing > noop > broken
+
+
+def test_both_layers_map_a_grade_identically() -> None:
+    """`verify_static` and `verify_any` share ONE mapping.
+
+    The mapping used to be duplicated in both, which is the shape that
+    drifts: widen a band in one and the same code scores differently
+    depending on which layer read it, with nothing failing.
+    """
+    from_envelope = gv.verify_static(env(GOOD)).score
+    from_source = gv.verify_any(GOOD).score       # bare source, no envelope
+    assert from_envelope == pytest.approx(from_source)
+
+
+# --------------------------------------------------------------------------
+# Nesting depth — a dimension branch-COUNT cannot see
+# --------------------------------------------------------------------------
+
+
+def test_nesting_is_scored_separately_from_branch_count() -> None:
+    """Same number of branches, different shape, different score."""
+    flat = (
+        "def f(xs):\n"
+        "    if not xs: return 0\n"
+        "    if len(xs) == 1: return 1\n"
+        "    if len(xs) == 2: return 2\n"
+        "    return 3\n"
+    )
+    nested = (
+        "def f(xs):\n"
+        "    if xs:\n"
+        "        if len(xs) > 1:\n"
+        "            if len(xs) > 2:\n"
+        "                return 3\n"
+        "    return 0\n"
+    )
+    assert gv.verify_static(env(flat)).score > gv.verify_static(env(nested)).score
+
+
+def test_depth_walker_survives_pathologically_nested_source() -> None:
+    """The grader runs on MODEL output; deep nesting must not raise.
+
+    A recursive walker is the obvious implementation and the wrong one:
+    the input that would blow the recursion limit is exactly the input a
+    struggling model produces, and a grader that raises stops training.
+    """
+    src = "def f():\n"
+    for i in range(220):
+        src += "    " * (i + 1) + f"if x{i}:\n"
+    src += "    " * 221 + "pass\n"
+    import ast as _ast
+    try:
+        tree = _ast.parse(src)
+    except (SyntaxError, MemoryError, RecursionError):
+        pytest.skip("parser itself refused the input; grader never sees it")
+    assert gv._max_branch_depth(tree) > 100
+    # And the full path never raises either.
+    assert 0.0 <= gv.verify_static(env(src)).score <= 1.0
+
+
+def test_an_unweighted_submetric_cannot_break_a_run(monkeypatch) -> None:
+    """Adding a dimension must not KeyError against a stale weight map."""
+    monkeypatch.setitem(gv._Q_WEIGHTS, "flatness", 0.0)
+    gv._Q_WEIGHTS.pop("flatness", None)
+    try:
+        assert 0.0 <= gv.verify_static(env(GOOD)).score <= 1.0
+    finally:
+        gv._Q_WEIGHTS["flatness"] = 0.6

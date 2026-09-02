@@ -137,13 +137,63 @@ class TierWeights:
     reached a later tier, however gracefully it failed — otherwise a
     beautifully-formed envelope containing garbage would outscore working
     code, and the reward would teach presentation over correctness.
+
+    ## The passing band is DERIVED, not a constant
+
+    ``substance`` used to be a rigid 0.70, which made the band for code
+    that WORKS ``[0.60, 0.70]`` — 0.10 wide, while everything from 0.70 to
+    the authority band sat empty. Measured consequence (soaks 13 and 14):
+    every passing sibling scored 0.65-0.672 and the best group spread in
+    two full soaks was 0.0052, so `--min-spread 0.01` demanded 10% of the
+    entire available range between two candidates and no group ever
+    cleared it. The generator was producing structurally distinct answers
+    by then; the reward simply had nowhere to put the difference.
+
+    So the ceiling is now derived from the band ABOVE it rather than
+    declared: passing code spans ``[passing_floor, authority -
+    authority_margin]``. The margin is the whole non-overlap contract in
+    one number — an authoritative (test-executed) verdict must still
+    strictly outrank the most beautiful statically-graded candidate,
+    because tests are evidence and style is not. Set ``BAND_SUBSTANCE``
+    explicitly to pin the old behaviour.
+
+    Every edge is env-tunable and the ordering is ENFORCED in
+    ``__post_init__``: a misconfigured environment degrades to a valid
+    monotonic ladder instead of silently inverting the reward.
     """
 
     envelope: float = field(default_factory=lambda: _envf("BAND_ENVELOPE", 0.10))
     shape: float = field(default_factory=lambda: _envf("BAND_SHAPE", 0.25))
     syntax: float = field(default_factory=lambda: _envf("BAND_SYNTAX", 0.45))
-    substance: float = field(default_factory=lambda: _envf("BAND_SUBSTANCE", 0.70))
+    #: Bottom of the band for code that parses AND defines something. Above
+    #: `syntax` so a passing candidate can never be outranked by a graceful
+    #: syntax failure.
+    passing_floor: float = field(
+        default_factory=lambda: _envf("BAND_PASSING_FLOOR", _PASS_FLOOR))
+    #: Headroom reserved BELOW `authority` for the authoritative tier. The
+    #: one number that keeps "tests passed" strictly above "reads nicely".
+    authority_margin: float = field(
+        default_factory=lambda: _envf("BAND_AUTHORITY_MARGIN", 0.05))
+    #: Ceiling of the passing band. Negative (the default) means DERIVE it
+    #: from `authority` and `authority_margin`; an explicit value pins it.
+    substance: float = field(
+        default_factory=lambda: _envf("BAND_SUBSTANCE", -1.0))
     authority: float = field(default_factory=lambda: _envf("BAND_AUTHORITY", 1.00))
+
+    def __post_init__(self) -> None:
+        if self.substance < 0.0:
+            self.substance = self.authority - self.authority_margin
+        # Monotonicity is the contract every tier mapping relies on. Repair
+        # rather than raise: a grader that refuses to start would stop
+        # training entirely over a typo'd env var, which is strictly worse
+        # than grading on a clamped-but-ordered ladder.
+        edges = ["envelope", "shape", "syntax", "passing_floor",
+                 "substance", "authority"]
+        prev = 0.0
+        for name in edges:
+            val = max(prev, min(1.0, float(getattr(self, name))))
+            setattr(self, name, val)
+            prev = val
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +297,23 @@ def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
     return ver, sources, ""
 
 
-#: Floor of the passing band. Above `no_defs` (0.50) and `inert` (0.15),
-#: so a wider range for working code can never outrank a later tier.
+#: Floor of the passing band, in FINAL SCORE space. Above the structure
+#: band, so a wider range for working code can never outrank a later tier.
 _PASS_FLOOR = _envf("PASS_FLOOR", 0.60)
+
+#: The three bands a graded source can land in, in ascending order. Named
+#: because the ladder is now structural: each band owns a disjoint score
+#: interval, so "cannot be outranked by a lower tier" is a property of the
+#: intervals rather than an arithmetic coincidence between two constants.
+_BAND_SYNTAX = "syntax"        # parses badly or not at all
+_BAND_STRUCTURE = "structure"  # parses, but defines nothing worth grading
+_BAND_PASSING = "passing"      # parses AND defines: the graded band
+
+#: Positions WITHIN the structure band. Inert code (a body of `pass` or a
+#: bare docstring) is worth strictly less than code that at least runs
+#: statements, and both are worth less than anything with a definition.
+_INERT_Q = _envf("INERT_Q", 0.15)
+_NO_DEFS_Q = _envf("NO_DEFS_Q", 0.50)
 
 #: Relative weights of the quality sub-metrics. Env-tunable because what
 #: "better code" means is a policy, not a constant -- a docs-focused batch
@@ -260,6 +324,7 @@ _Q_WEIGHTS = {
     "density": _envf("Q_W_DENSITY", 0.6),
     "simplicity": _envf("Q_W_SIMPLICITY", 0.8),
     "concision": _envf("Q_W_CONCISION", 0.6),
+    "flatness": _envf("Q_W_FLATNESS", 0.6),
 }
 
 #: Chars-per-statement beyond which a file reads as padded. Not a hard cap:
@@ -268,6 +333,10 @@ _CONCISION_TARGET = _envf("CONCISION_TARGET_CPS", 90.0)
 
 #: Decision points per definition treated as "reasonably simple".
 _SIMPLICITY_TARGET = _envf("SIMPLICITY_TARGET_BRANCHES", 4.0)
+
+#: Nesting depth of branching constructs treated as "reasonably flat".
+#: Decays past it rather than cutting off, for the same reason as the rest.
+_DEPTH_TARGET = _envf("DEPTH_TARGET_LEVELS", 3.0)
 
 _BRANCH_NODES = (
     ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
@@ -350,6 +419,14 @@ def _quality(tree, src, defs, stmts):
     branches = sum(1 for n in ast.walk(tree) if isinstance(n, _BRANCH_NODES))
     simplicity = _soft(branches / n_defs, _SIMPLICITY_TARGET)
 
+    # NESTING is a different axis from branch COUNT, which is why it is its
+    # own sub-metric rather than folded into `simplicity`: ten sequential
+    # guard clauses and one ten-deep pyramid have the same branch count and
+    # are not the same code. Measured on the deepest nesting of any
+    # BRANCHING construct, so a module of long flat functions is not
+    # punished for being long.
+    flatness = _soft(_max_branch_depth(tree), _DEPTH_TARGET)
+
     # `src.strip()`, not `src`: surrounding whitespace is PRESENTATION, and
     # letting it move the score reintroduces the defect the fence stripper
     # exists to remove -- two candidates whose code is byte-identical would
@@ -360,20 +437,61 @@ def _quality(tree, src, defs, stmts):
     parts = {
         "docs": docs, "types": types, "density": density,
         "simplicity": simplicity, "concision": concision,
+        "flatness": flatness,
     }
-    total_w = sum(_Q_WEIGHTS.values()) or 1.0
-    q = sum(parts[k] * _Q_WEIGHTS[k] for k in parts) / total_w
+    # Weight lookup tolerates a sub-metric the env has not been told about,
+    # so adding a dimension can never divide by a stale total or KeyError a
+    # training run mid-batch.
+    weights = {k: float(_Q_WEIGHTS.get(k, 0.0)) for k in parts}
+    total_w = sum(weights.values()) or 1.0
+    q = sum(parts[k] * weights[k] for k in parts) / total_w
     q = max(0.0, min(1.0, q))
     detail = (
         f"q={q:.3f},docs={docs:.2f},types={types:.2f},den={density:.2f},"
-        f"simp={simplicity:.2f},con={concision:.2f},defs={n_defs},"
-        f"stmt={n_stmts}"
+        f"simp={simplicity:.2f},con={concision:.2f},flat={flatness:.2f},"
+        f"defs={n_defs},stmt={n_stmts}"
     )
     return q, detail
 
 
-def _grade_source(src: str) -> Tuple[float, str]:
-    """Graded syntax/substance for ONE extracted source. In [0, 1]."""
+def _max_branch_depth(tree: "ast.AST") -> int:
+    """Deepest nesting of branching constructs. Iterative, never recurses.
+
+    `ast.walk` cannot answer this — it flattens. A recursive walker would
+    be the obvious alternative and is the wrong tool here: this grader runs
+    on model-generated source, and deeply-nested generated code is exactly
+    the input that would hit the interpreter's recursion limit. A grader
+    that raises on the pathological case is a grader that stops training,
+    so the traversal carries its own explicit stack.
+    """
+    deepest = 0
+    stack = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            d = depth + 1 if isinstance(child, _BRANCH_NODES) else depth
+            if d > deepest:
+                deepest = d
+            stack.append((child, d))
+    return deepest
+
+
+def _grade_source(src: str) -> "SourceGrade":
+    """Grade ONE extracted source: which BAND it earns, and where in it.
+
+    Returns a position in [0, 1] WITHIN a named band rather than a single
+    number spanning every outcome. That split is the fix for a real defect:
+    the old return value pre-compressed passing code into the top 40% of
+    [0, 1] (`_PASS_FLOOR + (1 - _PASS_FLOOR) * q`) and the caller then
+    squeezed THAT into a 0.25-wide tier span, so quality variation reached
+    the reward twice-attenuated — 0.10 of usable range, and in practice a
+    group spread of ~1e-3 against a 0.01 floor.
+
+    Naming the band makes the ladder structural instead of arithmetic: the
+    caller maps each band onto its own interval, and the non-overlap
+    contract holds because the intervals do not overlap, not because two
+    magic constants happen to be ordered.
+    """
     try:
         ast.parse(src)
     except SyntaxError as exc:
@@ -382,33 +500,32 @@ def _grade_source(src: str) -> Tuple[float, str]:
         # How far the parse got, normalised over the file's own length: a
         # candidate that dies on its last line got nearly everything right,
         # and that difference is the signal a boolean throws away.
-        return max(0.0, min(1.0, (line - 1) / total)), f"syntax_error:line{line}/{total}"
+        return SourceGrade(max(0.0, min(1.0, (line - 1) / total)), _BAND_SYNTAX,
+                           f"syntax_error:line{line}/{total}")
     except (ValueError, RecursionError) as exc:
-        return 0.0, f"uncompilable:{type(exc).__name__}"
+        return SourceGrade(0.0, _BAND_SYNTAX, f"uncompilable:{type(exc).__name__}")
 
     tree = ast.parse(src)
     stmts = list(getattr(tree, "body", []) or [])
     if not stmts:
-        return 0.0, "empty_module"
+        return SourceGrade(0.0, _BAND_SYNTAX, "empty_module")
     inert = all(
         isinstance(n, ast.Pass)
         or (isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant))
         for n in stmts
     )
     if inert:
-        return 0.15, "inert_body"
+        return SourceGrade(_INERT_Q, _BAND_STRUCTURE, "inert_body")
     defs = [
         n for n in ast.walk(tree)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     ]
     if not defs:
-        return 0.5, f"{len(stmts)}stmt_no_defs"
+        return SourceGrade(_NO_DEFS_Q, _BAND_STRUCTURE, f"{len(stmts)}stmt_no_defs")
     q, detail = _quality(tree, src, defs, stmts)
-    # Mapped into [_PASS_FLOOR, 1.0]. The floor sits ABOVE the no-defs 0.5
-    # and the inert 0.15, so widening the range for passing code cannot
-    # promote a candidate past one that reached a later tier -- the
-    # non-overlap contract in TierWeights holds unchanged.
-    return _PASS_FLOOR + (1.0 - _PASS_FLOOR) * q, f"quality:{detail}"
+    # Raw q — the caller owns the band. No pre-compression here, or the
+    # attenuation this refactor removed comes straight back.
+    return SourceGrade(q, _BAND_PASSING, f"quality:{detail}")
 
 
 def _reason_kind(reason: str) -> str:
@@ -435,6 +552,38 @@ _SHAPE_FAULTS = frozenset({"missing_keys", "candidates_empty", "no_content"})
 
 #: The extracted source is not usable Python.
 _SYNTAX_FAULTS = frozenset({"syntax_error", "uncompilable", "empty_module"})
+
+
+@dataclass(frozen=True)
+class SourceGrade:
+    """Where one source sits: a band, and a position in [0, 1] within it."""
+
+    q: float
+    band: str
+    reason: str
+
+
+def _verdict_for_grade(
+    grade: "SourceGrade", w: "TierWeights", schema_version: str = "",
+) -> Verdict:
+    """Map a banded grade onto its score interval. THE only such mapping.
+
+    This existed twice — identically — in `verify_static` and `verify_any`,
+    which is precisely the shape that drifts: a band widened in one place
+    and not the other would score the same code differently depending on
+    which layer read it, and nothing would fail. One function, two callers.
+
+    The interval per band is read from `TierWeights`, whose `__post_init__`
+    guarantees the edges are monotonic, so a mapped score can never escape
+    its band or invert the ladder.
+    """
+    lo, hi, tier = {
+        _BAND_SYNTAX: (w.shape, w.syntax, 2),
+        _BAND_STRUCTURE: (w.syntax, w.passing_floor, 3),
+        _BAND_PASSING: (w.passing_floor, w.substance, 3),
+    }.get(grade.band, (w.shape, w.syntax, 2))
+    q = max(0.0, min(1.0, float(grade.q)))
+    return Verdict(lo + (hi - lo) * q, tier, grade.reason, schema_version)
 
 
 def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
@@ -467,13 +616,12 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         # Tier 2/3 — the whole point: grade the extracted SOURCE.
         graded = [_grade_source(s) for s in sources]
         # Worst-file semantics: a multi-file candidate is only as valid as
-        # its weakest file, because APPLY is all-or-nothing.
-        score, why = min(graded, key=lambda g: g[0])
-        if score <= 0.0 or _reason_kind(why) in _SYNTAX_FAULTS:
-            span = w.syntax - w.shape
-            return Verdict(w.shape + span * score, 2, why, ver)
-        span = w.substance - w.syntax
-        return Verdict(w.syntax + span * score, 3, why, ver)
+        # its weakest file, because APPLY is all-or-nothing. Ranked by the
+        # SCORE the band produces, not by `q` — `q` is a position within a
+        # band, so comparing it across bands would rank a perfect-quality
+        # file below a merely-late syntax error.
+        worst = min(graded, key=lambda g: _verdict_for_grade(g, w).score)
+        return _verdict_for_grade(worst, w, ver)
     except Exception as exc:  # noqa: BLE001 — a grader must never break training
         logger.debug("verify_static fault: %s", exc, exc_info=True)
         return Verdict(w.envelope * 0.2, 0, "grader_fault")
@@ -510,15 +658,11 @@ def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         return v
     w = weights or TierWeights()
     try:
-        score, why = _grade_source(text or "")
+        grade = _grade_source(text or "")
     except Exception:  # noqa: BLE001 — a grader must never break training
         logger.debug("verify_any source fault", exc_info=True)
         return v
-    if score <= 0.0 or _reason_kind(why) in _SYNTAX_FAULTS:
-        span = w.syntax - w.shape
-        return Verdict(w.shape + span * score, 2, why)
-    span = w.substance - w.syntax
-    return Verdict(w.syntax + span * score, 3, why)
+    return _verdict_for_grade(grade, w)
 
 
 # ---------------------------------------------------------------------------
