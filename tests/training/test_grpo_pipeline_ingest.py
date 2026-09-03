@@ -75,3 +75,42 @@ def test_one_hash_per_op_first_seen_wins(tmp_path: Path) -> None:
 def test_rows_without_a_hash_are_never_collapsed(tmp_path: Path) -> None:
     d = _corpus(tmp_path, [_row("op-1", 0, "a = 1\n"), _row("op-1", 1, "a = 1\n")])
     assert len(list(gp.iter_trajectory_rows(d))) == 2
+
+
+def test_a_torn_line_is_counted_not_silently_dropped(tmp_path, caplog) -> None:
+    """Readers take no lock, so a harvest against a LIVE soak can catch the
+    row being appended and see it torn. That is benign — the file is
+    append-only — but an uncounted skip makes a damaged corpus
+    indistinguishable from a healthy one.
+    """
+    import logging
+
+    d = tmp_path / "events"
+    d.mkdir()
+    good = _row("op-a", 0, "def f(): return 1", kind="primary", h="h1")
+    torn = json.dumps(_row("op-b", 0, "def g(): return 2", kind="primary",
+                           h="h2"))[:120]
+    (d / "experience.jsonl").write_text(
+        json.dumps(good) + "\n" + torn + "\n", encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=gp.logger.name):
+        rows = list(gp.iter_trajectory_rows(d))
+
+    assert len(rows) == 1, "the intact row must still be ingested"
+    assert any("undecodable line" in r.getMessage() for r in caplog.records), \
+        "the skip must be reported"
+
+
+def test_a_clean_corpus_logs_no_warning(tmp_path, caplog) -> None:
+    import logging
+
+    d = tmp_path / "events"
+    d.mkdir()
+    (d / "experience.jsonl").write_text(
+        json.dumps(_row("op-a", 0, "def f(): return 1", kind="primary", h="h1"))
+        + "\n", encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger=gp.logger.name):
+        assert len(list(gp.iter_trajectory_rows(d))) == 1
+    assert not [r for r in caplog.records if "undecodable" in r.getMessage()]

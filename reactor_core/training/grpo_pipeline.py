@@ -86,6 +86,7 @@ def iter_trajectory_rows(
         except OSError as exc:
             logger.warning("[GRPO] unreadable telemetry %s: %s", f.name, exc)
             continue
+        malformed = 0
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -93,6 +94,16 @@ def iter_trajectory_rows(
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                # Counted, not silent. The writer appends under an
+                # exclusive flock but readers take no lock, so a harvest
+                # running against a LIVE soak can catch the row currently
+                # being appended and see it torn. That case is benign — the
+                # file is append-only, so the next read gets it whole — but
+                # an uncounted `continue` makes a genuinely corrupt corpus
+                # indistinguishable from a healthy one, and silently
+                # under-reporting the sample is how this pipeline has been
+                # wrong before.
+                malformed += 1
                 continue
             # Recorder rows only; the same directory also carries Trinity
             # bus envelopes, which have no generation content at all.
@@ -111,6 +122,12 @@ def iter_trajectory_rows(
                     continue
                 seen_keys.add(key)
             yield row
+        if malformed:
+            logger.warning(
+                "[GRPO] %s: %d undecodable line(s) skipped. One is normally "
+                "the row being appended by a live soak; a persistent count "
+                "means the corpus is damaged.", f.name, malformed,
+            )
 
 
 def build_prompt_dataset(
