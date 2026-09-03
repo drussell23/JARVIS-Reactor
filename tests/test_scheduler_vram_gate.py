@@ -111,28 +111,43 @@ def test_utilization_gate_still_independent() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeProc:
-    def __init__(self, stdout: bytes, returncode: int = 0) -> None:
-        self._stdout = stdout
+class _FakeRun:
+    """What ``subprocess.run`` returns to the shared probe."""
+
+    def __init__(self, stdout: str, returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.stderr = ""
         self.returncode = returncode
 
-    async def communicate(self):
-        return self._stdout, b""
+
+def _guard():
+    """The single memory reader the scheduler now delegates to.
+
+    ``_get_gpu_metrics`` no longer shells out itself: the "occupancy, not
+    bandwidth" decision lives in ``training.memory_guard`` and is shared
+    with the GRPO runner's admission gate, so there is one implementation
+    to keep right rather than two that can drift back apart. These tests
+    therefore patch the probe's subprocess seam; the assertions are
+    unchanged, because the contract is.
+    """
+    probe = scheduler._load_memory_guard()
+    assert probe is not None, "memory_guard must be loadable"
+    return probe
 
 
 @pytest.mark.asyncio
 async def test_metrics_report_occupancy_not_bandwidth(monkeypatch) -> None:
     """nvidia-smi is asked for memory.used/memory.total, and the ratio is
     what reaches the snapshot."""
+    probe = _guard()
     seen_args = {}
 
-    async def _fake_exec(*args, **kwargs):
+    def _fake_run(args, **kwargs):
         seen_args["args"] = args
-        return _FakeProc(b"0, 29078, 32607\n")
+        return _FakeRun("0, 29078, 32607\n")
 
-    monkeypatch.setattr(
-        scheduler.asyncio, "create_subprocess_exec", _fake_exec,
-    )
+    monkeypatch.setattr(probe.shutil, "which", lambda _n: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(probe.subprocess, "run", _fake_run)
     monitor = scheduler.ResourceMonitor()
     gpu_util, vram_pct = await monitor._get_gpu_metrics()
 
@@ -143,12 +158,10 @@ async def test_metrics_report_occupancy_not_bandwidth(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_zero_total_memory_does_not_divide_by_zero(monkeypatch) -> None:
-    async def _fake_exec(*args, **kwargs):
-        return _FakeProc(b"0, 0, 0\n")
-
-    monkeypatch.setattr(
-        scheduler.asyncio, "create_subprocess_exec", _fake_exec,
-    )
+    probe = _guard()
+    monkeypatch.setattr(probe.shutil, "which", lambda _n: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(probe.subprocess, "run",
+                        lambda *a, **k: _FakeRun("0, 0, 0\n"))
     monitor = scheduler.ResourceMonitor()
     _gpu, vram_pct = await monitor._get_gpu_metrics()
     assert vram_pct is None
@@ -156,11 +169,45 @@ async def test_zero_total_memory_does_not_divide_by_zero(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_missing_nvidia_smi_degrades_to_none(monkeypatch) -> None:
-    async def _boom(*args, **kwargs):
-        raise FileNotFoundError("nvidia-smi")
-
-    monkeypatch.setattr(
-        scheduler.asyncio, "create_subprocess_exec", _boom,
-    )
+    probe = _guard()
+    monkeypatch.setattr(probe.shutil, "which", lambda _n: None)
     monitor = scheduler.ResourceMonitor()
     assert await monitor._get_gpu_metrics() == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_probe_degrades_to_none(monkeypatch) -> None:
+    """A wedged nvidia-smi must not stall the monitor, and must not be
+    reported as an idle card."""
+    probe = _guard()
+    monkeypatch.setattr(probe.shutil, "which", lambda _n: "/usr/bin/nvidia-smi")
+
+    def _boom(*_a, **_k):
+        raise OSError("nvidia-smi went away")
+
+    monkeypatch.setattr(probe.subprocess, "run", _boom)
+    monitor = scheduler.ResourceMonitor()
+    assert await monitor._get_gpu_metrics() == (None, None)
+
+
+def test_scheduler_no_longer_carries_its_own_nvidia_smi_call() -> None:
+    """DRY, enforced: a second parser here is how the metric drifted back
+    to ``utilization.memory`` the first time.
+
+    Comments and docstrings are stripped before the check — the surviving
+    prose *explains* the distinction and must stay readable, while a
+    literal ``--query-gpu`` in executable code means the duplication is
+    back.
+    """
+    import io
+    import tokenize
+
+    source = _SCHEDULER_PATH.read_text(encoding="utf-8")
+    code_tokens = [
+        tok.string
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING)
+    ]
+    code = " ".join(code_tokens)
+    assert "--query-gpu" not in code
+    assert "utilization.memory" not in code

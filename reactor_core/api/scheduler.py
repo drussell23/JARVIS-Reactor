@@ -71,6 +71,44 @@ from typing import (
 logger = logging.getLogger(__name__)
 
 
+#: Memoized ``training.memory_guard`` module, or False once it is known to
+#: be unavailable. Loaded BY PATH and LAZILY, for the same reason
+#: ``scripts/grpo_preflight.py`` does it: ``reactor_core/__init__`` eagerly
+#: imports the ML stack, and this scheduler is exercised by stdlib-only
+#: tests on runners that have neither torch nor a GPU. ``memory_guard``
+#: itself is stdlib-only at module scope; a package-qualified import would
+#: still drag the whole training stack in through the package __init__.
+_MEMORY_GUARD: Any = None
+
+
+def _load_memory_guard() -> Any:
+    """The shared memory probe, or None if it cannot be loaded."""
+    global _MEMORY_GUARD
+    if _MEMORY_GUARD is not None:
+        return _MEMORY_GUARD or None
+    import importlib.util  # noqa: PLC0415
+    import sys as _sys  # noqa: PLC0415
+
+    path = (
+        Path(__file__).resolve().parents[1] / "training" / "memory_guard.py"
+    )
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_reactor_memory_guard", path,
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {path}")
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[scheduler] memory_guard unavailable: %s", exc)
+        _MEMORY_GUARD = False
+        return None
+    _MEMORY_GUARD = mod
+    return mod
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -430,32 +468,30 @@ class ResourceMonitor:
         ``utilization.memory=0`` while holding 29078/32607 MiB (89.2%).
         Gating on the bandwidth figure admits a training job onto a card
         with 3 GiB free.
-        """
-        # Try nvidia-smi
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
 
-            if proc.returncode == 0:
-                line = stdout.decode().strip().split("\n")[0]
-                gpu_util, mem_used, mem_total = map(float, line.split(","))
-                vram_pct = (
-                    100.0 * mem_used / mem_total if mem_total > 0 else None
-                )
-                return gpu_util, vram_pct
-        except Exception:
-            pass
+        The reading itself lives in ``training.memory_guard`` and is shared
+        with the GRPO runner's admission gate. One reader, because the
+        decision above is subtle enough that a second copy would drift —
+        and drifting back to ``utilization.memory`` is precisely the bug
+        this gate exists to prevent.
+        """
+        probe = _load_memory_guard()
+        if probe is None:
+            return None, None
+        # Off the event loop: the probe shells out to nvidia-smi, which
+        # blocks, and this runs inside the scheduler's monitor tick.
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(probe.gpu_occupancy_pct), timeout=10.0,
+            )
+        except Exception:  # noqa: BLE001
+            # A wedged nvidia-smi must not stall the monitor. Unknown is
+            # reported as None, never as 0.0 — see is_training_allowed,
+            # which treats None as "cannot say" rather than "card is free".
+            return None, None
 
         # Try MPS (Apple Silicon) - no direct utilization API
         # Could potentially use powermetrics but requires sudo
-
-        return None, None
 
     async def is_training_allowed(self) -> Tuple[bool, str]:
         """Check if training is allowed based on current resources."""
