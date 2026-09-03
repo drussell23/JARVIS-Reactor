@@ -168,9 +168,32 @@ def history_rewards(
     return out
 
 
+def _group_prompt(prompts: Optional[Sequence[Any]]) -> str:
+    """The one prompt a GRPO group shares. Never raises.
+
+    TRL passes the prompt repeated once per completion; a group is by
+    definition `num_generations` samples of a single prompt, so the first
+    non-empty entry is that prompt. A chat-shaped prompt (list of message
+    dicts) is flattened to its text so intent detection sees words rather
+    than a repr.
+    """
+    for item in (prompts or ()):
+        if isinstance(item, str) and item.strip():
+            return item
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+            parts = [
+                str(m.get("content", ""))
+                for m in item if isinstance(m, dict)
+            ]
+            joined = "\n".join(p for p in parts if p)
+            if joined.strip():
+                return joined
+    return ""
+
+
 async def candidate_reward(
     completions: Optional[Sequence[str]] = None,
-    prompts: Optional[Sequence[Any]] = None,  # noqa: ARG001 — TRL passes it
+    prompts: Optional[Sequence[Any]] = None,
     **kwargs: Any,
 ) -> Optional[List[Optional[float]]]:
     """TRL-compatible reward over one group of sibling candidates.
@@ -193,9 +216,18 @@ async def candidate_reward(
 
     # Grades the CODE inside the envelope, in bands, across a tiered
     # ladder (envelope -> shape -> syntax -> substance -> authority).
-    from reactor_core.training.grpo_verifier import verify_batch  # noqa: PLC0415
+    from reactor_core.training.grpo_verifier import (  # noqa: PLC0415
+        refine_group,
+        verify_batch,
+    )
 
     verdicts = await verify_batch(texts)
+    # The group is the unit of comparison, so the grade is refined in the
+    # context the group shares: the task's intent, and the code each
+    # sibling chose DIFFERENTLY from the others. Whole-file grading
+    # measured ~90% shared text and reported a 0.06 disagreement as 0.017.
+    # Authoritative verdicts pass through untouched — tests are evidence.
+    verdicts = refine_group(texts, verdicts, prompt=_group_prompt(prompts))
     rewards: List[float] = [v.score for v in verdicts]
     _emit(log_extra, "verify_reason", [v.reason for v in verdicts])
     _emit(log_extra, "verify_tier", [v.tier for v in verdicts])

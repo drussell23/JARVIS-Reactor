@@ -103,6 +103,13 @@ def _envs(name: str, default: str = "") -> str:
     return (os.environ.get(_ENV_PREFIX + name, default) or "").strip()
 
 
+def _envb(name: str, default: bool) -> bool:
+    raw = _envs(name).lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
@@ -327,6 +334,50 @@ _Q_WEIGHTS = {
     "flatness": _envf("Q_W_FLATNESS", 0.6),
 }
 
+#: Master for the context-aware layer: task-intent weighting + the
+#: differential footprint. Off restores the whole-file, fixed-weight
+#: grade byte-for-byte, which is how a soak's spread stays attributable
+#: to one variable.
+_CONTEXT_METRICS = _envb("CONTEXT_METRICS", True)
+
+#: How much of the passing grade is carried by the DIFFERENTIAL FOOTPRINT
+#: (the code a sibling chose differently) versus the whole file it lands
+#: in. Not 1.0: a candidate that fixes the bug and wrecks the rest of the
+#: module must still lose, so the file it produced keeps a real share.
+_FOOTPRINT_W = _envf("Q_FOOTPRINT_WEIGHT", 0.6)
+
+#: Task intent -> multipliers on the operator's configured base weights.
+#: Multipliers, never replacements: `_Q_WEIGHTS` stays the policy and this
+#: only says which axis the TASK is about. A goal that asks for a bounded
+#: recursion guard is judged mostly on whether the result stayed simple
+#: and flat; a docs goal is judged on whether it documented anything.
+_INTENT_EMPHASIS: Dict[str, Dict[str, float]] = {
+    "docs": {"docs": 2.0, "types": 1.2},
+    "typing": {"types": 2.0, "docs": 1.2},
+    "tests": {"density": 1.5, "docs": 1.3},
+    "refactor": {"simplicity": 1.8, "flatness": 1.8, "concision": 1.4},
+    "robustness": {"simplicity": 1.5, "flatness": 1.5},
+    "performance": {"concision": 1.3, "simplicity": 1.3},
+}
+
+#: Markers per intent. Deterministic substring families, no model call.
+#: Scanned over the TASK REGION only (see `_task_region`) — a whole O+V
+#: prompt is ~24 KB of which the Manifesto and architecture digests are
+#: byte-identical across every op, so counting markers over all of it
+#: would measure the boilerplate and report the same intent every time.
+_INTENT_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "docs": ("docstring", "document", "docs for", "comment", "explain"),
+    "typing": ("type hint", "annotat", "typing", "mypy", "type signature"),
+    "tests": ("test file", "test coverage", "pytest", "unit test", "regression test"),
+    "refactor": ("refactor", "simplify", "deduplicate", "extract", "clean up",
+                 "readab", "restructur"),
+    "robustness": ("guard", "edge case", "handle", "raise", "except",
+                   "validate", "bounded", "overflow", "recursion", "crash",
+                   "fail", "error", "none check", "null"),
+    "performance": ("performance", "latency", "faster", "optimi", "cache",
+                    "throughput", "memory"),
+}
+
 #: Chars-per-statement beyond which a file reads as padded. Not a hard cap:
 #: the sub-metric decays smoothly so one verbose function cannot zero a file.
 _CONCISION_TARGET = _envf("CONCISION_TARGET_CPS", 90.0)
@@ -356,7 +407,7 @@ def _soft(value: float, target: float) -> float:
     return float(target) / (float(target) + max(0.0, float(value)))
 
 
-def _quality(tree, src, defs, stmts):
+def _quality(tree, src, defs, stmts, q_weights=None):
     """Continuous quality of code that already PARSES. Returns (q, detail).
 
     ## Why this replaces a def-count step
@@ -390,7 +441,9 @@ def _quality(tree, src, defs, stmts):
       * concision -- characters per statement, decaying past a target, so
         padding a file cannot buy reward
 
-    Weights are env-tunable: what "better" means is policy, not constant.
+    `q_weights` overrides the module policy for ONE call — the seam the
+    task-intent layer uses. Absent, the configured `_Q_WEIGHTS` apply, so
+    every pre-existing caller is byte-identical.
     """
     n_defs = len(defs)
     n_stmts = max(1, len(stmts))
@@ -442,7 +495,8 @@ def _quality(tree, src, defs, stmts):
     # Weight lookup tolerates a sub-metric the env has not been told about,
     # so adding a dimension can never divide by a stale total or KeyError a
     # training run mid-batch.
-    weights = {k: float(_Q_WEIGHTS.get(k, 0.0)) for k in parts}
+    base = q_weights if q_weights is not None else _Q_WEIGHTS
+    weights = {k: float(base.get(k, 0.0)) for k in parts}
     total_w = sum(weights.values()) or 1.0
     q = sum(parts[k] * weights[k] for k in parts) / total_w
     q = max(0.0, min(1.0, q))
@@ -476,7 +530,211 @@ def _max_branch_depth(tree: "ast.AST") -> int:
     return deepest
 
 
-def _grade_source(src: str) -> "SourceGrade":
+# ---------------------------------------------------------------------------
+# Context-aware grading — the task's intent, and the code that differs
+# ---------------------------------------------------------------------------
+#
+# ## The defect this closes
+#
+# Soaks 13-18 all failed `--min-spread 0.01` while the GENERATOR was
+# provably healthy: soak 18's sample is clean (draw kinds separated, no
+# duplicate hashes, 15 of 15 groups pairable) and its best group still
+# spread only 0.00585. The reason is DILUTION, not calibration.
+#
+# A candidate is a WHOLE-FILE rewrite of an existing module. The edit
+# touches five or ten statements of a hundred, so ~90% of the input to
+# every sub-metric is byte-identical across siblings: `docs` is a ratio
+# over all definitions, `concision` a ratio over the whole file. The
+# shared mass pins each ratio and the siblings' real disagreement arrives
+# attenuated by an order of magnitude. Measured on soak 18's corpus, the
+# group whose siblings genuinely differ scores q = 0.523 / 0.526 / 0.509
+# over the whole file and 0.426 / 0.428 / 0.367 over the code they
+# actually chose — a 0.06 separation the whole-file view reported as
+# 0.017. Widening the band again would only rescale the noise with it.
+#
+# ## Why the reference is the GROUP, not the prompt's baseline
+#
+# The obvious reference is the pre-edit file, and the prompt does embed
+# it under a `## File: <path> [SHA-256: ...] [N bytes, M lines]` header.
+# It cannot be used: the recorder truncates it. Measured across every
+# trainable row of soak 18 carrying such a header (8 of 8), the declared
+# byte count, the declared SHA and an explicit truncation marker ALL
+# disagree with the block that arrived. Diffing against a truncated
+# baseline would report the entire tail of the file as deleted for every
+# candidate — a fabricated measurement, which is worse than none.
+#
+# So the reference is the group's COMMON CORE: statements that appear in
+# EVERY sibling are, by construction, not what any sibling chose. What is
+# left is the differential footprint. This measures divergence, which is
+# exactly the quantity a within-group advantage consumes, and it cannot
+# manufacture difference: byte-identical siblings have empty footprints,
+# fall back to the whole-file grade, score identically, and the group is
+# correctly dropped as flat.
+
+
+def _task_region(prompt: str) -> str:
+    """The part of an O+V prompt that describes THIS op. Never raises.
+
+    A whole prompt is ~24 KB of which the Manifesto, the pipeline digest
+    and the architecture sections are byte-identical across every op in a
+    soak. Marker counting over all of it would measure the boilerplate and
+    return the same intent for every task, so the scan is anchored to the
+    task headers the composer emits, and falls back to the head of the
+    text when neither is present (a live rollout prompt need not carry
+    them).
+    """
+    text = str(prompt or "")
+    if not text:
+        return ""
+    out: List[str] = []
+    for header in ("## Task", "## Human Instructions"):
+        start = text.find(header)
+        if start < 0:
+            continue
+        nxt = text.find("\n## ", start + len(header))
+        out.append(text[start: nxt if nxt > 0 else start + 2000])
+    if out:
+        return "\n".join(out).lower()
+    return text[:2000].lower()
+
+
+def _task_intent(prompt: str) -> str:
+    """The single intent this task is about, or "" for none. Deterministic.
+
+    Argmax over marker families with a STRICT winner: a tie means the task
+    is not clearly about one axis, and inventing an emphasis there would
+    move scores on nothing more than keyword luck.
+    """
+    region = _task_region(prompt)
+    if not region:
+        return ""
+    hits = {
+        name: sum(region.count(m) for m in markers)
+        for name, markers in _INTENT_MARKERS.items()
+    }
+    best = max(hits.values()) if hits else 0
+    if best <= 0:
+        return ""
+    winners = [n for n, c in hits.items() if c == best]
+    return winners[0] if len(winners) == 1 else ""
+
+
+def _intent_weights(prompt: str) -> Tuple[Dict[str, float], str]:
+    """Base sub-metric weights scaled by the task's intent. Never raises."""
+    if not _CONTEXT_METRICS:
+        return dict(_Q_WEIGHTS), ""
+    try:
+        intent = _task_intent(prompt)
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        logger.debug("intent detection faulted", exc_info=True)
+        return dict(_Q_WEIGHTS), ""
+    if not intent:
+        return dict(_Q_WEIGHTS), ""
+    emphasis = _INTENT_EMPHASIS.get(intent, {})
+    return ({k: v * float(emphasis.get(k, 1.0)) for k, v in _Q_WEIGHTS.items()},
+            intent)
+
+
+def _strip_docstrings(tree: "ast.AST") -> "ast.AST":
+    """Docstrings out, in place, on a tree the caller owns.
+
+    Two siblings whose only difference is the wording of a docstring have
+    made the same choice, and letting that difference into the footprint
+    would put prose in the numerator of a code measurement. `docs` already
+    scores whether a definition is documented — that signal is kept.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef,
+                                 ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = list(getattr(node, "body", None) or [])
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(getattr(body[0], "value", None), ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
+def _statement_keys(src: str) -> List[Tuple[str, "ast.stmt"]]:
+    """(normalised key, node) per TOP-LEVEL statement. Never raises.
+
+    Top level, not every node: a changed line inside a function makes the
+    whole function the unit that differs, which is the honest granularity
+    for "what did this sibling choose" — and it keeps the comparison O(top
+    level statements) rather than O(nodes) on model-generated source.
+    """
+    try:
+        tree = _strip_docstrings(ast.parse(src))
+    except Exception:  # noqa: BLE001 — unparseable source has no footprint
+        return []
+    out: List[Tuple[str, "ast.stmt"]] = []
+    for stmt in list(getattr(tree, "body", None) or []):
+        try:
+            out.append((ast.dump(stmt, annotate_fields=False), stmt))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _footprint_q(
+    sources: Sequence[str], q_weights: Optional[Dict[str, float]] = None,
+) -> List[Optional[float]]:
+    """Quality of each source's DIFFERENTIAL FOOTPRINT. None where absent.
+
+    `None` is a real answer and is not a zero: it says this candidate's
+    footprint could not be measured — identical to its siblings, or made
+    of statements that define nothing — and the caller must then keep the
+    whole-file grade rather than invent one. Never raises.
+    """
+    n = len(sources)
+    if n < 2:
+        return [None] * n
+    try:
+        per = [_statement_keys(s) for s in sources]
+        if any(not p for p in per):
+            return [None] * n
+        common = set.intersection(*[{k for k, _ in p} for p in per])
+        out: List[Optional[float]] = []
+        for entries in per:
+            diff = [node for key, node in entries if key not in common]
+            out.append(_grade_footprint(diff, q_weights))
+        return out
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        logger.debug("footprint faulted", exc_info=True)
+        return [None] * n
+
+
+def _grade_footprint(
+    diff: Sequence["ast.stmt"], q_weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """`q` over the statements one sibling chose differently, or None."""
+    if not diff:
+        return None
+    try:
+        module = ast.Module(body=list(diff), type_ignores=[])
+        src = ast.unparse(module)
+        tree = ast.parse(src)
+    except Exception:  # noqa: BLE001 — a synthetic module need not round-trip
+        return None
+    stmts = list(getattr(tree, "body", None) or [])
+    defs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    # No definitions in the footprint means the sub-metrics that carry the
+    # signal (docs, types, density) have no denominator. Declining is
+    # correct; grading it anyway would divide by the fallbacks and report
+    # a confident number about nothing.
+    if not defs or not stmts:
+        return None
+    try:
+        q, _detail = _quality(tree, src, defs, stmts, q_weights)
+    except Exception:  # noqa: BLE001
+        return None
+    return float(q)
+
+
+def _grade_source(src: str, q_weights: Optional[Dict[str, float]] = None) -> "SourceGrade":
     """Grade ONE extracted source: which BAND it earns, and where in it.
 
     Returns a position in [0, 1] WITHIN a named band rather than a single
@@ -522,7 +780,7 @@ def _grade_source(src: str) -> "SourceGrade":
     ]
     if not defs:
         return SourceGrade(_NO_DEFS_Q, _BAND_STRUCTURE, f"{len(stmts)}stmt_no_defs")
-    q, detail = _quality(tree, src, defs, stmts)
+    q, detail = _quality(tree, src, defs, stmts, q_weights)
     # Raw q — the caller owns the band. No pre-compression here, or the
     # attenuation this refactor removed comes straight back.
     return SourceGrade(q, _BAND_PASSING, f"quality:{detail}")
@@ -663,6 +921,117 @@ def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         logger.debug("verify_any source fault", exc_info=True)
         return v
     return _verdict_for_grade(grade, w)
+
+
+def _sources_for(text: str) -> List[str]:
+    """The Python source(s) inside one response, whatever LAYER it is.
+
+    Mirrors `verify_any`'s decision exactly — envelope first, raw text only
+    when the text is demonstrably not an envelope — because a footprint
+    built from a different extraction than the grade it refines would be
+    measuring a different candidate than the one being scored.
+    """
+    try:
+        ver, sources, reason = extract_sources(text or "")
+    except Exception:  # noqa: BLE001
+        return [text or ""]
+    if sources:
+        return [str(s or "") for s in sources]
+    if ver is None and _reason_kind(reason) == "envelope_unparseable":
+        return [text or ""]
+    return []
+
+
+def refine_group(
+    texts: Sequence[str],
+    verdicts: Sequence["Verdict"],
+    *,
+    prompt: str = "",
+    weights: Optional[TierWeights] = None,
+) -> List["Verdict"]:
+    """Re-grade a GROUP's passing candidates in the context they share.
+
+    Two additive layers, both deterministic static analysis and neither
+    able to move a candidate out of the band it earned:
+
+      * the task's INTENT re-aims the sub-metric weights, so a goal about
+        bounded recursion is judged mostly on whether the answer stayed
+        simple and flat;
+      * the DIFFERENTIAL FOOTPRINT replaces most of the whole-file grade
+        with a grade of the code this sibling chose differently from the
+        rest of the group, which is where the discriminating information
+        actually lives.
+
+    Only verdicts that came from the passing band (`quality:` reason) are
+    touched. An authoritative verdict is evidence and is left exactly
+    where the tests put it; a syntax failure keeps the score its own band
+    assigned. Never raises: on any fault the input verdicts are returned
+    unchanged, because a reward that stops training is worse than a
+    reward that is merely coarse.
+    """
+    out = list(verdicts)
+    if not _CONTEXT_METRICS or len(out) < 2 or len(texts) != len(out):
+        return out
+    try:
+        w = weights or TierWeights()
+        q_weights, intent = _intent_weights(prompt)
+        idx = [i for i, v in enumerate(out)
+               if _reason_kind(str(v.reason)) == "quality"]
+        # A footprint needs someone to differ FROM. One passing candidate
+        # in a group has no divergence to measure and keeps its grade.
+        if len(idx) < 2:
+            return out
+        sources = {i: _sources_for(str(texts[i] or "")) for i in idx}
+        if any(not s for s in sources.values()):
+            return out
+        # One source per candidate for the comparison: a multi-file answer
+        # is one answer, and its files were already reduced to a single
+        # verdict by worst-file semantics upstream.
+        joined = ["\n".join(sources[i]) for i in idx]
+        fps = _footprint_q(joined, q_weights)
+        for slot, i in enumerate(idx):
+            grades = [_grade_source(s, q_weights) for s in sources[i]]
+            worst = min(grades, key=lambda g: _verdict_for_grade(g, w).score)
+            if worst.band != _BAND_PASSING:
+                continue
+            q_whole = float(worst.q)
+            q_fp = fps[slot]
+            if q_fp is None:
+                # Unmeasurable footprint: keep the whole-file grade, but
+                # under the intent weights, which are a property of the
+                # TASK and do not depend on the group differing.
+                q_eff, note = q_whole, "fp=none"
+            else:
+                fw = max(0.0, min(1.0, _FOOTPRINT_W))
+                q_eff = (1.0 - fw) * q_whole + fw * float(q_fp)
+                note = f"fp={q_fp:.3f}"
+            reason = f"{worst.reason},{note}"
+            if intent:
+                reason = f"{reason},intent={intent}"
+            out[i] = _verdict_for_grade(
+                SourceGrade(q_eff, _BAND_PASSING, reason), w,
+                str(out[i].schema_version or ""),
+            )
+        return out
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        logger.debug("refine_group faulted", exc_info=True)
+        return list(verdicts)
+
+
+def verify_group(
+    texts: Sequence[str],
+    *,
+    prompt: str = "",
+    weights: Optional[TierWeights] = None,
+) -> List["Verdict"]:
+    """`verify_any` over a group, then refined in the group's context.
+
+    The synchronous entry point for readers of a CORPUS — the preflight
+    and any offline analysis — so that what Gate 3 measures and what the
+    trainer optimises are produced by the same code path.
+    """
+    grouped = [verify_any(str(t or ""), weights) for t in texts]
+    return refine_group(texts, grouped, prompt=prompt, weights=weights)
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +1204,6 @@ async def verify_batch(texts: Sequence[str], weights: Optional[TierWeights] = No
 __all__ = [
     "AdaptiveBudget", "SCHEMA_DIFF", "SCHEMA_FULL", "SCHEMA_NOOP",
     "SCHEMA_TOOL", "TierWeights", "Verdict", "authoritative_command",
-    "extract_sources", "verify", "verify_authoritative", "verify_batch",
-    "verify_static", "verify_any",
+    "extract_sources", "refine_group", "verify", "verify_authoritative",
+    "verify_batch", "verify_group", "verify_static", "verify_any",
 ]

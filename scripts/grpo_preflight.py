@@ -139,9 +139,15 @@ def analyse(
         if len(rows) < max(2, min_group):
             singleton += 1
             continue
+        # Grouped, not per-row: Gate 3 must measure what the TRAINER will
+        # optimise, and the trainer grades a group in the context it
+        # shares (task intent + the code each sibling chose differently).
+        # Scoring rows independently here and jointly there would make the
+        # gate an answer about a reward nothing uses.
+        texts = [str(r.get("assistant_output") or "") for r in rows]
         scores = [
-            float(verifier.verify_any(str(r.get("assistant_output") or "")).score)
-            for r in rows
+            float(v.score)
+            for v in verifier.verify_group(texts, prompt=prompt)
         ]
         entry = {
             "prompt_head": prompt[:80],
