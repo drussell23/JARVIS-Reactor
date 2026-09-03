@@ -52,18 +52,34 @@ _REWARD_COLUMNS = ("outcome", "confidence", "latency_ms", "model_id", "task_type
 # ---------------------------------------------------------------------------
 
 
+#: ``metadata.draw_kind`` values that are a genuine answer to the op's
+#: GENERATE prompt. Mirrors ``trajectory_recorder.GENUINE_DRAW_KINDS`` on
+#: the jarvis side; the empty string is a pre-discriminator corpus row.
+GENUINE_DRAW_KINDS = frozenset({"primary", "sibling", "unknown", ""})
+
+
 def iter_trajectory_rows(
     telemetry_dir: Path,
     *,
     trainable_only: bool = True,
+    genuine_only: bool = True,
 ) -> Iterable[Dict[str, Any]]:
     """Stream recorder rows out of the corpus.
+
+    ``genuine_only`` keeps only rows whose ``metadata.draw_kind`` is a
+    genuine primary/sibling draw (or absent -- a corpus written before the
+    discriminator existed is treated as genuine, never silently emptied).
+    An L2 repair iteration answered a different prompt and is not a
+    sibling of the draw it repaired; pairing them is what made soak 17's
+    "twins" 1.0000 alike. Rows are also deduplicated by
+    ``(op_id, candidate_hash)``, deterministically, first seen wins.
 
     A generator, not a list, because the corpus is append-only and grows
     without bound across soaks; materialising every historical row to
     select a few hundred prompts is the I/O cost this path exists to
     avoid.
     """
+    seen_keys: set = set()
     for f in sorted(Path(telemetry_dir).glob("*.jsonl")):
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
@@ -86,6 +102,14 @@ def iter_trajectory_rows(
                 continue
             if trainable_only and not row.get("metadata", {}).get("should_train", False):
                 continue
+            meta = row.get("metadata") or {}
+            if genuine_only and str(meta.get("draw_kind", "") or "") not in GENUINE_DRAW_KINDS:
+                continue
+            key = (str(meta.get("op_id", "") or ""), str(meta.get("candidate_hash", "") or ""))
+            if key[1]:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
             yield row
 
 
