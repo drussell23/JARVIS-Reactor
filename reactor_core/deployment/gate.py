@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,76 @@ GGUF_SUPPORTED_VERSIONS = frozenset({1, 2, 3})
 # Default minimum file size: 100 MB
 DEFAULT_MIN_FILE_SIZE = 100 * 1024 * 1024
 
-# Default maximum file size: 20 GB
+# Static fallback maximum: 20 GB. Used ONLY when the machine's VRAM cannot
+# be probed -- an unknown capacity must not read as an unlimited one.
 DEFAULT_MAX_FILE_SIZE = 20 * 1024 * 1024 * 1024
+
+# Share of total VRAM a model's WEIGHTS may occupy.
+#
+# The gate deliberately does NOT compute a KV-cache budget, because it
+# cannot: KV size depends on the context window, and the context window is
+# chosen at SERVE time by the num_ctx negotiator, which already owns that
+# math. Duplicating it here would create a second sizing authority free to
+# drift from the first. So the gate answers only the question it can:
+# "do the weights leave enough room for a cache to exist at all?"
+#
+# 0.75 is calibrated against measurements on this class of card
+# (32,607 MiB), where KV cost varies ~2x by ATTENTION ARCHITECTURE and a
+# single reserve constant would therefore be wrong for one of them:
+#
+#   qwen2.5-coder:32b  full attention   19.85GB weights -> 29.3GB @ 32K
+#   qwen3.8:27b        hybrid DeltaNet  17.74GB weights -> 22.0GB @ 32K
+#
+# At 0.75 the ceiling is ~24.5GB: Q4/Q5/Q6 of a 27-32B are admitted, Q8
+# (~29GB, which leaves no cache room on this card) is refused.
+GATE_VRAM_WEIGHT_FRACTION = 0.75
+
+_ENV_MAX_FILE_SIZE = "REACTOR_GATE_MAX_FILE_SIZE_BYTES"
+_ENV_VRAM_FRACTION = "REACTOR_GATE_VRAM_WEIGHT_FRACTION"
+
+
+def _vram_weight_fraction() -> float:
+    """Share of VRAM the weights may claim. Clamped to a sane band."""
+    try:
+        raw = float(os.getenv(_ENV_VRAM_FRACTION, str(GATE_VRAM_WEIGHT_FRACTION)))
+        return max(0.10, min(0.95, raw))
+    except (TypeError, ValueError):
+        return GATE_VRAM_WEIGHT_FRACTION
+
+
+def resolve_max_file_size() -> Tuple[int, str]:
+    """The largest artifact this machine can actually serve.
+
+    Returns ``(bytes, provenance)``. Provenance is reported so an operator
+    can tell a MEASURED ceiling from a guessed one -- a limit derived from
+    a card that could not be probed is a different claim from one derived
+    from a card that was.
+
+    Order: explicit operator override -> measured VRAM -> static fallback.
+    """
+    override = os.getenv(_ENV_MAX_FILE_SIZE, "").strip()
+    if override:
+        try:
+            val = int(override)
+            if val > 0:
+                return val, "operator_override"
+        except ValueError:
+            logger.warning(
+                "[Gate] %s=%r is not an integer -- ignoring",
+                _ENV_MAX_FILE_SIZE, override,
+            )
+
+    try:
+        from reactor_core.deployment.vram import (  # noqa: PLC0415
+            total_vram_bytes,
+        )
+        total = total_vram_bytes()
+    except Exception:  # noqa: BLE001
+        total = None
+
+    if total:
+        return int(total * _vram_weight_fraction()), "measured_vram"
+    return DEFAULT_MAX_FILE_SIZE, "static_fallback_unprobeable_gpu"
 
 # Default prompts used for inference quality checks
 DEFAULT_TEST_PROMPTS = [
@@ -130,12 +199,26 @@ class DeploymentGate:
     def __init__(
         self,
         min_file_size_bytes: int = DEFAULT_MIN_FILE_SIZE,
-        max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE,
+        max_file_size_bytes: Optional[int] = None,
         skip_inference_check: bool = False,
         test_prompts: Optional[List[str]] = None,
     ) -> None:
         self.min_file_size_bytes = min_file_size_bytes
-        self.max_file_size_bytes = max_file_size_bytes
+        # None => size the ceiling to the machine. An explicit value still
+        # wins, so callers that know their target hardware (a deploy aimed
+        # at a different node) are unaffected.
+        if max_file_size_bytes is None:
+            self.max_file_size_bytes, self.max_file_size_provenance = (
+                resolve_max_file_size()
+            )
+            logger.info(
+                "[Gate] max artifact size %.1f GB (%s)",
+                self.max_file_size_bytes / (1024 ** 3),
+                self.max_file_size_provenance,
+            )
+        else:
+            self.max_file_size_bytes = max_file_size_bytes
+            self.max_file_size_provenance = "caller_supplied"
         self.skip_inference_check = skip_inference_check
         self.test_prompts = test_prompts if test_prompts is not None else list(DEFAULT_TEST_PROMPTS)
 
