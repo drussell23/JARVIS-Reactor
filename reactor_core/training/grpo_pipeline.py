@@ -57,6 +57,69 @@ _REWARD_COLUMNS = ("outcome", "confidence", "latency_ms", "model_id", "task_type
 #: the jarvis side; the empty string is a pre-discriminator corpus row.
 GENUINE_DRAW_KINDS = frozenset({"primary", "sibling", "unknown", ""})
 
+#: ``metadata.candidate_status`` values whose answer is CATEGORICAL: the
+#: response means the same thing however it is worded, so a re-draw cannot
+#: be a near-twin whose difference is measurement noise.
+#:
+#: This is what makes a ``retry`` refusal admissible when a ``retry`` patch
+#: is not. The exclusion of non-genuine draws was written for REPAIR, whose
+#: docstring reason is that "an L2 repair iteration answered a DIFFERENT
+#: prompt"; ``retry`` was swept in alongside it. But the recorder defines a
+#: retry as a draw that "re-answers the SAME prompt without exploring" — so
+#: for a refusal the stated reason simply does not apply. The real hazard a
+#: retry carries is the soak-17 twin class: a re-sampled PATCH at the legacy
+#: near-deterministic point is likely a near-copy of the primary, and
+#: pairing the two grades noise. A refusal has no such failure mode — every
+#: refusal grades at the syntax ceiling regardless of wording, and identical
+#: refusals are already collapsed upstream by the (op_id, candidate_hash)
+#: dedupe. Measured on soak bt-2026-09-04-213313: 156 of 330 rows were
+#: ``noop``/``retry`` and were discarded, which is why trainable_groups sat
+#: frozen at 15 while the corpus nearly tripled.
+#:
+#: ``parse_error`` is deliberately NOT here. Its score varies with how far
+#: the parse got (0.250 line-1/3 .. 0.393 line-6/7), so a re-drawn parse
+#: error IS a re-sample of the same broken code and carries exactly the twin
+#: hazard this set exists to avoid.
+CATEGORICAL_STATUSES = frozenset({"noop"})
+
+#: Off restores the pre-relaxation filter byte-for-byte, so a soak's yield
+#: stays attributable to one variable.
+_ENV_ADMIT_CATEGORICAL_RETRIES = "REACTOR_GRPO_ADMIT_CATEGORICAL_RETRIES"
+
+
+def _envb(name: str, default: bool) -> bool:
+    """Env boolean, mirroring grpo_verifier's helper. NEVER raises."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def is_genuine_row(meta: Optional[Dict[str, Any]]) -> bool:
+    """Does this row answer the op's own GENERATE prompt?
+
+    ONE predicate, so the reader and any future consumer cannot drift into
+    two different notions of "genuine". Pure; NEVER raises — an unreadable
+    row is treated as genuine, matching the pre-existing policy that a
+    corpus written before the discriminator existed is never silently
+    emptied.
+    """
+    try:
+        m = meta or {}
+        kind = str(m.get("draw_kind", "") or "")
+        if kind in GENUINE_DRAW_KINDS:
+            return True
+        if not _envb(_ENV_ADMIT_CATEGORICAL_RETRIES, True):
+            return False
+        # A retry is "the same prompt, re-answered". Admit it only when the
+        # answer is categorical. `repair` stays excluded at any status: it
+        # answered a different prompt, which no status can undo.
+        if kind != "retry":
+            return False
+        return str(m.get("candidate_status", "") or "") in CATEGORICAL_STATUSES
+    except Exception:  # noqa: BLE001 — a filter must never break ingestion
+        return True
+
 
 def iter_trajectory_rows(
     telemetry_dir: Path,
@@ -66,13 +129,15 @@ def iter_trajectory_rows(
 ) -> Iterable[Dict[str, Any]]:
     """Stream recorder rows out of the corpus.
 
-    ``genuine_only`` keeps only rows whose ``metadata.draw_kind`` is a
-    genuine primary/sibling draw (or absent -- a corpus written before the
-    discriminator existed is treated as genuine, never silently emptied).
-    An L2 repair iteration answered a different prompt and is not a
-    sibling of the draw it repaired; pairing them is what made soak 17's
-    "twins" 1.0000 alike. Rows are also deduplicated by
-    ``(op_id, candidate_hash)``, deterministically, first seen wins.
+    ``genuine_only`` keeps only rows that answer the op's own GENERATE
+    prompt, decided by :func:`is_genuine_row` -- primary/sibling draws (or
+    an absent discriminator, so a pre-discriminator corpus is never
+    silently emptied), PLUS a ``retry`` whose ``candidate_status`` is
+    categorical (a refusal). An L2 ``repair`` iteration answered a
+    different prompt and is excluded at any status; pairing repairs with
+    the draw they repaired is what made soak 17's "twins" 1.0000 alike.
+    Rows are also deduplicated by ``(op_id, candidate_hash)``,
+    deterministically, first seen wins.
 
     A generator, not a list, because the corpus is append-only and grows
     without bound across soaks; materialising every historical row to
@@ -114,7 +179,7 @@ def iter_trajectory_rows(
             if trainable_only and not row.get("metadata", {}).get("should_train", False):
                 continue
             meta = row.get("metadata") or {}
-            if genuine_only and str(meta.get("draw_kind", "") or "") not in GENUINE_DRAW_KINDS:
+            if genuine_only and not is_genuine_row(meta):
                 continue
             key = (str(meta.get("op_id", "") or ""), str(meta.get("candidate_hash", "") or ""))
             if key[1]:
