@@ -123,8 +123,116 @@ def discover_fused_expert_params(model: nn.Module) -> Dict[str, torch.Size]:
 # ---------------------------------------------------------------------------
 
 
+class _ExpertMatmul(torch.autograd.Function):
+    """``F.linear(x, W)`` where W is reconstructed from 4-bit on BOTH passes.
+
+    The point is what is NOT saved. ``ctx.save_for_backward`` gets the
+    PACKED parameter; the dequantized bf16 weight is built, used and
+    dropped inside each pass.
+
+    Measured 2026-09-05 with ``saved_tensors_hooks`` on a tiny MoE: the
+    plain ``F.linear(x, stack[i])`` path saved one dequantized bf16 copy
+    per hit expert -- 1792 KiB of expert weights against 0 bytes of packed
+    ones, an expansion of 4.0x -- because autograd must keep the weight to
+    compute ``grad_input``. On the 30B that is 128 experts x 9.00 MB =
+    ~1.12 GiB of live bf16 per layer, which is the 1.23-1.49 GiB
+    allocation every ladder rung died on.
+
+    The experts are FROZEN (the adapter is on attention), so no gradient
+    flows back to the weight and only ``grad_input`` is returned. That is
+    what makes recompute strictly cheaper than retention here: the backward
+    needs W transiently and nothing needs it afterwards.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, packed: torch.Tensor,
+                stack: "QuantizedExpertStack", index: int) -> torch.Tensor:
+        weight = stack.dequantize(index)
+        out = nn.functional.linear(x, weight)
+        ctx.save_for_backward(x, packed)
+        ctx.stack = stack
+        ctx.index = index
+        del weight
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # noqa: ANN001
+        _x, _packed = ctx.saved_tensors
+        weight = ctx.stack.dequantize(ctx.index)
+        # grad_input only: the expert weight is frozen, so autograd needs
+        # nothing back for it and the reconstruction can be dropped here.
+        grad_x = grad_out @ weight
+        del weight
+        return grad_x, None, None, None
+
+
+class _PackedExpertWeight(torch.Tensor):
+    """A weight that carries a 4-bit expert and expands only when used.
+
+    It has the expert's real shape, dtype and device but NO storage, so
+    holding one costs nothing. ``F.linear`` against it is intercepted and
+    routed through :class:`_ExpertMatmul`; every other operation falls
+    through to the dequantized tensor, so the object still behaves like the
+    weight it stands for.
+
+    This is what keeps the model unpatched. ``Qwen3MoeExperts.forward``
+    still does ``F.linear(current_state, self.gate_up_proj[expert_idx])``
+    on an object it indexes out of an attribute -- exactly as before -- and
+    the memory behaviour changes underneath it.
+    """
+
+    __slots__ = ["_stack", "_index"]
+
+    @staticmethod
+    def __new__(cls, stack: "QuantizedExpertStack", index: int) -> "_PackedExpertWeight":
+        shape = torch.Size(tuple(stack.shape[1:]))
+        param = stack.experts[index]
+        obj = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
+            cls, shape, dtype=stack.dtype, device=param.device,
+            requires_grad=False,
+        )
+        obj._stack = stack
+        obj._index = int(index)
+        return obj
+
+    def materialize(self) -> torch.Tensor:
+        return self._stack.dequantize(self._index)
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):  # noqa: ANN001
+        kwargs = kwargs or {}
+        if func is nn.functional.linear and len(args) >= 2 and isinstance(args[1], cls):
+            x, w = args[0], args[1]
+            if len(args) > 2 and args[2] is not None:
+                raise NotImplementedError("quantized experts carry no bias")
+            return _ExpertMatmul.apply(x, w._stack.experts[w._index].data,
+                                       w._stack, w._index)
+        # Anything else gets the real tensor. Correctness first: an
+        # unrecognised op must see the weight, not a hollow shell.
+        return func(*cls._real(args), **{k: cls._real1(v) for k, v in kwargs.items()})
+
+    @classmethod
+    def _real1(cls, a):  # noqa: ANN001
+        return a.materialize() if isinstance(a, cls) else a
+
+    @classmethod
+    def _real(cls, args):  # noqa: ANN001
+        return [cls._real1(a) for a in args]
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # noqa: ANN001
+        """Fallback for anything that reaches the dispatcher directly.
+
+        ``_make_wrapper_subclass`` requires this to exist. It must also be
+        CORRECT rather than a stub: a path that skips ``__torch_function__``
+        would otherwise operate on a tensor with no storage.
+        """
+        return func(*cls._real(args), **{k: cls._real1(v)
+                                         for k, v in (kwargs or {}).items()})
+
+
 class QuantizedExpertStack(nn.Module):
-    """``stack[i]`` is the dequantized 2-D weight of expert ``i``.
+    """``stack[i]`` is the 2-D weight of expert ``i``.
 
     Holds one ``Params4bit`` per expert. Replaces a fused ``[E, out, in]``
     parameter in place, on the same attribute, so the owning module's
@@ -178,14 +286,30 @@ class QuantizedExpertStack(nn.Module):
 
     # -- the protocol ------------------------------------------------------
 
-    def __getitem__(self, index: Any) -> torch.Tensor:
+    def dequantize(self, index: int) -> torch.Tensor:
+        """The real 2-D bf16 weight of expert ``index``. Allocates."""
         import bitsandbytes.functional as bnbf  # noqa: PLC0415
 
+        param = self.experts[int(index)]
+        return bnbf.dequantize_4bit(param.data, param.quant_state)
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        """The expert's weight -- expanded lazily, and never retained.
+
+        Returns a :class:`_PackedExpertWeight`: correct shape, dtype and
+        device, no storage, and ``F.linear`` against it routes through
+        :class:`_ExpertMatmul` so the backward keeps the PACKED expert
+        rather than the dequantized one. Under ``no_grad`` (generation)
+        there is nothing to retain, so the plain dequantized tensor is
+        returned and the extra indirection is skipped.
+        """
         if isinstance(index, torch.Tensor):
             # The eager loop indexes with a 0-d tensor from `nonzero()`.
             index = int(index.item())
-        param = self.experts[int(index)]
-        return bnbf.dequantize_4bit(param.data, param.quant_state)
+        index = int(index)
+        if not torch.is_grad_enabled():
+            return self.dequantize(index)
+        return _PackedExpertWeight(self, index)
 
     def __len__(self) -> int:
         return len(self.experts)
