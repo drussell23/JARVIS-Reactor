@@ -568,6 +568,7 @@ def train_with_ladder(
     trainable_only: bool,
     max_prompts: Optional[int],
     only_prompts: Optional[List[str]],
+    max_prompt_tokens: Optional[int],
     gptq_backend: str,
     use_qlora: bool,
     config_overrides: Dict[str, Any],
@@ -603,6 +604,7 @@ def train_with_ladder(
                     trainable_only=trainable_only,
                     max_prompts=max_prompts,
                     only_prompts=only_prompts,
+                    max_prompt_tokens=max_prompt_tokens,
                     use_qlora=use_qlora,
                     gptq_backend=gptq_backend,
                     **rung.as_kwargs(),
@@ -720,6 +722,17 @@ def main(argv: Optional[List[str]] = None) -> int:
              "decode step and 64%% of the step, so this knob is the run's "
              "wall clock: the truncation callback stops the run if the "
              "ceiling is still never reached.",
+    )
+    ap.add_argument(
+        "--max-prompt-tokens", type=int, default=4096,
+        help="section-aware budget for each PROMPT. Measured 2026-09-05: "
+             "prefill costs 2.296 MB per prompt token at a group of 16, and "
+             "the corpus prompts run ~6,100 tokens, which left 1.03 GiB "
+             "under the allocator cap; step 3 then asked for 1.57 GiB and "
+             "every ladder rung died there, because the ladder never "
+             "touches the prompt. 4096 leaves ~5.5 GiB. Whole ambient "
+             "sections are dropped and task-bearing sections are never cut "
+             "(prompt_budget.py). 0 disables.",
     )
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--max-steps", type=int, default=-1)
@@ -958,6 +971,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 guard=guard,
                 trainable_only=not args.include_untrainable,
                 max_prompts=args.max_prompts or None,
+                max_prompt_tokens=args.max_prompt_tokens or None,
                 only_prompts=contrast_prompts,
                 gptq_backend=args.gptq_backend,
                 use_qlora=not args.no_qlora,

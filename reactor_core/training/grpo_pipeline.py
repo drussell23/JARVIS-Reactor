@@ -38,7 +38,9 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+
+from reactor_core.training.prompt_budget import FitReport, fit_prompt, summarize
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +287,8 @@ def build_prompt_dataset(
     trainable_only: bool = True,
     max_prompts: Optional[int] = None,
     only_prompts: Optional[Iterable[str]] = None,
+    max_prompt_tokens: Optional[int] = None,
+    count_tokens: Optional[Callable[[str], int]] = None,
 ) -> Any:
     """An in-memory Arrow ``Dataset`` of PROMPTS. No intermediate file.
 
@@ -317,6 +321,16 @@ def build_prompt_dataset(
     through ``verify_static``. Selecting on the gate's contrast compresses
     wall-clock; it does not by itself promise the reward will find contrast
     in the completions the model generates.
+
+    ``max_prompt_tokens`` fits each prompt into a token budget by dropping
+    whole AMBIENT sections and never cutting a task-bearing one -- see
+    :mod:`reactor_core.training.prompt_budget` for the measurement that
+    forced it (2.296 MB of prefill per prompt token; ~6,100-token prompts
+    left 1.03 GiB, and step 3 asked for 1.57) and the classification
+    rule. The budget is in TOKENS, so ``count_tokens`` is required with
+    it. A prompt whose protected core alone exceeds the budget is
+    EXCLUDED with a warning rather than clipped: clipping it would train
+    the model on a document shape inference never produces.
     """
     from datasets import Dataset  # noqa: PLC0415 — heavy import, call-time
 
@@ -327,6 +341,14 @@ def build_prompt_dataset(
         {str(p).strip() for p in only_prompts if str(p).strip()}
         if only_prompts is not None else None
     )
+    budget = int(max_prompt_tokens or 0)
+    if budget and count_tokens is None:
+        raise ValueError(
+            "max_prompt_tokens is a budget in TOKENS; pass count_tokens "
+            "(a tokenizer-backed counter) with it"
+        )
+    fit_reports: List[FitReport] = []
+    refused = 0
     records: List[Dict[str, Any]] = []
     for row in iter_trajectory_rows(telemetry_dir, trainable_only=trainable_only):
         prompt = str(row.get("user_input") or "")
@@ -336,6 +358,20 @@ def build_prompt_dataset(
         if allowed is not None and key not in allowed:
             continue
         seen.add(key)
+        if budget:
+            # After the allow-list match: the gate selected on the FULL
+            # text, and the match must see what the gate saw.
+            prompt, rep = fit_prompt(prompt, budget, count_tokens)
+            fit_reports.append(rep)
+            if rep.refused:
+                refused += 1
+                logger.warning(
+                    "[GRPO] prompt excluded: its task-bearing sections alone "
+                    "are %d tokens against a budget of %d (op %s)",
+                    rep.after, budget,
+                    (row.get("metadata") or {}).get("op_id") or "?",
+                )
+                continue
         meta = row.get("metadata") or {}
         records.append({
             "prompt": prompt,
@@ -348,6 +384,9 @@ def build_prompt_dataset(
         })
         if max_prompts and len(records) >= max_prompts:
             break
+
+    if budget:
+        logger.info("[GRPO] %s", summarize(fit_reports))
 
     if not records:
         if allowed is not None:
@@ -823,6 +862,7 @@ def build_trainer(
     max_prompts: Optional[int] = None,
     trainable_only: bool = True,
     only_prompts: Optional[Iterable[str]] = None,
+    max_prompt_tokens: Optional[int] = None,
     use_qlora: bool = True,
     device_map: Optional[Any] = None,
     gptq_backend: str = "",
@@ -838,9 +878,22 @@ def build_trainer(
 
     from reactor_core.training.grpo_reward import candidate_reward  # noqa: PLC0415
 
+    count_tokens: Optional[Callable[[str], int]] = None
+    if max_prompt_tokens:
+        # The budget is in THIS model's tokens, so it is counted with this
+        # model's tokenizer. GRPOTrainer builds its own instance from the
+        # same id -- identical vocabulary, identical counts -- and that
+        # path is left exactly as it was.
+        from transformers import AutoTokenizer  # noqa: PLC0415
+        _tok = AutoTokenizer.from_pretrained(model_id)
+
+        def count_tokens(text: str) -> int:
+            return len(_tok(text, add_special_tokens=False)["input_ids"])
+
     dataset = build_prompt_dataset(
         telemetry_dir, trainable_only=trainable_only, max_prompts=max_prompts,
-        only_prompts=only_prompts,
+        only_prompts=only_prompts, max_prompt_tokens=max_prompt_tokens,
+        count_tokens=count_tokens,
     )
     args = build_grpo_config(
         output_dir, num_generations=num_generations, **config_overrides,
