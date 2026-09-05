@@ -90,6 +90,16 @@ class PipelineConfig:
 
     # Model
     base_model: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    #: WHICH trainer runs a cycle. Empty resolves through
+    #: ``trainer_strategy.resolve_name`` -- request, then
+    #: ``REACTOR_TRAINING_STRATEGY``, then SFT -- so an unconfigured
+    #: pipeline behaves exactly as it did before strategies existed.
+    #: ``"grpo"`` runs the GRPO runner, which owns the admission gate, the
+    #: corpus gate, the prompt budget and the isolated degradation ladder.
+    training_strategy: str = ""
+    #: Strategy-specific knobs, forwarded verbatim. A strategy ignores what
+    #: it does not know, so one config can serve several.
+    trainer_options: Dict[str, Any] = field(default_factory=dict)
     use_qlora: bool = True
     lora_rank: int = 64
     lora_alpha: int = 128
@@ -1444,7 +1454,47 @@ class UnifiedTrainingPipeline:
         train_dataset: Any,
         eval_dataset: Any,
     ) -> Any:
-        """Run model training."""
+        """Run model training through the resolved STRATEGY.
+
+        The pipeline does not name a trainer. ``trainer_strategy`` resolves
+        one from the config, then the environment, then the default (SFT),
+        and this method runs whatever comes back. Registering a method is
+        therefore a registration rather than a branch here.
+
+        SFT is itself a registered strategy (:meth:`_train_sft`), so the
+        default path is the same code it always was, reached the same way
+        every other method is.
+        """
+        from reactor_core.training import trainer_strategy as _ts  # noqa: PLC0415
+
+        request = _ts.TrainerRequest(
+            base_model=self.config.base_model,
+            output_dir=Path(self.config.output_dir),
+            telemetry_dir=Path(self.config.telemetry_dir)
+            if getattr(self.config, "telemetry_dir", None) else None,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            strategy=getattr(self.config, "training_strategy", "") or "",
+            options=dict(getattr(self.config, "trainer_options", {}) or {}),
+        )
+        name = _ts.resolve_name(request)
+        if name == _ts.STRATEGY_SFT:
+            # The historical path, unchanged and un-wrapped: its result
+            # object is what every downstream stage already consumes.
+            return await self._train_sft(train_dataset, eval_dataset)
+
+        outcome = await _ts.run(request)
+        logger.info("[Pipeline] %s", outcome.summary())
+        if not outcome.ok:
+            raise RuntimeError(f"training strategy {name!r}: {outcome.reason}")
+        return outcome
+
+    async def _train_sft(
+        self,
+        train_dataset: Any,
+        eval_dataset: Any,
+    ) -> Any:
+        """Supervised fine-tuning — the pipeline's original trainer."""
         from reactor_core.training.trainer import AsyncTrainer, TrainingConfig
 
         # Create training config
