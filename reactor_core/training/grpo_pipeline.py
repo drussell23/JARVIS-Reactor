@@ -284,6 +284,7 @@ def build_prompt_dataset(
     *,
     trainable_only: bool = True,
     max_prompts: Optional[int] = None,
+    only_prompts: Optional[Iterable[str]] = None,
 ) -> Any:
     """An in-memory Arrow ``Dataset`` of PROMPTS. No intermediate file.
 
@@ -297,15 +298,42 @@ def build_prompt_dataset(
     metadata. Feeding the same prompt N times would not add information —
     GRPO already draws `num_generations` samples from each one — it would
     just weight that prompt N times in the epoch.
+
+    ``only_prompts`` narrows the set to exactly those prompts, matched on
+    the same ``.strip()`` key used for deduplication. It exists for ONE
+    caller: the runner, handing back ``grpo_preflight.analyse``'s own list
+    of contrast-bearing groups. Two definitions of "trainable" are live in
+    this file's world and they answer different questions —
+    ``trainable_only`` filters ROWS to genuine draws, while the gate
+    additionally demands two or more responses whose grades actually
+    differ. Measured 2026-09-05: 242 prompts survive the row filter and 27
+    survive the gate, which at 656.8s per optimiser step is 44.2 hours
+    against 4.9. Passing the gate's list here is what collapses that, and
+    it is passed rather than recomputed so the runner cannot form a second
+    opinion about what is trainable.
+
+    NOTE the honest limit of that: the gate grades corpus text through
+    ``verify_group``/``verify_any``, and the live reward grades rollouts
+    through ``verify_static``. Selecting on the gate's contrast compresses
+    wall-clock; it does not by itself promise the reward will find contrast
+    in the completions the model generates.
     """
     from datasets import Dataset  # noqa: PLC0415 — heavy import, call-time
 
     seen: set = set()
+    # Matched on the SAME .strip() key the dedup uses, or a prompt could be
+    # in the allow-list and still be filtered out by a trailing newline.
+    allowed: Optional[set] = (
+        {str(p).strip() for p in only_prompts if str(p).strip()}
+        if only_prompts is not None else None
+    )
     records: List[Dict[str, Any]] = []
     for row in iter_trajectory_rows(telemetry_dir, trainable_only=trainable_only):
         prompt = str(row.get("user_input") or "")
         key = prompt.strip()
         if not key or key in seen:
+            continue
+        if allowed is not None and key not in allowed:
             continue
         seen.add(key)
         meta = row.get("metadata") or {}
@@ -322,12 +350,36 @@ def build_prompt_dataset(
             break
 
     if not records:
+        if allowed is not None:
+            # Distinguish "the corpus is empty" from "the allow-list matched
+            # nothing", because the second is a WIRING fault (a prompt that
+            # the gate selected and the loader could not find) and reporting
+            # it as an empty corpus would send the reader to the wrong place.
+            raise ValueError(
+                f"no prompts in {telemetry_dir} matched the {len(allowed)} "
+                "prompt(s) selected by the corpus gate. The gate and the "
+                "loader read the same rows, so a total miss means their keys "
+                "have drifted, not that the corpus is empty."
+            )
         raise ValueError(
             f"no trainable prompts in {telemetry_dir} — with "
             f"trainable_only={trainable_only}. A corpus of governance-caged "
             "ops is correctly marked should_train=false and yields nothing."
         )
-    logger.info("[GRPO] built in-memory dataset: %d distinct prompt(s)", len(records))
+    if allowed is not None:
+        logger.info(
+            "[GRPO] built in-memory dataset: %d distinct prompt(s), narrowed "
+            "to the %d contrast-bearing group(s) the corpus gate selected",
+            len(records), len(allowed),
+        )
+        if len(records) < len(allowed):
+            logger.warning(
+                "[GRPO] %d gate-selected prompt(s) were not found by the "
+                "loader — the two are reading the corpus differently",
+                len(allowed) - len(records),
+            )
+    else:
+        logger.info("[GRPO] built in-memory dataset: %d distinct prompt(s)", len(records))
     return Dataset.from_list(records)
 
 
@@ -770,18 +822,25 @@ def build_trainer(
     num_generations: int = 4,
     max_prompts: Optional[int] = None,
     trainable_only: bool = True,
+    only_prompts: Optional[Iterable[str]] = None,
     use_qlora: bool = True,
     device_map: Optional[Any] = None,
     gptq_backend: str = "",
     **config_overrides: Any,
 ) -> Any:
-    """Assemble the GRPOTrainer over the live corpus."""
+    """Assemble the GRPOTrainer over the live corpus.
+
+    ``only_prompts`` is forwarded verbatim to :func:`build_prompt_dataset`;
+    see there for why the gate's selection is passed in rather than
+    recomputed.
+    """
     from trl import GRPOTrainer  # noqa: PLC0415
 
     from reactor_core.training.grpo_reward import candidate_reward  # noqa: PLC0415
 
     dataset = build_prompt_dataset(
         telemetry_dir, trainable_only=trainable_only, max_prompts=max_prompts,
+        only_prompts=only_prompts,
     )
     args = build_grpo_config(
         output_dir, num_generations=num_generations, **config_overrides,

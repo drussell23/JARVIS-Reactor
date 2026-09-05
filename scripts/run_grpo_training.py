@@ -315,6 +315,7 @@ def train_with_ladder(
     guard: Any,
     trainable_only: bool,
     max_prompts: Optional[int],
+    only_prompts: Optional[List[str]],
     gptq_backend: str,
     use_qlora: bool,
     config_overrides: Dict[str, Any],
@@ -346,6 +347,7 @@ def train_with_ladder(
                     str(output_dir),
                     trainable_only=trainable_only,
                     max_prompts=max_prompts,
+                    only_prompts=only_prompts,
                     use_qlora=use_qlora,
                     gptq_backend=gptq_backend,
                     **rung.as_kwargs(),
@@ -459,6 +461,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="train regardless of Gate 3. For wiring smoke "
                          "tests only — a flat corpus amplifies noise to "
                          "full scale, it does not train weakly.")
+    ap.add_argument(
+        "--all-prompts", action="store_true",
+        help="train on every prompt the row filter admits, not only the "
+             "contrast-bearing groups the corpus gate selected. Measured "
+             "2026-09-05: 242 prompts vs 27, which at 656.8s per optimiser "
+             "step is 44.2 hours against 4.9. The default narrows to the "
+             "gate's selection; this restores the old behaviour.",
+    )
     ap.add_argument("--skip-admission", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and validate everything, take no step")
@@ -500,12 +510,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_groups=args.min_groups,
         trainable_only=not args.include_untrainable,
     )
+    # Popped BEFORE the verdict becomes the report: 27 prompts of ~24k chars
+    # would make the JSON unreadable, and the COUNT is the evidence anyone
+    # actually reads. The prompts themselves go to the dataset loader.
+    contrast_prompts: Optional[List[str]] = (
+        verdict.pop("trainable_prompts", None) or None
+    )
     report["corpus"] = verdict
     logger.info(
         "[runner] corpus: %d rows, %d prompts, %d trainable group(s) at "
         "--min-spread %.4f (%d flat, %d below min size)",
         verdict["rows"], verdict["prompts"], verdict["trainable_groups"],
         args.min_spread, verdict["flat_groups"], verdict["groups_below_min"],
+    )
+    if args.all_prompts:
+        contrast_prompts = None
+        logger.info(
+            "[runner] --all-prompts: training over every admitted prompt, not "
+            "only the gate's contrast-bearing groups",
+        )
+    elif contrast_prompts:
+        logger.info(
+            "[runner] narrowing the training set to the %d contrast-bearing "
+            "group(s) the gate selected (of %d admitted prompts)",
+            len(contrast_prompts), verdict["prompts"],
+        )
+    report["contrast_filtered"] = bool(contrast_prompts)
+    report["training_prompts"] = (
+        len(contrast_prompts) if contrast_prompts else verdict["prompts"]
     )
     if not verdict["passes"] and not args.skip_corpus_gate:
         logger.error(
@@ -601,6 +633,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             guard=guard,
             trainable_only=not args.include_untrainable,
             max_prompts=args.max_prompts or None,
+            only_prompts=contrast_prompts,
             gptq_backend=args.gptq_backend,
             use_qlora=not args.no_qlora,
             config_overrides=overrides,

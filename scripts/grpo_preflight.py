@@ -128,6 +128,14 @@ def analyse(
         groups[str(row.get("user_input") or "")].append(row)
 
     trainable: List[Dict[str, Any]] = []
+    #: The FULL prompt text of every trainable group, in group order.
+    #: ``examples`` keeps only 80-char heads because a report carrying 27
+    #: prompts of ~24k chars each is not a report. The trainer needs the
+    #: whole string to select on, so it travels separately and the runner
+    #: pops it before writing JSON. This is the gate's own verdict reused,
+    #: which is the point: the runner must not form a second opinion about
+    #: which prompts carry contrast.
+    trainable_prompts: List[str] = []
     flat: List[Dict[str, Any]] = []
     singleton = 0
     verdict_sources: Dict[str, int] = defaultdict(int)
@@ -178,6 +186,7 @@ def analyse(
             flat.append(entry)
         else:
             trainable.append(entry)
+            trainable_prompts.append(prompt)
 
     return {
         "telemetry_dir": str(telemetry_dir),
@@ -186,6 +195,7 @@ def analyse(
         "groups_below_min": singleton,
         "flat_groups": len(flat),
         "trainable_groups": len(trainable),
+        "trainable_prompts": trainable_prompts,
         "flat_eps": getattr(reward, "_FLAT_EPS", None),
         "min_group": min_group,
         "min_spread": min_spread,

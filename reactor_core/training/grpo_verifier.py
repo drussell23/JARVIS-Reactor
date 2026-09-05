@@ -245,6 +245,41 @@ def _strip_code_fence(text: str) -> str:
     return body.strip()
 
 
+def _fenced_blocks(text: str) -> List[str]:
+    """Every CLOSED fenced block body in a mixed prose+code response.
+
+    `_strip_code_fence` answers a different question -- "is this value
+    ENTIRELY a fence" -- and deliberately returns the text byte-identical
+    when it is not. A model answering a code-repair prompt in markdown
+    produces neither shape: prose, then a fence, then more prose.
+
+    Measured on live 30B rollouts 2026-09-05: all four completions were
+    exactly that, and grading them whole reported `syntax_error:line4/29`
+    -- a number about the PROSE. This is the same defect the fence stripper
+    was written for, one layer out.
+
+    Returns [] when there is no closed fence, so the caller keeps its
+    existing behaviour instead of being handed an empty string to grade. An
+    UNCLOSED fence yields nothing on purpose: a truncated block is not
+    evidence about code the model never finished writing.
+    """
+    body = text or ""
+    if _FENCE not in body:
+        return []
+    parts = body.split(_FENCE)
+    # parts alternate [outside, inside, outside, inside, ...]. An even
+    # number of parts means the last fence was never closed, so its
+    # trailing chunk is dropped.
+    last = len(parts) - (1 if len(parts) % 2 == 0 else 0)
+    blocks: List[str] = []
+    for index in range(1, last, 2):
+        chunk = parts[index]
+        newline = chunk.find(chr(10))
+        # Drop the opening line's language tag ("python", "py", "diff"...).
+        blocks.append(chunk[newline + 1:] if newline >= 0 else chunk)
+    return [b for b in (s.strip(chr(10)) for s in blocks) if b.strip()]
+
+
 def extract_sources(text: str) -> Tuple[Optional[str], List[str], str]:
     """``(schema_version, [source, ...], reason)`` from a completion.
 
@@ -844,6 +879,41 @@ def _verdict_for_grade(
     return Verdict(lo + (hi - lo) * q, tier, grade.reason, schema_version)
 
 
+def _sub_envelope(v: Verdict, w: "TierWeights") -> Verdict:
+    """Compress a source-only grade into the band BELOW the envelope tier.
+
+    PARTIAL CREDIT, and the emphasis is on partial. ``TierWeights`` states
+    the contract this enforces: "a completion that fails an earlier tier
+    can never outrank one that reached a later tier". A rollout with no
+    envelope failed tier 0, so however good its code is it must rank under
+    the worst response that did produce one -- otherwise the reward teaches
+    the model to stop emitting the schema the pipeline requires.
+
+    Without this, measured: the bare string ``garbage`` parses as a Python
+    expression statement, grades ``1stmt_no_defs`` at 0.525, and outranks a
+    real envelope carrying code with an early syntax error at 0.250. Prose
+    that happens to parse beat genuinely broken code, which is the ladder
+    inverted.
+
+    ORDER is preserved exactly -- the full-ladder score is rescaled, not
+    rebanded -- so the reward still separates a good answer from a bad one
+    within the group, which is all GRPO's advantage needs: it normalises by
+    the group's own standard deviation, so a monotonic rescale changes the
+    magnitude of nothing it uses.
+
+    Applied by the reward path only. The GATE grades CORPUS rows, where the
+    envelope is absent because the recorder stripped it rather than because
+    a model failed to emit one, and punishing the corpus for the recorder's
+    behaviour would measure the wrong thing again.
+    """
+    span = max(1e-9, float(w.substance) - float(w.shape))
+    frac = max(0.0, min(1.0, (float(v.score) - float(w.shape)) / span))
+    return Verdict(
+        max(0.0, float(w.envelope)) * frac, 0,
+        f"no_envelope|{v.reason}"[:120], v.schema_version, v.authoritative,
+    )
+
+
 def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     """Tiers 0-3. Pure, sub-millisecond, never raises."""
     w = weights or TierWeights()
@@ -916,6 +986,15 @@ def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         return v
     w = weights or TierWeights()
     try:
+        # The code the model actually wrote, when it wrapped it in markdown;
+        # the whole response only when it did not. Each block is graded and
+        # the WORST wins, the same rule the envelope path applies across a
+        # candidate's files -- a response is as good as its weakest code.
+        blocks = _fenced_blocks(text or "")
+        if blocks:
+            graded = [_grade_source(b) for b in blocks]
+            worst = min(graded, key=lambda g: _verdict_for_grade(g, w).score)
+            return _verdict_for_grade(worst, w)
         grade = _grade_source(text or "")
     except Exception:  # noqa: BLE001 — a grader must never break training
         logger.debug("verify_any source fault", exc_info=True)
@@ -938,7 +1017,11 @@ def _sources_for(text: str) -> List[str]:
     if sources:
         return [str(s or "") for s in sources]
     if ver is None and _reason_kind(reason) == "envelope_unparseable":
-        return [text or ""]
+        # Mirrors verify_any's fence handling exactly. A footprint built
+        # from the prose while the GRADE came from the fenced code would be
+        # describing a different candidate than the one being scored.
+        blocks = _fenced_blocks(text or "")
+        return blocks if blocks else [text or ""]
     return []
 
 
@@ -1171,10 +1254,45 @@ async def verify(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     Tier 4 is consulted ONLY when the static tiers already reached
     SUBSTANCE. Asking an expensive validator about a candidate that does
     not parse spends budget to learn what tier 2 established for free.
+
+    ## Why the static tier is `verify_any` and not `verify_static`
+
+    This is the reward the TRAINER sees, and its input is a live rollout
+    whose layer is not known in advance -- which is the exact question
+    `verify_any` was written to answer. Grading rollouts with
+    `verify_static` alone assumed every rollout would be an envelope.
+    Measured 2026-09-05 against Qwen3-Coder-30B on a real corpus prompt:
+    four sampled completions, NONE an envelope, all four scoring the
+    tier-0 constant 0.0200 -- spread 0.000000. `candidate_reward` then
+    correctly refuses to invent a winner, TRL drops the group, and the
+    only surviving gradient is the MoE router's auxiliary loss. Every step
+    of every observed run behaved this way, so training could not have
+    learned anything about code. The same four completions through
+    `verify_any` score 0.2707 / 0.3586 / 0.2561 / 0.2700 -- spread
+    0.102511, which is signal about what the model actually wrote.
+
+    The incentive is PRESERVED, and structurally rather than by hope:
+    source-graded verdicts are compressed into the band below the envelope
+    tier by ``_sub_envelope``, so any response carrying an envelope still
+    outranks every response that does not, however good the loose code is.
+    What changes is only that non-envelopes stop collapsing onto a single
+    constant -- which is the property that made every group flat -- while
+    keeping the ladder's stated contract that failing an earlier tier can
+    never outrank reaching a later one.
+
+    ``REACTOR_GRPO_REWARD_ENVELOPE_ONLY=1`` restores the envelope-only
+    grader for anyone who wants the old semantics back.
     """
     w = weights or TierWeights()
     loop = asyncio.get_running_loop()
-    static = await loop.run_in_executor(None, verify_static, text, w)
+    if _envb("REWARD_ENVELOPE_ONLY", False):
+        static = await loop.run_in_executor(None, verify_static, text, w)
+    else:
+        static = await loop.run_in_executor(None, verify_any, text, w)
+        if not static.schema_version:
+            # Source-graded: no envelope was reached. Partial credit, banded
+            # under every response that produced one -- see _sub_envelope.
+            static = _sub_envelope(static, w)
     if static.tier < 3:
         return static
 
