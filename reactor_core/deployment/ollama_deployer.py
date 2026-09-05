@@ -63,6 +63,9 @@ _ENV_NUM_CTX = "REACTOR_OLLAMA_NUM_CTX"
 _ENV_CREATE_TIMEOUT_S = "REACTOR_OLLAMA_CREATE_TIMEOUT_S"
 _ENV_BIN = "REACTOR_OLLAMA_BIN"
 _ENV_DRAFT_MODEL = "REACTOR_OLLAMA_DRAFT_MODEL"
+_ENV_BASE_TAG = "REACTOR_OLLAMA_BASE_TAG"
+_ENV_ADAPTER_TAG = "REACTOR_OLLAMA_ADAPTER_TAG"
+_ENV_ADAPTER_MIN_BYTES = "REACTOR_GATE_ADAPTER_MIN_FILE_SIZE_BYTES"
 
 _DEFAULT_HOST = "http://127.0.0.1:11434"
 _DEFAULT_TAG = "jprime-latest"
@@ -72,6 +75,21 @@ _DEFAULT_ROLLBACK_TAG = "jprime-previous"
 #: where VRAM allows, so the deploy default matches the architecture.
 _DEFAULT_NUM_CTX = 32768
 _DEFAULT_CREATE_TIMEOUT_S = 1800.0
+
+#: The tag an ADAPTER is layered over. Empty by default: only the operator
+#: knows which base the adapter was trained against, and layering a LoRA
+#: onto the wrong weights produces a model that loads and answers wrongly
+#: -- the worst failure shape. An empty value makes the adapter path
+#: refuse rather than guess.
+_DEFAULT_BASE_TAG = ""
+_DEFAULT_ADAPTER_TAG = "jprime-adapter-latest"
+
+#: The gate's size floor for an ADAPTER. `DEFAULT_MIN_FILE_SIZE` (100 MB)
+#: exists to catch a truncated 18 GB model; a LoRA over 192 attention
+#: projections is ~27 MB, so the model floor would reject every healthy
+#: adapter. The floor is a property of WHAT is being validated, not a
+#: constant: 256 KiB still catches a truncated or empty conversion.
+_DEFAULT_ADAPTER_MIN_BYTES = 256 * 1024
 
 
 def _env_str(name: str, default: str) -> str:
@@ -252,46 +270,180 @@ class OllamaDeployer:
             lines.append(f"DRAFT {draft_model}")
         return "\n".join(lines) + "\n"
 
-    async def _gate_result(self, gguf_path: Path) -> Any:
+    def build_adapter_modelfile(
+        self, adapter_path: Path, *, base_tag: str, draft_model: str = "",
+    ) -> str:
+        """Render a Modelfile that layers an ADAPTER over an existing tag.
+
+        ``FROM`` names a TAG ollama already serves rather than a file, and
+        ``ADAPTER`` points at the LoRA GGUF. The base weights are never
+        read, copied or re-quantised.
+
+        This is what makes the flywheel closable on one 32 GiB card.
+        Merging an adapter into the base to produce a single deployable
+        model needs the base in bf16 -- 16 shards, ~57 GiB -- against a
+        WSL guest capped at 47 GiB, and on this host a host-RAM blowout is
+        not a failed job, it is the desktop (the commit-limit arc). Ollama
+        applies the adapter at load time instead, so the whole deployment
+        costs the size of the adapter.
+
+        Kept pure, and deliberately parallel to :meth:`build_modelfile`:
+        the two differ only in what ``FROM`` names and the extra
+        ``ADAPTER`` line, so the deploy machinery below can drive either.
+        """
+        lines = [
+            f"FROM {base_tag}",
+            f"ADAPTER {Path(adapter_path).resolve()}",
+            f"PARAMETER num_ctx {self.num_ctx}",
+            "PARAMETER temperature 0",
+        ]
+        if draft_model:
+            lines.append(f"DRAFT {draft_model}")
+        return "\n".join(lines) + "\n"
+
+    async def _gate_result(self, gguf_path: Path, *, min_bytes: int = 0) -> Any:
+        """Validate an artifact. ``min_bytes`` overrides the size floor.
+
+        An injected gate (the test seam) is used as given -- a test that
+        supplied a gate means to control the verdict, and silently
+        rebuilding it would take that control away.
+        """
         gate = self._gate
         if gate is None:
             from reactor_core.deployment.gate import (  # noqa: PLC0415
                 DeploymentGate,
             )
-            gate = DeploymentGate(skip_inference_check=True)
+            kwargs: Dict[str, Any] = {"skip_inference_check": True}
+            if min_bytes > 0:
+                kwargs["min_file_size_bytes"] = min_bytes
+            gate = DeploymentGate(**kwargs)
         return await gate.validate(gguf_path)
 
     # -- public API -------------------------------------------------------
     async def deploy(self, gguf_path: Path) -> DeployResult:
-        """Validate, lease the GPU, snapshot, create, and verify."""
+        """Validate, lease the GPU, snapshot, create, and verify a MODEL."""
+        return await self._deploy(
+            gguf_path,
+            tag=self.tag,
+            kind="model",
+            modelfile=lambda draft: self.build_modelfile(
+                Path(gguf_path), draft_model=draft,
+            ),
+        )
+
+    async def deploy_adapter(
+        self,
+        adapter_path: Path,
+        *,
+        base_tag: Optional[str] = None,
+        tag: Optional[str] = None,
+    ) -> DeployResult:
+        """Publish a LoRA ADAPTER layered over a base tag ollama already has.
+
+        Every step of :meth:`deploy` applies unchanged -- gate, GPU lease,
+        rollback snapshot, create, verify-by-serving -- because it is the
+        same machinery with a different Modelfile and a size floor that
+        suits an adapter. Two preconditions are adapter-specific and both
+        fail CLOSED:
+
+        * ``base_tag`` must be given (env ``REACTOR_OLLAMA_BASE_TAG``).
+          Layering a LoRA over the wrong base yields a model that loads
+          and answers wrongly, which is worse than one that fails to load.
+        * that base must already be SERVED. ``ollama create`` would
+          otherwise try to pull ~18 GB, turning a deploy into a download
+          that competes with whatever else holds the card.
+        """
+        base = (base_tag if base_tag is not None
+                else _env_str(_ENV_BASE_TAG, _DEFAULT_BASE_TAG)).strip()
+        target = (tag if tag is not None
+                  else _env_str(_ENV_ADAPTER_TAG, _DEFAULT_ADAPTER_TAG)).strip()
+        adapter_path = Path(adapter_path)
+
+        if not base:
+            return DeployResult(
+                ok=False, tag=target, gguf_path=str(adapter_path),
+                stage="input",
+                reason=(
+                    "no base tag: an adapter must name the model it was "
+                    f"trained against (pass base_tag= or set {_ENV_BASE_TAG})"
+                ),
+            )
+
+        served = await self._tags()
+        if not any(t == base or t.split(":")[0] == base.split(":")[0]
+                   for t in served):
+            return DeployResult(
+                ok=False, tag=target, gguf_path=str(adapter_path),
+                stage="base_missing",
+                reason=(
+                    f"base tag {base!r} is not served by ollama "
+                    f"({len(served)} tags); pull it deliberately -- a deploy "
+                    "must not become an 18 GB download"
+                ),
+            )
+
+        min_bytes = _env_int(
+            _ENV_ADAPTER_MIN_BYTES, _DEFAULT_ADAPTER_MIN_BYTES, 1, 1 << 40,
+        )
+        return await self._deploy(
+            adapter_path,
+            tag=target,
+            kind="adapter",
+            gate_min_bytes=min_bytes,
+            modelfile=lambda draft: self.build_adapter_modelfile(
+                adapter_path, base_tag=base, draft_model=draft,
+            ),
+            extra_checks=(f"base:{base}",),
+        )
+
+    async def _deploy(
+        self,
+        artifact: Path,
+        *,
+        tag: str,
+        kind: str,
+        modelfile: Callable[[str], str],
+        gate_min_bytes: int = 0,
+        extra_checks: Sequence[str] = (),
+    ) -> DeployResult:
+        """The deployment machinery, shared by model and adapter.
+
+        ``modelfile`` renders the Modelfile for a given draft model, so the
+        DRAFT-retry fallback below is written once and applies to both.
+        """
         t0 = time.monotonic()
-        gguf_path = Path(gguf_path)
+        gguf_path = Path(artifact)
         res = DeployResult(
-            ok=False, tag=self.tag, gguf_path=str(gguf_path),
+            ok=False, tag=tag, gguf_path=str(gguf_path),
             rollback_tag=self.rollback_tag,
         )
+        res.checks.extend(extra_checks)
 
         if not gguf_path.is_file():
             res.stage = "input"
-            res.reason = f"GGUF not found: {gguf_path}"
+            res.reason = f"{kind} GGUF not found: {gguf_path}"
             res.duration_s = time.monotonic() - t0
             return res
 
         # 1. Gate -- never publish an artifact that failed validation.
-        gate_result = await self._gate_result(gguf_path)
+        gate_result = await self._gate_result(
+            gguf_path, min_bytes=gate_min_bytes,
+        )
         res.gate_summary = (
             gate_result.summary() if hasattr(gate_result, "summary") else ""
         )
         if not getattr(gate_result, "passed", False):
             res.stage = "gate"
-            res.reason = f"deployment gate rejected the model: {res.gate_summary}"
+            res.reason = (
+                f"deployment gate rejected the {kind}: {res.gate_summary}"
+            )
             res.duration_s = time.monotonic() - t0
             return res
         res.checks.append("gate:passed")
 
         # 2. GPU lease -- ollama create writes blobs and the verify probe
         #    loads the model; both contend with a live soak.
-        async with self._lease(reason=f"ollama-create:{self.tag}") as lease:
+        async with self._lease(reason=f"ollama-create:{tag}") as lease:
             res.lease_backend = lease.backend
             if not lease.held:
                 res.stage = "gpu_lease"
@@ -302,9 +454,9 @@ class OllamaDeployer:
 
             # 3. Snapshot the outgoing model BEFORE overwriting the tag.
             existing = await self._tags()
-            if any(t.split(":")[0] == self.tag.split(":")[0] for t in existing):
+            if any(t.split(":")[0] == tag.split(":")[0] for t in existing):
                 rc, out = await self._run(
-                    ["cp", self.tag, self.rollback_tag], timeout_s=120.0,
+                    ["cp", tag, self.rollback_tag], timeout_s=120.0,
                 )
                 if rc == 0:
                     res.checks.append(f"snapshot:{self.rollback_tag}")
@@ -325,14 +477,11 @@ class OllamaDeployer:
             )
             tmpdir = Path(tempfile.mkdtemp(prefix="reactor-modelfile-"))
             try:
-                modelfile = tmpdir / "Modelfile"
+                modelfile_path = tmpdir / "Modelfile"
                 draft = self.draft_model
-                modelfile.write_text(
-                    self.build_modelfile(gguf_path, draft_model=draft),
-                    encoding="utf-8",
-                )
+                modelfile_path.write_text(modelfile(draft), encoding="utf-8")
                 rc, out = await self._run(
-                    ["create", self.tag, "-f", str(modelfile)],
+                    ["create", tag, "-f", str(modelfile_path)],
                     timeout_s=timeout_s,
                 )
                 if rc != 0 and draft:
@@ -347,11 +496,9 @@ class OllamaDeployer:
                         draft, rc, out.strip()[:160],
                     )
                     res.checks.append(f"draft:rejected:{draft}")
-                    modelfile.write_text(
-                        self.build_modelfile(gguf_path), encoding="utf-8",
-                    )
+                    modelfile_path.write_text(modelfile(""), encoding="utf-8")
                     rc, out = await self._run(
-                        ["create", self.tag, "-f", str(modelfile)],
+                        ["create", tag, "-f", str(modelfile_path)],
                         timeout_s=timeout_s,
                     )
                 elif draft:
@@ -369,11 +516,11 @@ class OllamaDeployer:
             # 5. Verify by serving. Exit code 0 means a manifest was
             #    written, not that the tag is servable.
             served = await self._tags()
-            base = self.tag.split(":")[0]
-            if not any(t == self.tag or t.split(":")[0] == base for t in served):
+            stem = tag.split(":")[0]
+            if not any(t == tag or t.split(":")[0] == stem for t in served):
                 res.stage = "verify"
                 res.reason = (
-                    f"ollama create returned 0 but {self.tag} is not in "
+                    f"ollama create returned 0 but {tag} is not in "
                     f"/api/tags ({len(served)} tags served)"
                 )
                 res.duration_s = time.monotonic() - t0
@@ -382,7 +529,7 @@ class OllamaDeployer:
 
         res.ok = True
         res.stage = "complete"
-        res.reason = f"{self.tag} is live and servable"
+        res.reason = f"{tag} is live and servable ({kind})"
         res.duration_s = time.monotonic() - t0
         logger.info("[OllamaDeploy] %s", res.summary())
         return res
