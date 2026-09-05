@@ -244,6 +244,97 @@ def _make_guard_callback(watchdog: Any) -> Any:
     return _MemoryGuardCallback()
 
 
+#: Consecutive fully-clipped steps before the truncation guard stops a run.
+#: One could be an unlucky batch; two is a configuration verdict. At 11-18
+#: minutes per step, stopping at two costs one step where continuing costs
+#: the whole run.
+DEFAULT_CLIPPED_PATIENCE = 2
+
+
+def _env_int(name: str, default: int) -> int:
+    """An int from the environment, or the default. Never raises."""
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _make_truncation_callback(*, mask_truncated: bool, patience: int = 0) -> Any:
+    """Refuse to spend hours on steps whose loss has no tokens in it.
+
+    With ``mask_truncated_completions=True`` TRL zeroes the completion mask
+    for every row whose last token is not EOS or pad
+    (``grpo_trainer.py``: ``completion_mask * (~is_truncated)``), and
+    ``num_items_in_batch`` is that mask's sum. Measured 2026-09-05:
+    ``completions/clipped_ratio`` was **1.0** at BOTH 8 and 256 completion
+    tokens, and ``mean_terminated_length`` was 0 -- no rollout ever emitted
+    EOS. Every row was therefore masked, the policy loss had zero
+    contributing tokens, and the only gradient came from the MoE router's
+    auxiliary term.
+
+    That is the failure mode this exists for, and note WHY it was invisible:
+    the step still logged a perfectly plausible ``loss`` (0.008183, which is
+    exactly ``aux_loss * 1e-3``), so nothing looked wrong. A number attached
+    to no learning is worse than an error.
+
+    The guard therefore reads the ratio TRL already publishes rather than
+    re-deriving truncation itself -- one definition, and it is the
+    trainer's. It only arms when masking is actually on, because with
+    ``mask_truncated_completions=False`` a clipped completion still carries
+    gradient and a full clip ratio is merely a budget observation.
+    """
+    from transformers import TrainerCallback  # noqa: PLC0415
+
+    limit = patience if patience > 0 else _env_int(
+        "REACTOR_TRAIN_CLIPPED_PATIENCE", DEFAULT_CLIPPED_PATIENCE)
+
+    class _TruncationCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.tripped: Optional[str] = None
+            self.consecutive = 0
+            self.last_ratio: Optional[float] = None
+
+        def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: ANN001
+            if not mask_truncated or not logs:
+                return control
+            ratio = logs.get("completions/clipped_ratio")
+            try:
+                ratio = float(ratio)
+            except (TypeError, ValueError):
+                return control
+            self.last_ratio = ratio
+            # 1.0 exactly: EVERY completion hit the ceiling, so every row is
+            # masked. Anything less leaves at least one row contributing.
+            if ratio < 1.0:
+                self.consecutive = 0
+                return control
+            self.consecutive += 1
+            logger.warning(
+                "[runner] step %s: clipped_ratio=1.0 — every completion hit "
+                "the %s-token ceiling, so mask_truncated_completions masks "
+                "them ALL and the policy loss has no tokens (%d/%d)",
+                getattr(state, "global_step", "?"),
+                getattr(args, "max_completion_length", "?"),
+                self.consecutive, limit,
+            )
+            if self.consecutive >= limit and self.tripped is None:
+                self.tripped = (
+                    f"{self.consecutive} consecutive step(s) with "
+                    f"clipped_ratio=1.0 and mask_truncated_completions=True: "
+                    f"every completion is masked out of the loss, so the "
+                    f"policy gradient is empty. Raise --max-completion-length "
+                    f"past {getattr(args, 'max_completion_length', '?')} until "
+                    f"completions terminate, or set "
+                    f"mask_truncated_completions=False to train on truncated "
+                    f"text."
+                )
+                logger.error("[runner] STOPPING: %s", self.tripped)
+                control.should_training_stop = True
+            return control
+
+    return _TruncationCallback()
+
+
 def _dataset_len(trainer: Any) -> int:
     """Rows the trainer will actually iterate. NEVER raises."""
     try:
@@ -374,12 +465,21 @@ def train_with_ladder(
 
                 callback = _make_guard_callback(watchdog)
                 trainer.add_callback(callback)
+                # The trainer's OWN view of whether truncation is masked --
+                # never a second opinion about the config it was built with.
+                truncation = _make_truncation_callback(
+                    mask_truncated=bool(getattr(
+                        trainer.args, "mask_truncated_completions", False)),
+                )
+                trainer.add_callback(truncation)
                 result = trainer.train()
                 attempt["metrics"] = getattr(result, "metrics", None)
                 attempt["global_step"] = int(
                     getattr(trainer.state, "global_step", 0) or 0
                 )
                 attempt["guard_tripped"] = callback.tripped
+                attempt["truncation_tripped"] = truncation.tripped
+                attempt["clipped_ratio"] = truncation.last_ratio
         except Exception as exc:  # noqa: BLE001
             attempt["error"] = f"{type(exc).__name__}: {exc}"[:500]
             attempt["watchdog"] = watchdog.report()
@@ -445,7 +545,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="completions per prompt; the within-group contrast "
                          "IS the GRPO signal, so this is the main lever on a "
                          "small corpus")
-    ap.add_argument("--max-completion-length", type=int, default=256)
+    ap.add_argument(
+        "--max-completion-length", type=int, default=512,
+        help="tokens per completion. 512, not 256, because at 256 EVERY "
+             "rollout hit the ceiling (clipped_ratio 1.0, "
+             "mean_terminated_length 0) and mask_truncated_completions then "
+             "masked all of them out of the loss. Generation is ~1.645s per "
+             "decode step and 64%% of the step, so this knob is the run's "
+             "wall clock: the truncation callback stops the run if the "
+             "ceiling is still never reached.",
+    )
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--max-steps", type=int, default=-1)
     ap.add_argument("--gradient-accumulation-steps", type=int, default=8)
