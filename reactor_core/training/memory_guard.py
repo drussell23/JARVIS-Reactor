@@ -495,6 +495,56 @@ def _divisible_generations(n: int, global_batch: int) -> int:
     return 2
 
 
+def accumulation_for_groups(
+    num_generations: int,
+    *,
+    per_device_batch: int = 1,
+    requested_accum: int = 8,
+    device_count: int = 1,
+) -> int:
+    """Smallest accumulation >= ``requested_accum`` whose generation batch
+    holds a whole number of groups.
+
+    The COMPANION of :func:`_divisible_generations`. That one bends the
+    group to fit a fixed batch, which is what a memory fallback needs --
+    the batch is the thing being held down. This one bends the batch to
+    fit a chosen group, which is what raising ``num_generations`` for
+    sample efficiency needs: the group size is the thing being asked for.
+
+    TRL's constraint is the same in both directions -- the generation
+    batch (``per_device_batch * accumulation * device_count``) must be an
+    exact multiple of ``num_generations``, or ``GRPOConfig`` raises in its
+    constructor. Raising ``num_generations`` to 16 against the historical
+    accumulation of 8 gives a generation batch of 8, and 8 % 16 != 0: the
+    run would die at construction, before a single byte of VRAM was
+    allocated, with a message about batch shapes rather than about the
+    knob that was actually changed.
+
+    NEVER raises; a nonsensical input returns ``requested_accum``.
+    """
+    import math  # noqa: PLC0415
+    try:
+        g = int(num_generations)
+        per = max(1, int(per_device_batch)) * max(1, int(device_count))
+        accum = max(1, int(requested_accum))
+        if g <= 1:
+            return accum
+        # need: per * accum % g == 0  ->  accum % (g / gcd(per, g)) == 0
+        step = g // math.gcd(per, g)
+        fitted = ((accum + step - 1) // step) * step
+        if fitted != accum:
+            logger.info(
+                "[memguard] accumulation %d -> %d so the generation batch "
+                "(%d x %d = %d) is a whole number of %d-completion groups",
+                accum, fitted, per, fitted, per * fitted, g,
+            )
+        return fitted
+    except Exception:  # noqa: BLE001 -- a sizing helper must never break a run
+        logger.debug("[memguard] accumulation_for_groups fell back",
+                     exc_info=True)
+        return max(1, int(requested_accum or 1))
+
+
 def build_ladder(
     *,
     num_generations: int = 4,

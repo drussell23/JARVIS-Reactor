@@ -187,7 +187,9 @@ def main(argv: list) -> int:
         # one describes a conversion that is not happening.
         if not args.pre_quantized:
             kw["quantization_config"] = build_qlora_config()
-        kw["peft_config"] = build_lora_config()
+        # model_id: the profiler exists to measure the real footprint, and
+        # adapter placement is now part of it.
+        kw["peft_config"] = build_lora_config(args.model)
     quant = ("pre-quantized (checkpoint)" if args.pre_quantized
              else "bnb-nf4 (at load)" if not args.no_qlora else "none (bf16)")
     print(f"  quantization: {quant}")

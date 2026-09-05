@@ -86,6 +86,42 @@ CATEGORICAL_STATUSES = frozenset({"noop"})
 #: stays attributable to one variable.
 _ENV_ADMIT_CATEGORICAL_RETRIES = "REACTOR_GRPO_ADMIT_CATEGORICAL_RETRIES"
 
+#: Adapter placement and the TRL sample-efficiency knobs. Every one of these
+#: is a DEFAULT with an env override rather than a literal at the call site,
+#: so a sweep can move one variable without a code edit -- and so the value
+#: that actually ran is recoverable from the environment of the run.
+_ENV_TARGET_MODULES = "REACTOR_GRPO_TARGET_MODULES"
+_ENV_ADAPT_EXPERTS = "REACTOR_GRPO_ADAPT_EXPERTS"
+_ENV_NUM_GENERATIONS = "REACTOR_GRPO_NUM_GENERATIONS"
+_ENV_NUM_ITERATIONS = "REACTOR_GRPO_NUM_ITERATIONS"
+_ENV_EPSILON_HIGH = "REACTOR_GRPO_EPSILON_HIGH"
+_ENV_SCALE_REWARDS = "REACTOR_GRPO_SCALE_REWARDS"
+
+#: 16 completions per prompt. The corpus is 27 trainable groups; TRL's own
+#: guidance for a small prompt set is to multiply the samples per prompt
+#: rather than the prompts, because GRPO's entire learning signal is the
+#: WITHIN-group contrast. 27 x 16 is 432 completions where 27 x 4 was 108.
+DEFAULT_NUM_GENERATIONS = 16
+#: mu -- optimisation passes over each generated batch. Generation dominates
+#: wall-clock here (a 30B MoE through HF generate, no vLLM), so reusing a
+#: batch twice buys a second update for a few percent more time.
+DEFAULT_NUM_ITERATIONS = 2
+#: DAPO clip-higher. Raising ONLY the upper bound lets an under-weighted good
+#: token recover while the lower bound still restrains collapse.
+DEFAULT_EPSILON_HIGH = 0.28
+#: False removes the per-group std division, and with it the question-level
+#: difficulty bias (Understanding R1-Zero). It matters on THIS corpus because
+#: the reward ladder is explicitly tiered -- an easy prompt whose group all
+#: lands on the same rung would otherwise have its tiny spread amplified to
+#: the same magnitude as a real one.
+DEFAULT_SCALE_REWARDS: Any = False
+
+#: Projection names. Vocabulary of the architecture, not tuned values: the
+#: DECISION about which set applies is made by resolve_target_modules from
+#: the checkpoint's own config.
+_ATTENTION_PROJECTIONS: Sequence[str] = ("q_proj", "k_proj", "v_proj", "o_proj")
+_DENSE_MLP_PROJECTIONS: Sequence[str] = ("gate_proj", "up_proj", "down_proj")
+
 
 def _envb(name: str, default: bool) -> bool:
     """Env boolean, mirroring grpo_verifier's helper. NEVER raises."""
@@ -93,6 +129,54 @@ def _envb(name: str, default: bool) -> bool:
     if raw is None or not str(raw).strip():
         return default
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _envi(name: str, default: int) -> int:
+    """Env int. NEVER raises -- an unparseable value keeps the default."""
+    try:
+        raw = os.environ.get(name)
+        return int(str(raw).strip()) if raw and str(raw).strip() else default
+    except Exception:  # noqa: BLE001
+        logger.warning("[GRPO] %s=%r is not an int; using %d",
+                       name, os.environ.get(name), default)
+        return default
+
+
+def _envf(name: str, default: float) -> float:
+    """Env float. NEVER raises."""
+    try:
+        raw = os.environ.get(name)
+        return float(str(raw).strip()) if raw and str(raw).strip() else default
+    except Exception:  # noqa: BLE001
+        logger.warning("[GRPO] %s=%r is not a float; using %r",
+                       name, os.environ.get(name), default)
+        return default
+
+
+def _env_scale_rewards(name: str, default: Any) -> Any:
+    """``scale_rewards`` is tri-valued: "group" | "batch" | False.
+
+    A plain bool env helper cannot express it, and coercing the string
+    "batch" through one would silently yield ``True`` -- which TRL then
+    reads as the "group" default. That is the quiet-wrong-answer shape
+    this repo keeps finding, so the parse is explicit.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    token = str(raw).strip().lower()
+    if token in ("0", "false", "no", "off", "none"):
+        return False
+    if token in ("group", "batch"):
+        return token
+    logger.warning("[GRPO] %s=%r is not group|batch|false; using %r",
+                   name, raw, default)
+    return default
+
+
+def default_num_generations() -> int:
+    """ONE source of truth for the group size, shared with the runner's CLI."""
+    return max(2, _envi(_ENV_NUM_GENERATIONS, DEFAULT_NUM_GENERATIONS))
 
 
 def is_genuine_row(meta: Optional[Dict[str, Any]]) -> bool:
@@ -302,6 +386,16 @@ def build_grpo_config(
         # judgement about the model's choice; leaving it unmasked teaches
         # the model that running out of room is a quality signal.
         mask_truncated_completions=True,
+        # --- sample efficiency ---
+        # mu: optimisation passes per generated batch. Generation is the
+        # expensive half here, so a second pass is nearly free relative to
+        # generating a second batch.
+        num_iterations=_envi(_ENV_NUM_ITERATIONS, DEFAULT_NUM_ITERATIONS),
+        # DAPO clip-higher. `epsilon` (lower) is left at TRL's 0.2.
+        epsilon_high=_envf(_ENV_EPSILON_HIGH, DEFAULT_EPSILON_HIGH),
+        # False drops the per-group std division. See DEFAULT_SCALE_REWARDS.
+        scale_rewards=_env_scale_rewards(_ENV_SCALE_REWARDS,
+                                         DEFAULT_SCALE_REWARDS),
         # --- optimisation ---
         learning_rate=1e-5,   # adapter-appropriate, per TRL's PEFT note
         logging_steps=1,
@@ -311,7 +405,85 @@ def build_grpo_config(
     if use_liger:
         cfg["use_liger_kernel"] = True
     cfg.update(overrides)
+    cfg = _reconcile_group_batch(cfg)
+    cfg = _drop_unsupported(GRPOConfig, cfg)
     return GRPOConfig(**cfg)
+
+
+def _reconcile_group_batch(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the generation batch a whole number of groups.
+
+    ``num_generations`` and ``gradient_accumulation_steps`` are not
+    independent: TRL requires the generation batch to divide evenly into
+    groups, and violating it raises inside the ``GRPOConfig`` constructor
+    -- before any allocation, with a message about batch shapes rather
+    than about the knob that moved. Raising the group size to 16 against
+    the historical accumulation of 8 does exactly that.
+
+    The accumulation is what gives, not the group size: the group size is
+    the thing being deliberately chosen, and a LARGER accumulation is
+    strictly safer for memory (more, smaller micro-batches).
+
+    Delegates the arithmetic to ``memory_guard.accumulation_for_groups``
+    so the invariant has ONE definition, shared with the rung ladder's
+    ``_divisible_generations`` which enforces the same rule from the
+    other side. NEVER raises.
+    """
+    try:
+        from reactor_core.training.memory_guard import (  # noqa: PLC0415
+            accumulation_for_groups,
+        )
+        generations = int(cfg.get("num_generations") or 1)
+        if generations <= 1:
+            return cfg
+        # steps_per_generation, when set, is what spans the generation
+        # batch; otherwise it defaults to the accumulation.
+        key = ("steps_per_generation"
+               if cfg.get("steps_per_generation") else
+               "gradient_accumulation_steps")
+        current = int(cfg.get(key) or 1)
+        fitted = accumulation_for_groups(
+            generations,
+            per_device_batch=int(cfg.get("per_device_train_batch_size") or 1),
+            requested_accum=current,
+        )
+        if fitted != current:
+            logger.info(
+                "[GRPO] %s %d -> %d to fit %d-completion groups",
+                key, current, fitted, generations,
+            )
+            cfg[key] = fitted
+        return cfg
+    except Exception:  # noqa: BLE001 -- reconciliation must never break build
+        logger.warning("[GRPO] could not reconcile the group batch; "
+                       "GRPOConfig will validate it", exc_info=True)
+        return cfg
+
+
+def _drop_unsupported(config_cls: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop keys the INSTALLED trl does not define, loudly.
+
+    The knobs above are verified against trl 1.12.0, but this module is
+    pinned to no version. A field removed or renamed upstream would
+    otherwise turn a config into a ``TypeError`` at construction. Dropping
+    is the recoverable failure -- the run proceeds on that field's
+    default -- and the warning names exactly what was lost, so a silently
+    weaker run is still an explained one.
+    """
+    try:
+        import dataclasses  # noqa: PLC0415
+        known = {f.name for f in dataclasses.fields(config_cls)}
+    except Exception:  # noqa: BLE001
+        return cfg
+    kept = {k: v for k, v in cfg.items() if k in known}
+    dropped = sorted(set(cfg) - set(kept))
+    if dropped:
+        logger.warning(
+            "[GRPO] installed trl's %s has no field(s) %s -- dropped; those "
+            "settings take their library default for this run",
+            getattr(config_cls, "__name__", config_cls), ", ".join(dropped),
+        )
+    return kept
 
 
 def build_qlora_config(**overrides: Any) -> Any:
@@ -329,14 +501,124 @@ def build_qlora_config(**overrides: Any) -> Any:
     return BitsAndBytesConfig(**kw)
 
 
-def build_lora_config(**overrides: Any) -> Any:
-    """LoRA over attention + MLP projections.
+def describe_expert_topology(model_id: str) -> Dict[str, Any]:
+    """Ask the CHECKPOINT whether it is a mixture-of-experts, and how wide.
 
-    ``target_modules`` deliberately names the attention and MLP
-    projections and NOT the MoE router (``gate``): adapting the router
-    changes which experts fire, which is the one part of a MoE whose
-    balance ``router_aux_loss_coef`` is simultaneously trying to hold
-    steady.
+    Returns ``{"is_moe", "num_experts", "experts_per_tok", "model_type",
+    "known"}``. NEVER raises -- an unreadable config returns
+    ``known=False``, and every caller treats that as "do not assume a
+    dense MLP", which is the memory-safe direction to be wrong in.
+
+    Vendors spell the same field several ways, so each spelling is asked
+    for rather than one being assumed.
+    """
+    out: Dict[str, Any] = {"is_moe": False, "num_experts": 0,
+                           "experts_per_tok": 0, "model_type": "",
+                           "known": False}
+    try:
+        from transformers import AutoConfig  # noqa: PLC0415
+        cfg = AutoConfig.from_pretrained(model_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("[GRPO] could not read a config for %s", model_id,
+                     exc_info=True)
+        return out
+    out["known"] = True
+    out["model_type"] = str(getattr(cfg, "model_type", "") or "")
+    for attr in ("num_experts", "num_local_experts", "n_routed_experts",
+                 "moe_num_experts", "num_routed_experts"):
+        value = getattr(cfg, attr, None)
+        if isinstance(value, int) and value > int(out["num_experts"]):
+            out["num_experts"] = value
+    for attr in ("num_experts_per_tok", "moe_topk", "num_experts_per_token"):
+        value = getattr(cfg, attr, None)
+        if isinstance(value, int) and value > int(out["experts_per_tok"]):
+            out["experts_per_tok"] = value
+    out["is_moe"] = bool(int(out["num_experts"]) > 1
+                         or "moe" in out["model_type"].lower())
+    return out
+
+
+def resolve_target_modules(
+    model_id: str,
+    *,
+    adapt_experts: Optional[bool] = None,
+) -> List[str]:
+    """Which projections should carry adapters, GIVEN WHAT THIS MODEL IS.
+
+    The static list this replaced was written for a dense model, where
+    ``gate_proj`` / ``up_proj`` / ``down_proj`` name one MLP per layer. On
+    a Qwen3 MoE those names exist ONLY inside the experts, so the same
+    list means "one adapter per projection per expert per layer" --
+    48 layers x 128 experts x 3 = 18,432 adapted projections against 192
+    for attention, measured from the checkpoint's own weight map.
+
+    Two independent reasons that is the wrong target here, not merely an
+    expensive one:
+
+    * **Memory.** At r=16 those expert adapters carry ~830 M trainable
+      parameters. The bf16 adapter plus AdamW's three fp32 states is
+      ~11.8 GiB ON TOP of the ~18 GiB 4-bit base, on a 32.6 GiB card,
+      before a single activation. Worse, it is invisible to the rung
+      ladder: the ladder moves ``num_generations`` and
+      ``max_completion_length``, and adapter plus optimiser state is
+      independent of both, so every rung OOMs identically and the run
+      exits ladder-exhausted having learned nothing.
+    * **Signal.** 8 of 128 experts active per token means each expert sees
+      ~6% of tokens. Spreading a corpus of 27 groups across 830 M
+      parameters that each see a sixteenth of it is a worse use of the
+      same gradient than concentrating it on the 13 M attention
+      parameters every token flows through.
+
+    The router (``mlp.gate``) is untouched in BOTH branches -- peft
+    matches on the module suffix, and ``gate`` never suffix-matches
+    ``gate_proj``. That was already true and is asserted here so a future
+    reader does not have to re-derive it.
+    """
+    explicit = os.environ.get(_ENV_TARGET_MODULES) or ""
+    if explicit.strip():
+        chosen = [m.strip() for m in explicit.split(",") if m.strip()]
+        if chosen:
+            logger.info("[GRPO] target_modules pinned by %s: %s",
+                        _ENV_TARGET_MODULES, chosen)
+            return chosen
+    topology = describe_expert_topology(model_id)
+    if adapt_experts is None:
+        adapt_experts = _envb(_ENV_ADAPT_EXPERTS, False)
+    attention = list(_ATTENTION_PROJECTIONS)
+    if not topology["is_moe"]:
+        if not topology["known"]:
+            logger.warning(
+                "[GRPO] %s: architecture unreadable; assuming dense and "
+                "adapting the MLP projections too. Set %s to pin the list.",
+                model_id, _ENV_TARGET_MODULES,
+            )
+        return attention + list(_DENSE_MLP_PROJECTIONS)
+    if adapt_experts:
+        logger.warning(
+            "[GRPO] %s is MoE (%s experts) and %s is set: adapting the "
+            "EXPERT projections. This is the ~830 M-parameter placement "
+            "the rung ladder cannot rescue -- see resolve_target_modules.",
+            model_id, topology["num_experts"], _ENV_ADAPT_EXPERTS,
+        )
+        return attention + list(_DENSE_MLP_PROJECTIONS)
+    logger.info(
+        "[GRPO] %s is MoE (model_type=%s, %s experts, %s active/token): "
+        "adapters on ATTENTION ONLY (%s). The MLP projection names live "
+        "inside the experts on this architecture, so naming them would "
+        "attach one adapter per expert per layer.",
+        model_id, topology["model_type"], topology["num_experts"],
+        topology["experts_per_tok"], ",".join(attention),
+    )
+    return attention
+
+
+def build_lora_config(model_id: str = "", **overrides: Any) -> Any:
+    """LoRA sized and TARGETED for whatever ``model_id`` actually is.
+
+    ``target_modules`` is resolved from the checkpoint by
+    :func:`resolve_target_modules` rather than fixed here; pass it in
+    ``overrides`` to pin it, or leave ``model_id`` empty only when the
+    caller genuinely has no checkpoint to inspect.
 
     ``lora_dropout`` is 0.0 because on THIS architecture it is not a free
     hyperparameter. A Qwen3 MoE keeps its expert MLPs as fused
@@ -357,11 +639,20 @@ def build_lora_config(**overrides: Any) -> Any:
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
     )
+    if "target_modules" not in overrides:
+        if model_id:
+            kw["target_modules"] = resolve_target_modules(model_id)
+        else:
+            # No checkpoint to ask. Keep the historical dense list so a
+            # dense caller is unchanged, but say so -- silence here is how
+            # the MoE case went unnoticed in the first place.
+            logger.warning(
+                "[GRPO] build_lora_config called without model_id; falling "
+                "back to the dense projection list. On a MoE this attaches "
+                "one adapter per expert -- pass model_id to avoid it.")
+            kw["target_modules"] = (list(_ATTENTION_PROJECTIONS)
+                                    + list(_DENSE_MLP_PROJECTIONS))
     kw.update(overrides)
     return LoraConfig(**kw)
 
@@ -473,7 +764,9 @@ def build_trainer(
     )
     kwargs: Dict[str, Any] = {}
     if use_qlora:
-        kwargs["peft_config"] = build_lora_config()
+        # model_id, not bare: the adapter targets are resolved from what
+        # this checkpoint IS. See resolve_target_modules.
+        kwargs["peft_config"] = build_lora_config(model_id)
     # A model OBJECT, never the id: see load_training_model for the host-RAM
     # OOM and the double-quantization this avoids.
     return GRPOTrainer(
@@ -489,7 +782,10 @@ def build_trainer(
 
 
 __all__ = [
+    "default_num_generations",
+    "describe_expert_topology",
     "detect_quantization",
+    "resolve_target_modules",
     "load_training_model",
     "build_grpo_config",
     "build_lora_config",

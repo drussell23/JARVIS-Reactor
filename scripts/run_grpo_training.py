@@ -55,6 +55,21 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+def _default_num_generations() -> int:
+    """The group size default, owned by grpo_pipeline.
+
+    Wrapped so that a missing training extra degrades to TRL's own default
+    instead of making ``--help`` unavailable.
+    """
+    try:
+        from reactor_core.training.grpo_pipeline import (  # noqa: PLC0415
+            default_num_generations,
+        )
+        return default_num_generations()
+    except Exception:  # noqa: BLE001
+        return 8
+
+
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
@@ -357,7 +372,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "why the GPTQ mirror is not a substitute")
     ap.add_argument("--telemetry-dir", default="")
     ap.add_argument("--output-dir", default="")
-    ap.add_argument("--num-generations", type=int, default=4)
+    ap.add_argument("--num-generations", type=int,
+                    default=_default_num_generations(),
+                    help="completions per prompt; the within-group contrast "
+                         "IS the GRPO signal, so this is the main lever on a "
+                         "small corpus")
     ap.add_argument("--max-completion-length", type=int, default=256)
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--max-steps", type=int, default=-1)
@@ -448,13 +467,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             return EXIT_REFUSED
 
     # --- the ladder ---------------------------------------------------------
-    global_batch = max(1, args.gradient_accumulation_steps)
     device_count = 0
     try:
         import torch  # noqa: PLC0415
         device_count = torch.cuda.device_count()
     except Exception:  # noqa: BLE001
         pass
+    # Reconcile FIRST. build_grpo_config enforces the same invariant as a
+    # last line of defence, but the ladder sizes its fallback rungs against
+    # global_batch -- so it has to see the accumulation that will really be
+    # used, not the one that was requested.
+    accumulation = guard.accumulation_for_groups(
+        args.num_generations,
+        per_device_batch=1,
+        requested_accum=max(1, args.gradient_accumulation_steps),
+        device_count=max(1, device_count),
+    )
+    if accumulation != args.gradient_accumulation_steps:
+        logger.info(
+            "[runner] gradient_accumulation_steps %d -> %d so the generation "
+            "batch holds whole %d-completion groups",
+            args.gradient_accumulation_steps, accumulation,
+            args.num_generations,
+        )
+        args.gradient_accumulation_steps = accumulation
+    global_batch = accumulation
     ladder = guard.build_ladder(
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
@@ -470,6 +507,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     overrides: Dict[str, Any] = {
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_train_epochs": args.epochs,
+    }
+    report["batching"] = {
+        "num_generations": args.num_generations,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "per_device_train_batch_size": 1,
+        "generation_batch": global_batch,
+        "groups_per_generation_batch": (
+            global_batch // args.num_generations
+            if args.num_generations else 0
+        ),
     }
     if args.max_steps > 0:
         overrides["max_steps"] = args.max_steps
