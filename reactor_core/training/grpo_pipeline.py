@@ -732,10 +732,34 @@ def load_training_model(
         logger.info("[GRPO] %s is pre-quantized (%s); not re-quantizing",
                     model_id, quant["method"])
     elif use_qlora:
-        kw["quantization_config"] = build_qlora_config()
-        logger.info("[GRPO] %s is base weights; attaching bnb-NF4", model_id)
+        topology = describe_expert_topology(model_id)
+        if topology["is_moe"]:
+            # bnb alone quantizes only nn.Linear. transformers 5 keeps routed
+            # experts as fused 3-D parameters, so on the 30B "bnb-NF4" left
+            # 29.0B of 30.5B parameters in bf16 (~54 GiB) and the load
+            # OOM'd. The MoE quantizer applies THE SAME config expert by
+            # expert -- see moe_quant for why nothing else changes.
+            from reactor_core.training.moe_quant import as_moe_config  # noqa: PLC0415
+            kw["quantization_config"] = as_moe_config(build_qlora_config())
+            logger.info(
+                "[GRPO] %s is a %d-expert MoE on base weights; attaching "
+                "per-expert bnb-NF4 (plain bnb would leave the fused experts "
+                "in bf16)", model_id, topology["num_experts"],
+            )
+        else:
+            kw["quantization_config"] = build_qlora_config()
+            logger.info("[GRPO] %s is base weights; attaching bnb-NF4", model_id)
 
-    return AutoModelForCausalLM.from_pretrained(model_id, **kw)
+    # The loader keeps every shard mmapped for the whole load, and under
+    # WSL2 Windows charges each mapped page to vmmemWSL's commit. On the
+    # 30B that alone is 47 GiB before the VRAM backing store -- see
+    # memory_guard.PageCacheValve for the measurement. Unmapping as we go
+    # keeps the guest's share near zero; nothing about the load changes.
+    from reactor_core.training.memory_guard import PageCacheValve  # noqa: PLC0415
+    with PageCacheValve(label="from_pretrained") as valve:
+        model = AutoModelForCausalLM.from_pretrained(model_id, **kw)
+    logger.info("[GRPO] page-cache valve: %s", valve.report())
+    return model
 
 
 def build_trainer(
