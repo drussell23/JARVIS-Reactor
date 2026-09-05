@@ -389,6 +389,17 @@ class PipelineConfig:
         default_factory=lambda: os.getenv("REACTOR_OLLAMA_ADAPTER_TAG", "")
     )
 
+    #: Require a MEASURED base-model control before an adapter may take the
+    #: live tag. Default ON: a cycle that trains and deploys unguarded is a
+    #: machine that replaces the model O+V generates with, every night, on
+    #: the strength of having produced a file.
+    require_promotion_baseline: bool = field(
+        default_factory=lambda: (
+            os.getenv("REACTOR_REQUIRE_PROMOTION_BASELINE", "true")
+            .strip().lower() not in ("0", "false", "no", "off")
+        )
+    )
+
     # Recovery
     state_file: Optional[Path] = None
     resume_on_error: bool = True
@@ -1529,8 +1540,51 @@ class NightShiftPipeline:
         recorded = (self._state.adapter_path if self._state else "") or ""
         return bool(recorded) and "adapter" in source.name.lower()
 
+    def _promotion_verdict(self) -> Any:
+        """May this adapter take the live tag?
+
+        The question is answered against a MEASURED base-model control, and
+        REFUSED when it cannot be answered honestly -- no baseline, a stale
+        one, one measured on a different base, or a candidate with no score.
+        "No data" is not "no regression", and a first cycle on a fresh box
+        must not promote by default.
+
+        Returns the verdict; the caller decides what to do with it, so the
+        gate stays a judgement and the stage stays the actor.
+        """
+        from reactor_core.deployment.promotion_gate import (  # noqa: PLC0415
+            evaluate_promotion,
+        )
+
+        metrics = (self._state.eval_metrics if self._state else {}) or {}
+        # Whatever the evaluation stage reported as its headline number.
+        # Named here rather than assumed, so a change to the harness is a
+        # change to one line and not a silent comparison of unlike things.
+        metric = str(self.config.trainer_options.get(
+            "promotion_metric", "overall_score"))
+        raw = metrics.get(metric)
+        score = float(raw) if isinstance(raw, (int, float)) else None
+        return evaluate_promotion(
+            candidate_score=score,
+            candidate_metric=metric,
+            base_model=self.config.base_model,
+        )
+
     async def _deploy_adapter_to_ollama(self, adapter_gguf: Path) -> None:
         """Publish an adapter GGUF by layering it over the base tag."""
+        if self.config.require_promotion_baseline:
+            verdict = self._promotion_verdict()
+            logger.info("[Deploy] %s", verdict.summary())
+            if not verdict.promote:
+                if self._state:
+                    self._state.deployed_tag = ""
+                    self._save_state()
+                # A refusal here costs a cycle. Promoting without a control
+                # costs the model O+V generates with, and the evidence to
+                # notice. Both stop the stage; only one is recoverable.
+                raise RuntimeError(
+                    f"promotion refused: {verdict.reason}"
+                )
         try:
             from reactor_core.deployment.ollama_deployer import (  # noqa: PLC0415
                 OllamaDeployer,

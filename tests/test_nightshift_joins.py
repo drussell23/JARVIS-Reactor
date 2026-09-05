@@ -300,6 +300,32 @@ async def test_skip_quantization_still_wins(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture()
+def control(tmp_path, monkeypatch):
+    """A measured base-model baseline.
+
+    The promotion gate refuses to publish an adapter without one, so a
+    deploy test must either provide a control or it is not exercising the
+    shipping path. Providing one is the honest option: switching the guard
+    off would test a configuration that never ships.
+    """
+    from reactor_core.deployment import promotion_gate as pg
+    from datetime import datetime, timezone
+
+    path = tmp_path / "baseline.json"
+    monkeypatch.setenv(pg.ENV_BASELINE_PATH, str(path))
+    pg.save_baseline(
+        pg.BaselineRecord(
+            score=10.0, metric="overall_score",
+            base_model=PipelineConfig().base_model,
+            measured_at=datetime.now(tz=timezone.utc).isoformat(),
+            harness="devtest", session_id="test",
+        ),
+        path=path,
+    )
+    return path
+
+
 def _adapter_gguf(tmp_path: Path) -> Path:
     g = tmp_path / "run-adapter.gguf"
     g.write_bytes(b"GGUF" + b"\x00" * 16)
@@ -307,7 +333,9 @@ def _adapter_gguf(tmp_path: Path) -> Path:
 
 
 @pytest.mark.asyncio
-async def test_an_adapter_is_published_through_the_deployer(tmp_path, monkeypatch) -> None:
+async def test_an_adapter_is_published_through_the_deployer(
+    tmp_path, monkeypatch, control,
+) -> None:
     g = _adapter_gguf(tmp_path)
     seen = {}
 
@@ -328,6 +356,7 @@ async def test_an_adapter_is_published_through_the_deployer(tmp_path, monkeypatc
                   ollama_base_tag="qwen3-coder:30b",
                   ollama_adapter_tag="qwen3-coder-ov:30b",
                   require_gatekeeper=False)
+    p._state.eval_metrics = {"overall_score": 12.0}   # beats the control
     p._state.quantized_path = str(g)
     await p._run_deployment()
     assert seen["path"] == g
@@ -337,7 +366,9 @@ async def test_an_adapter_is_published_through_the_deployer(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_a_failed_adapter_deploy_is_loud(tmp_path, monkeypatch) -> None:
+async def test_a_failed_adapter_deploy_is_loud(
+    tmp_path, monkeypatch, control,
+) -> None:
     g = _adapter_gguf(tmp_path)
 
     class _Deployer:
@@ -353,6 +384,7 @@ async def test_a_failed_adapter_deploy_is_loud(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(dep, "OllamaDeployer", _Deployer)
 
     p = _pipeline(tmp_path, deploy_via_ollama=True, require_gatekeeper=False)
+    p._state.eval_metrics = {"overall_score": 12.0}
     p._state.quantized_path = str(g)
     with pytest.raises(RuntimeError, match="base_missing"):
         await p._run_deployment()
@@ -389,7 +421,7 @@ async def test_a_full_model_still_takes_the_file_path(tmp_path, monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_an_adapter_takes_the_ollama_path_even_without_the_flag(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, control,
 ) -> None:
     """A config that forgot the flag must not silently copy an adapter into
     a directory where nothing can serve it."""
@@ -409,6 +441,7 @@ async def test_an_adapter_takes_the_ollama_path_even_without_the_flag(
     monkeypatch.setattr(dep, "OllamaDeployer", _Deployer)
 
     p = _pipeline(tmp_path, require_gatekeeper=False)
+    p._state.eval_metrics = {"overall_score": 12.0}
     p._state.adapter_path = str(tmp_path / "run-1")     # training said adapter
     p._state.quantized_path = str(g)
     await p._run_deployment()
@@ -450,3 +483,26 @@ def test_no_stage_names_a_trainer_or_assumes_an_artifact() -> None:
     assert "classify_artifact" in quant
     deploy = inspect.getsource(NightShiftPipeline._run_deployment)
     assert "_is_adapter_deploy" in deploy
+
+
+@pytest.mark.asyncio
+async def test_an_adapter_without_a_control_never_reaches_the_deployer(
+    tmp_path, monkeypatch,
+) -> None:
+    """The join and the gate compose: wiring the deploy did not weaken the
+    rule that an unmeasured adapter must not take the live tag."""
+    from reactor_core.deployment import promotion_gate as pg
+    monkeypatch.setenv(pg.ENV_BASELINE_PATH, str(tmp_path / "absent.json"))
+    monkeypatch.delenv(pg.ENV_FORCE_PROMOTE, raising=False)
+
+    class _Deployer:
+        def __init__(self, **kw):
+            raise AssertionError("must not be constructed without a control")
+
+    import reactor_core.deployment.ollama_deployer as dep
+    monkeypatch.setattr(dep, "OllamaDeployer", _Deployer)
+
+    p = _pipeline(tmp_path, deploy_via_ollama=True, require_gatekeeper=False)
+    p._state.quantized_path = str(_adapter_gguf(tmp_path))
+    with pytest.raises(RuntimeError, match="promotion refused"):
+        await p._run_deployment()
