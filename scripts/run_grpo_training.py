@@ -415,7 +415,15 @@ def train_with_isolated_ladder(
         handle, child_json = tempfile.mkstemp(prefix="grpo-rung-", suffix=".json")
         os.close(handle)
         try:
-            code = subprocess.call([sys.executable, script]
+            # -u: the child's stdout is a PIPE, so without it Python
+            # block-buffers every print -- the trainer's per-step loss
+            # lines included -- until the process EXITS. Measured
+            # 2026-09-05: a rung ran 45 minutes and completed several
+            # optimiser steps while its log showed nothing after model
+            # load; the loss lines all surfaced at once when it died.
+            # A guard that watches the log for progress cannot work
+            # against a child that only reports posthumously.
+            code = subprocess.call([sys.executable, "-u", script]
                                    + child_argv(index, child_json))
             child: Dict[str, Any] = {}
             try:
