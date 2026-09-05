@@ -33,6 +33,53 @@ sys.path.insert(0, str(REPO))
 
 GIB = 1024 ** 3
 
+#: Same meaning as run_grpo_training.EXIT_REFUSED: the box declined, the
+#: script did not fail. A refusal here IS a measurement -- it says the
+#: profile cannot be taken without damaging the host.
+EXIT_REFUSED = 2
+
+
+def _load_guard():
+    """``memory_guard`` by path, exactly as the runner loads it.
+
+    ``reactor_core/__init__`` imports the ML stack, and the guard has to
+    run BEFORE torch does -- admission is the only gate that fires before
+    a CUDA byte is touched. See ``run_grpo_training._load_by_path``.
+    """
+    import importlib.util  # noqa: PLC0415
+    path = REPO / "reactor_core" / "training" / "memory_guard.py"
+    spec = importlib.util.spec_from_file_location("_profiler_memory_guard", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _default_num_generations() -> int:
+    """The group size default, owned by grpo_pipeline — same source the
+    runner reads.
+
+    This must not be a literal. A profile is only evidence about the run
+    it mirrors, and ``num_generations`` is the dimension the rollout
+    multiplies: every completion in a group is generated AND
+    backpropagated. Profiling at 4 while ``run_grpo_training`` launches
+    at 16 understates the peak by the largest factor in the measurement,
+    and it does so in the reassuring direction — a clean profile followed
+    by an OOM on the real step is exactly the false negative this script
+    exists to prevent.
+
+    Wrapped like the runner's copy so a missing training extra degrades
+    to TRL's own default rather than making ``--help`` unavailable.
+    """
+    try:
+        from reactor_core.training.grpo_pipeline import (  # noqa: PLC0415
+            default_num_generations,
+        )
+        return default_num_generations()
+    except Exception:  # noqa: BLE001
+        return 8
+
 
 def vram() -> dict:
     import torch
@@ -89,7 +136,12 @@ def main(argv: list) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--telemetry-dir", default=str(Path.home() / ".jarvis" / "trinity" / "events"))
-    ap.add_argument("--num-generations", type=int, default=4)
+    ap.add_argument("--num-generations", type=int,
+                    default=_default_num_generations(),
+                    help="completions per prompt. Defaults to the value "
+                         "run_grpo_training will actually launch with, so "
+                         "the profile answers the question that was asked; "
+                         "lower it only to measure a specific rung.")
     ap.add_argument("--max-completion-length", type=int, default=256)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--no-qlora", action="store_true")
@@ -116,12 +168,63 @@ def main(argv: list) -> int:
         help="skip the kernel warm-up. The measured peak then includes "
              "Triton JIT compilation workspace, and the report says so.",
     )
+    ap.add_argument(
+        "--skip-admission", action="store_true",
+        help="measure even when memory_guard would refuse to start. The "
+             "watchdog still runs and will still hard-abort on Windows "
+             "commit; this only skips the pre-torch gate.",
+    )
     ap.add_argument("--json-out", default="")
     args = ap.parse_args(argv)
 
+    # The guard first, torch second. On 2026-09-04 22:03 this script --
+    # which then had NO guard, while the runner had two -- loaded the 30B
+    # straight through Windows' commit limit and took the desktop down at
+    # 22:09. The profiler is the thing people actually run against a new
+    # checkpoint, so it gets the same admission gate, the same watchdog
+    # (armed BEFORE the load, which is where the spill happens) and the
+    # same allocator cap as the runner.
+    guard = _load_guard()
+    if not args.skip_admission:
+        adm = guard.check_admission()
+        print(f"  admission: {adm.reason}")
+        if not adm.allowed:
+            print(f"\nREFUSED (exit {EXIT_REFUSED}): {adm.reason}")
+            return EXIT_REFUSED
+
+    with guard.MemoryWatchdog(label="profile") as watchdog:
+        return _profile(args, guard, watchdog)
+
+
+#: The runner's CLI default for --gradient-accumulation-steps and the
+#: pipeline's build_grpo_config default. Mirrored, not imported: loading
+#: the runner by path just to read an argparse default would import its
+#: whole CLI. test_profile_defaults pins the two against each other.
+RUNNER_REQUESTED_ACCUM = 8
+
+
+def _step_geometry(guard, num_generations: int) -> tuple:
+    """``(per_device_train_batch_size, gradient_accumulation_steps,
+    prompts_per_step)`` exactly as ``run_grpo_training`` will launch.
+
+    One sequence per micro-step; accumulation is whatever makes the
+    generation batch a whole number of groups, decided by the SAME
+    ``memory_guard.accumulation_for_groups`` the runner calls.
+    """
+    per_device = 1
+    accum = guard.accumulation_for_groups(
+        num_generations, per_device_batch=per_device,
+        requested_accum=RUNNER_REQUESTED_ACCUM, device_count=1,
+    )
+    return per_device, accum, max(1, (per_device * accum) // max(1, num_generations))
+
+
+def _profile(args, guard, watchdog) -> int:
+    """Everything that touches CUDA. Runs inside the watchdog."""
     import torch
     if not torch.cuda.is_available():
         print("CUDA unavailable — nothing to profile."); return 1
+    allocator_fraction = guard.cap_cuda_allocator()
     p = torch.cuda.get_device_properties(0)
     print(f"device: {p.name}  sm_{p.major}{p.minor}  {p.total_memory / GIB:.1f} GiB")
     print(f"torch : {torch.__version__} (cuda {torch.version.cuda})")
@@ -157,16 +260,22 @@ def main(argv: list) -> int:
         source = "SYNTHETIC (corpus unusable)"
     print(f"  dataset source: {source}\n")
 
-    # A GRPO step consumes `per_device_train_batch_size *
-    # gradient_accumulation_steps` prompts, and that product must be
-    # divisible by num_generations. The shipping config uses accum=8 for
-    # memory; with a thin corpus that needs 8 prompts and, short of them,
-    # transformers logs "not a single sample in your epoch_iterator" and
-    # exits at step 0 — reporting a peak that is only the loaded weights.
-    # A profile that silently measures nothing is worse than no profile,
-    # so the batch is collapsed to exactly one real step and the dataset
-    # padded to fill it.
-    need = args.num_generations
+    # THE RUNNER'S GEOMETRY, not a collapsed one. This script used to put
+    # the whole group in one micro-batch (per_device = num_generations,
+    # accum = 1) so a thin corpus could still take a step. That measures a
+    # forward the runner never runs: on 2026-09-04 23:30 the 30B loaded at
+    # 15.6 GiB and then OOM'd in the TRAINING forward with 16 sequences of
+    # ~6.3k tokens in one micro-batch -- ~20 GiB of checkpointed layer
+    # inputs -- while the runner trains ONE sequence per micro-step and
+    # accumulates. Same generation batch, same group, one sixteenth of the
+    # activation footprint. The geometry is taken from the same helper the
+    # runner calls, so the two cannot drift again.
+    per_device, accum, prompts_per_step = _step_geometry(guard, args.num_generations)
+    print(f"  geometry: per_device_train_batch_size={per_device} "
+          f"gradient_accumulation_steps={accum} -> generation batch "
+          f"{per_device * accum} = {prompts_per_step} prompt(s) x "
+          f"{args.num_generations} completions per optimiser step")
+    need = max(2, prompts_per_step)
     if len(ds) < need:
         ds = _pad_to(ds, need)
         print(f"  padded dataset to {len(ds)} row(s) so one full step can run")
@@ -177,8 +286,8 @@ def main(argv: list) -> int:
         max_completion_length=args.max_completion_length,
         max_steps=args.steps,
         num_train_epochs=1,
-        per_device_train_batch_size=args.num_generations,
-        gradient_accumulation_steps=1,
+        per_device_train_batch_size=per_device,
+        gradient_accumulation_steps=accum,
     )
     kw = {}
     if not args.no_qlora:
@@ -286,6 +395,12 @@ def main(argv: list) -> int:
     print(f"  config         : n_gen={args.num_generations} "
           f"max_completion={args.max_completion_length} "
           f"qlora={not args.no_qlora}")
+    wd = watchdog.report()
+    if wd.get("min_win_commit_available_gib") is not None:
+        print(f"  windows commit : min {wd['min_win_commit_available_gib']:.1f} GiB "
+              f"free during the run (floor {wd['win_commit_floor_gib']:.1f})")
+    if wd.get("breach"):
+        print(f"  watchdog breach: {wd['breach']}")
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps({
@@ -296,6 +411,8 @@ def main(argv: list) -> int:
             "qlora": not args.no_qlora, "quantization": quant_detected,
             "dataset_source": source, "steps_run": steps, "marks": marks,
             "warmup": warm,
+            "cuda_allocator_fraction": allocator_fraction,
+            "watchdog": wd,
         }, indent=2), encoding="utf-8")
         print(f"\n  wrote {args.json_out}")
     return 0

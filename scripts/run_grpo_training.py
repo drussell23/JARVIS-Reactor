@@ -244,6 +244,68 @@ def _make_guard_callback(watchdog: Any) -> Any:
     return _MemoryGuardCallback()
 
 
+def _dataset_len(trainer: Any) -> int:
+    """Rows the trainer will actually iterate. NEVER raises."""
+    try:
+        return int(len(trainer.train_dataset))
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def describe_adapter(trainer: Any) -> Dict[str, Any]:
+    """Trainable-parameter census -- the adapter half of the memory profile.
+
+    Peak VRAM from the watchdog answers "did it fit". This answers "what
+    is it training", which is the question the MoE targeting bug turned
+    on: a run whose adapters landed on 18,432 expert projections and one
+    whose adapters landed on 192 attention projections both LOAD, and are
+    told apart only by this census.
+
+    ``adamw_states_gib`` is the optimiser's own footprint, which does not
+    exist yet at dry-run time -- the optimiser is constructed on the first
+    training step. It is projected here because it is the term that
+    decides whether the real run fits, and a dry-run that omitted it would
+    understate the peak it exists to predict.
+
+    NEVER raises; a model that cannot be walked returns ``{"error": ...}``.
+    """
+    try:
+        model = getattr(trainer, "model", None)
+        if model is None:
+            return {"error": "trainer has no model"}
+        total = 0
+        trainable = 0
+        adapted: Dict[str, int] = {}
+        for name, param in model.named_parameters():
+            count = int(param.numel())
+            total += count
+            if not param.requires_grad:
+                continue
+            trainable += count
+            if "lora_" not in name:
+                continue
+            parts = name.split(".")
+            for index, segment in enumerate(parts):
+                if segment.startswith("lora_") and index:
+                    key = parts[index - 1]
+                    adapted[key] = adapted.get(key, 0) + 1
+                    break
+        gib = float(1 << 30)
+        return {
+            "trainable_params": trainable,
+            "total_params": total,
+            "trainable_pct": round(100.0 * trainable / max(1, total), 4),
+            "adapter_bf16_gib": round(trainable * 2 / gib, 3),
+            # AdamW: exp_avg + exp_avg_sq + fp32 master copy, 4 bytes each.
+            "projected_adamw_gib": round(trainable * 12 / gib, 3),
+            "adapted_projections": dict(sorted(adapted.items())),
+            "adapted_module_count": sum(adapted.values()) // 2,
+        }
+    except Exception as exc:  # noqa: BLE001 -- profiling must not kill a run
+        logger.debug("[runner] adapter census failed", exc_info=True)
+        return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def train_with_ladder(
     *,
     model_id: str,
@@ -301,7 +363,11 @@ def train_with_ladder(
                 if dry_run:
                     attempt["status"] = "dry-run"
                     attempt["watchdog"] = watchdog.report()
+                    attempt["adapter"] = describe_adapter(trainer)
+                    attempt["dataset_rows"] = _dataset_len(trainer)
                     attempts.append(attempt)
+                    logger.info("[runner] dry-run adapter: %s",
+                                attempt["adapter"])
                     return {"status": "dry-run", "attempts": attempts}
 
                 callback = _make_guard_callback(watchdog)
@@ -473,6 +539,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         device_count = torch.cuda.device_count()
     except Exception:  # noqa: BLE001
         pass
+    # Before the first allocation, in the process that will make it. The
+    # driver on this box pages a model that does not fit into HOST memory
+    # instead of failing, and that spill is charged to Windows' commit
+    # limit -- see memory_guard.DEFAULT_CUDA_ALLOCATOR_FRACTION.
+    report["cuda_allocator_fraction"] = guard.cap_cuda_allocator()
     # Reconcile FIRST. build_grpo_config enforces the same invariant as a
     # last line of defence, but the ladder sizes its fallback rungs against
     # global_batch -- so it has to see the accumulation that will really be
