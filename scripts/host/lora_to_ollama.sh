@@ -123,5 +123,57 @@ PROBE=$(ollama.exe run "$TAG" "Reply with the single word: ready" 2>&1 | head -3
 echo "  $PROBE"
 [ -n "$(echo "$PROBE" | tr -d '[:space:]')" ] \
   || die "'$TAG' registered but produced no output -- it loads and says nothing"
+
+# --- what can it actually produce inside O+V's budget? --------------------
+# The output ceiling O+V requests is 4096 tokens, but the binding limit is
+# the 180 s generation budget on the STANDARD route, not the token count.
+# Decode rate decides which one is reached first, and the only rate that
+# means anything here is a single interactive stream on a quiet card --
+# NOT the ~1.6 s/step measured during training, where 16 completions ran
+# in parallel under a 28 GiB load.
+#
+# ollama reports its own counters, so this reads eval_count / eval_duration
+# rather than timing the shell, and it runs HERE -- inside the bridge,
+# which the baseline runner already waits on -- so it cannot race the
+# control run for the card.
+if [ "${OV_SKIP_DECODE_BENCH:-0}" != "1" ]; then
+  echo
+  echo "=== decode rate (single stream, this adapter) ==="
+  BENCH_PROMPT="${OV_BENCH_PROMPT:-Write a Python function that reverses a linked list. Explain each step.}"
+  BENCH_JSON=$(curl -s -m 300 "${OLLAMA_API:-http://127.0.0.1:11434}/api/generate" \
+    -d "{\"model\":\"$TAG\",\"prompt\":$(printf '%s' "$BENCH_PROMPT" | "$PY" -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),\"stream\":false,\"options\":{\"num_predict\":256}}" 2>/dev/null)
+  if [ -n "$BENCH_JSON" ]; then
+    printf '%s' "$BENCH_JSON" | "$PY" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception as exc:
+    print(f"  benchmark: unparseable response ({exc})"); raise SystemExit(0)
+n = int(d.get("eval_count") or 0)
+ns = int(d.get("eval_duration") or 0)
+pn = int(d.get("prompt_eval_count") or 0)
+pns = int(d.get("prompt_eval_duration") or 0)
+if n and ns:
+    tps = n / (ns / 1e9)
+    print(f"  decode      : {tps:6.1f} tok/s  ({n} tokens in {ns/1e9:.1f}s)")
+    if pn and pns:
+        print(f"  prefill     : {pn/(pns/1e9):6.1f} tok/s  ({pn} tokens in {pns/1e9:.1f}s)")
+    budget = float(__import__("os").environ.get("OV_GEN_BUDGET_S", "180"))
+    # What O+V can actually emit inside its budget, once prefill is paid.
+    prefill_s = (pns / 1e9) if pns else 0.0
+    left = max(0.0, budget - prefill_s)
+    print(f"  in {budget:.0f}s : ~{int(tps*left)} tokens after {prefill_s:.0f}s prefill "
+          f"(O+V requests up to 4096)")
+    if tps * left < 4096:
+        print("  -> the CLOCK binds before the token ceiling")
+    else:
+        print("  -> the token ceiling binds before the clock")
+else:
+    print("  benchmark: no timing counters in the response")
+' 2>/dev/null || echo "  benchmark: could not parse ollama counters"
+  else
+    echo "  benchmark: no response from ollama (skipped, not fatal)"
+  fi
+fi
 echo
 echo "done. Point the soak at it with:  export OV_MODEL=$TAG"
