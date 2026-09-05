@@ -31,6 +31,10 @@ BASE="${OV_BASE_MODEL:-qwen3-coder:30b}"
 LLAMA="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
 PY="${REACTOR_TRAIN_PYTHON:-$HOME/.venvs/reactor-train/bin/python}"
 OUT_DIR="${OV_GGUF_OUT:-$HOME/.jarvis/adapters}"
+# A LoRA over 192 attention projections at r=16 is ~27 MB. 256 KiB sits far
+# below any healthy adapter and far above a truncated or empty one, so it
+# separates the two without encoding today's exact rank.
+MIN_ADAPTER_BYTES="${OV_MIN_ADAPTER_BYTES:-262144}"
 
 die() { echo "REFUSING: $*" >&2; exit 2; }
 
@@ -59,22 +63,65 @@ echo "  base    : $BASE (already local)"
 echo "  out     : $GGUF"
 # --outtype f16: an adapter is small and its whole purpose is the delta;
 # quantizing a 27 MB delta saves nothing and costs precision.
+# `| tail` makes $? the exit code of TAIL, not the converter. A converter
+# that died after writing a partial file would have passed silently, which
+# is the failure class this script exists to catch.
 "$PY" "$LLAMA/convert_lora_to_gguf.py" "$ADAPTER_DIR" \
   --outfile "$GGUF" --outtype f16 --verbose 2>&1 | tail -20
-[ -f "$GGUF" ] || die "conversion produced no file"
-echo "  wrote $(du -h "$GGUF" | cut -f1)"
+CONV_RC=${PIPESTATUS[0]}
+[ "$CONV_RC" -eq 0 ] || die "convert_lora_to_gguf exited $CONV_RC"
 
+# --- the artifact is what it claims to be ---------------------------------
+# Existence is not validity. A truncated conversion still leaves a file,
+# and `ollama create` would accept it and serve a model whose adapter is
+# garbage: loading fine, answering wrongly, which is the worst shape.
+[ -f "$GGUF" ] || die "conversion produced no file at $GGUF"
+GGUF_BYTES=$(stat -c%s "$GGUF" 2>/dev/null || echo 0)
+[ "$GGUF_BYTES" -ge "$MIN_ADAPTER_BYTES" ] \
+  || die "adapter is $GGUF_BYTES bytes, under the $MIN_ADAPTER_BYTES floor -- a truncated conversion, not a 13.4M-parameter LoRA"
+MAGIC=$(head -c 4 "$GGUF" 2>/dev/null)
+[ "$MAGIC" = "GGUF" ] || die "$GGUF does not start with GGUF magic (got '$MAGIC')"
+echo "  wrote $(du -h "$GGUF" | cut -f1) -- GGUF magic OK"
+
+# --- the Modelfile says exactly what we mean -------------------------------
 MODELFILE="$OUT_DIR/Modelfile-$STAMP"
 {
   echo "FROM $BASE"
   echo "ADAPTER $GGUF"
 } > "$MODELFILE"
 
+# Read it BACK and prove it. Writing a file is not writing the RIGHT file:
+# a shell-expansion slip (an empty $GGUF, a stale $BASE) yields a
+# syntactically valid Modelfile that layers nothing, or layers onto the
+# wrong weights. Both register cleanly and serve a model nobody asked for.
+FROM_LINES=$(grep -c '^FROM ' "$MODELFILE" || true)
+ADAPTER_LINES=$(grep -c '^ADAPTER ' "$MODELFILE" || true)
+[ "$FROM_LINES" -eq 1 ] || die "Modelfile has $FROM_LINES FROM lines, expected 1"
+[ "$ADAPTER_LINES" -eq 1 ] || die "Modelfile has $ADAPTER_LINES ADAPTER lines, expected 1"
+MF_FROM=$(sed -n 's/^FROM //p' "$MODELFILE")
+MF_ADAPTER=$(sed -n 's/^ADAPTER //p' "$MODELFILE")
+[ "$MF_FROM" = "$BASE" ] || die "Modelfile FROM is '$MF_FROM', expected '$BASE'"
+[ "$MF_ADAPTER" = "$GGUF" ] || die "Modelfile ADAPTER is '$MF_ADAPTER', expected '$GGUF'"
+[ -r "$MF_ADAPTER" ] || die "Modelfile ADAPTER path is not readable: $MF_ADAPTER"
+MF_BYTES=$(stat -c%s "$MF_ADAPTER" 2>/dev/null || echo 0)
+[ "$MF_BYTES" -eq "$GGUF_BYTES" ] \
+  || die "Modelfile ADAPTER points at $MF_BYTES bytes, the artifact is $GGUF_BYTES"
+echo "  Modelfile verified: FROM $MF_FROM + ADAPTER $MF_ADAPTER ($MF_BYTES bytes)"
+
 echo
 echo "=== registering '$TAG' with ollama ==="
 ollama.exe create "$TAG" -f "$MODELFILE" 2>&1 | tail -10
+CREATE_RC=${PIPESTATUS[0]}
+[ "$CREATE_RC" -eq 0 ] || die "ollama create exited $CREATE_RC"
+# Exit 0 means a manifest was written, not that the tag is servable.
+ollama.exe list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$TAG" \
+  || die "ollama create returned 0 but '$TAG' is not in the served list"
+echo "  '$TAG' is served"
 echo
 echo "=== verify it answers ==="
-ollama.exe run "$TAG" "Reply with the single word: ready" 2>&1 | head -3
+PROBE=$(ollama.exe run "$TAG" "Reply with the single word: ready" 2>&1 | head -3)
+echo "  $PROBE"
+[ -n "$(echo "$PROBE" | tr -d '[:space:]')" ] \
+  || die "'$TAG' registered but produced no output -- it loads and says nothing"
 echo
 echo "done. Point the soak at it with:  export OV_MODEL=$TAG"
