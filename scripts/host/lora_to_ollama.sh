@@ -35,6 +35,13 @@ OUT_DIR="${OV_GGUF_OUT:-$HOME/.jarvis/adapters}"
 # below any healthy adapter and far above a truncated or empty one, so it
 # separates the two without encoding today's exact rank.
 MIN_ADAPTER_BYTES="${OV_MIN_ADAPTER_BYTES:-262144}"
+#: Whether the ollama binary is a Windows process that cannot resolve our
+#: Linux paths. Detected, not assumed, so the same script works on a native
+#: Linux box; `OV_ENGINE_IS_WINDOWS` forces either answer.
+ENGINE_IS_WINDOWS="${OV_ENGINE_IS_WINDOWS:-}"
+if [ -z "$ENGINE_IS_WINDOWS" ]; then
+  if command -v ollama >/dev/null 2>&1; then ENGINE_IS_WINDOWS=0; else ENGINE_IS_WINDOWS=1; fi
+fi
 
 die() { echo "REFUSING: $*" >&2; exit 2; }
 
@@ -84,11 +91,38 @@ MAGIC=$(head -c 4 "$GGUF" 2>/dev/null)
 echo "  wrote $(du -h "$GGUF" | cut -f1) -- GGUF magic OK"
 
 # --- the Modelfile says exactly what we mean -------------------------------
+# --- the engine may not share our filesystem namespace --------------------
+# `ollama.exe` is a WINDOWS process. Handed a Linux path it reports
+# "no Modelfile or safetensors files found", which reads like a missing or
+# malformed artifact and is actually a path it cannot resolve -- observed
+# 2026-09-05 on a conversion that had already verified byte for byte.
+#
+# So the paths WRITTEN INTO the Modelfile, and the path passed to `-f`,
+# must be spelled for whoever reads them, not for whoever wrote them.
+# `wslpath -w` yields the `\\wsl.localhost\...` form, which the Windows
+# binary can reach. A native Linux ollama needs no translation and gets
+# none.
+to_engine_path() {
+  local p="$1"
+  if [ "$ENGINE_IS_WINDOWS" = "1" ] && command -v wslpath >/dev/null 2>&1; then
+    wslpath -w "$p" 2>/dev/null || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
+GGUF_FOR_ENGINE=$(to_engine_path "$GGUF")
+[ -n "$GGUF_FOR_ENGINE" ] || die "could not spell $GGUF for the engine"
+if [ "$ENGINE_IS_WINDOWS" = "1" ]; then
+  echo "  engine path: $GGUF_FOR_ENGINE"
+fi
+
 MODELFILE="$OUT_DIR/Modelfile-$STAMP"
 {
   echo "FROM $BASE"
-  echo "ADAPTER $GGUF"
+  echo "ADAPTER $GGUF_FOR_ENGINE"
 } > "$MODELFILE"
+MODELFILE_FOR_ENGINE=$(to_engine_path "$MODELFILE")
 
 # Read it BACK and prove it. Writing a file is not writing the RIGHT file:
 # a shell-expansion slip (an empty $GGUF, a stale $BASE) yields a
@@ -101,16 +135,19 @@ ADAPTER_LINES=$(grep -c '^ADAPTER ' "$MODELFILE" || true)
 MF_FROM=$(sed -n 's/^FROM //p' "$MODELFILE")
 MF_ADAPTER=$(sed -n 's/^ADAPTER //p' "$MODELFILE")
 [ "$MF_FROM" = "$BASE" ] || die "Modelfile FROM is '$MF_FROM', expected '$BASE'"
-[ "$MF_ADAPTER" = "$GGUF" ] || die "Modelfile ADAPTER is '$MF_ADAPTER', expected '$GGUF'"
-[ -r "$MF_ADAPTER" ] || die "Modelfile ADAPTER path is not readable: $MF_ADAPTER"
-MF_BYTES=$(stat -c%s "$MF_ADAPTER" 2>/dev/null || echo 0)
+[ "$MF_ADAPTER" = "$GGUF_FOR_ENGINE" ] \
+  || die "Modelfile ADAPTER is '$MF_ADAPTER', expected '$GGUF_FOR_ENGINE'"
+# Verify through OUR spelling of the same file: the Modelfile carries the
+# engine's spelling, which this shell may not be able to stat.
+[ -r "$GGUF" ] || die "adapter is not readable: $GGUF"
+MF_BYTES=$(stat -c%s "$GGUF" 2>/dev/null || echo 0)
 [ "$MF_BYTES" -eq "$GGUF_BYTES" ] \
   || die "Modelfile ADAPTER points at $MF_BYTES bytes, the artifact is $GGUF_BYTES"
 echo "  Modelfile verified: FROM $MF_FROM + ADAPTER $MF_ADAPTER ($MF_BYTES bytes)"
 
 echo
 echo "=== registering '$TAG' with ollama ==="
-ollama.exe create "$TAG" -f "$MODELFILE" 2>&1 | tail -10
+ollama.exe create "$TAG" -f "$MODELFILE_FOR_ENGINE" 2>&1 | tail -10
 CREATE_RC=${PIPESTATUS[0]}
 [ "$CREATE_RC" -eq 0 ] || die "ollama create exited $CREATE_RC"
 # Exit 0 means a manifest was written, not that the tag is servable.
