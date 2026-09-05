@@ -82,6 +82,12 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_REFUSED = 2
 EXIT_LADDER_EXHAUSTED = 3
+#: A CHILD process exits with this when its one rung ran out of memory.
+#: Distinct from EXIT_ERROR because the parent's response is opposite:
+#: descend rather than abort. Exit codes are the whole protocol here --
+#: the child already writes its report through ``--json-out``, so nothing
+#: else needs inventing.
+EXIT_RUNG_OOM = 4
 
 #: Columns whose presence in the training dataset would mean the corpus's
 #: own answers had been handed to the trainer. GRPO must generate its own
@@ -333,6 +339,122 @@ def _make_truncation_callback(*, mask_truncated: bool, patience: int = 0) -> Any
             return control
 
     return _TruncationCallback()
+
+
+def child_argv(rung_index: int, json_out: str) -> List[str]:
+    """This process's own argv, aimed at exactly one rung.
+
+    Reusing argv rather than reconstructing a command line means a flag
+    added to the CLI tomorrow reaches the child with no extra wiring. The
+    alternative -- rebuilding the arguments by hand -- is the same shape of
+    drift that once had the profiler measuring a different configuration
+    than the runner it was supposed to mirror.
+    """
+    argv: List[str] = []
+    skip = False
+    for arg in sys.argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if arg in ("--rung-index", "--json-out"):
+            skip = True
+            continue
+        if arg.startswith("--rung-index=") or arg.startswith("--json-out="):
+            continue
+        argv.append(arg)
+    return argv + ["--rung-index", str(rung_index), "--json-out", json_out]
+
+
+def train_with_isolated_ladder(
+    *, ladder: List[Any], report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Walk the ladder with each rung in a process of its own.
+
+    ## Why a subprocess and not better cleanup
+
+    Clearing CUDA state in-process is unreliable, and this ladder proved it
+    on 2026-09-05. ``release_trainer`` clears the model, optimiser,
+    scheduler and callback handler and then empties the allocator cache,
+    which was enough to let the ladder DESCEND at all -- before that fix it
+    could not -- but not enough to descend CLEANLY. Measured across one
+    run's four rungs:
+
+    | rung | failed at | allocated at failure |
+    |------|-----------|----------------------|
+    | 1 (16x256) | step 3 | 28.27 GiB |
+    | 2 (16x128) | step 3 | 28.27 GiB |
+    | 3 (16x64)  | step 3 | 28.07 GiB |
+    | 4 (8x64)   | **step 1** | **28.69 GiB** |
+
+    Rung 4 is the SMALLEST configuration and it had the LEAST room. At its
+    first generation it should have held ~15.6 GiB -- the model, with no
+    optimiser state yet -- and it held 28.69. The ladder was handicapping
+    itself as it descended, so "this model does not fit here" was a verdict
+    about the fourth rung of a leaky descent, not about the model.
+
+    Process death is the only reclamation the driver guarantees. Each rung
+    therefore runs as ``sys.executable <this script> --rung-index N``, and
+    its exit IS the cleanup: the OS frees the context whether the rung
+    succeeded, OOM'd, or was killed by the memory guard.
+
+    The protocol is exit codes plus the report file both halves already
+    use. Nothing new is invented to carry it.
+    """
+    import subprocess  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    attempts: List[Dict[str, Any]] = []
+    script = str(Path(__file__).resolve())
+    for index, rung in enumerate(ladder):
+        logger.info(
+            "[runner] rung %d/%d '%s' in a SUBPROCESS: num_generations=%d "
+            "max_completion_length=%d",
+            index + 1, len(ladder), rung.name,
+            rung.num_generations, rung.max_completion_length,
+        )
+        handle, child_json = tempfile.mkstemp(prefix="grpo-rung-", suffix=".json")
+        os.close(handle)
+        try:
+            code = subprocess.call([sys.executable, script]
+                                   + child_argv(index, child_json))
+            child: Dict[str, Any] = {}
+            try:
+                with open(child_json, "r", encoding="utf-8") as fh:
+                    child = json.load(fh)
+            except Exception:  # noqa: BLE001 — a child that died before
+                # writing still told us something through its exit code.
+                logger.debug("[runner] rung %d wrote no report", index + 1,
+                             exc_info=True)
+            for attempt in child.get("attempts", []) or []:
+                attempt["subprocess_exit"] = code
+                attempts.append(attempt)
+        finally:
+            try:
+                os.unlink(child_json)
+            except OSError:
+                pass
+
+        if code == EXIT_OK:
+            logger.info("[runner] rung '%s' trained", rung.name)
+            out = {"status": "trained", "attempts": attempts}
+            for key in ("output_dir", "adapter_saved"):
+                if key in child:
+                    out[key] = child[key]
+            return out
+        if code == EXIT_RUNG_OOM:
+            logger.warning(
+                "[runner] rung '%s' ran out of memory; its process is gone, "
+                "so the next rung starts on a clean card", rung.name,
+            )
+            continue
+        if code == EXIT_REFUSED:
+            # A gate said no. Descending cannot change a corpus or a
+            # busy card, so repeating it three more times is only noise.
+            return {"status": "refused", "attempts": attempts,
+                    "child_exit": code}
+        return {"status": "error", "attempts": attempts, "child_exit": code}
+
+    return {"status": "ladder-exhausted", "attempts": attempts}
 
 
 def release_trainer(trainer: Any, guard: Any) -> None:
@@ -632,6 +754,21 @@ def main(argv: Optional[List[str]] = None) -> int:
              "loss empty. Trades training on unfinished text for training "
              "on nothing.",
     )
+    ap.add_argument(
+        "--rung-index", type=int, default=-1,
+        help="CHILD MODE: run only this one rung of the ladder, in-process, "
+             "and exit 4 if it runs out of memory. The parent sets this when "
+             "isolating rungs; you rarely set it by hand.",
+    )
+    ap.add_argument(
+        "--in-process-ladder", action="store_true",
+        help="walk the whole ladder inside ONE process, the old behaviour. "
+             "Measured 2026-09-05: clearing CUDA state between rungs leaks, "
+             "so the 4th rung began with 28.69 GiB resident where it should "
+             "have had ~15.6, and the smallest configuration got the least "
+             "room. Isolation is the default because process death is the "
+             "only reclamation the driver guarantees.",
+    )
     ap.add_argument("--skip-admission", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and validate everything, take no step")
@@ -798,20 +935,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     try:
-        outcome = train_with_ladder(
-            model_id=args.model,
-            telemetry_dir=telemetry_dir,
-            output_dir=output_dir,
-            ladder=ladder,
-            guard=guard,
-            trainable_only=not args.include_untrainable,
-            max_prompts=args.max_prompts or None,
-            only_prompts=contrast_prompts,
-            gptq_backend=args.gptq_backend,
-            use_qlora=not args.no_qlora,
-            config_overrides=overrides,
-            dry_run=args.dry_run,
-        )
+        if args.rung_index < 0 and not args.in_process_ladder and not args.dry_run:
+            # PARENT: hand each rung to a process that will die and take its
+            # CUDA context with it. Gates 1 and 2 already ran above, so the
+            # children inherit a corpus and a card that were checked once.
+            outcome = train_with_isolated_ladder(ladder=ladder, report=report)
+        else:
+            # CHILD (--rung-index), or an explicit in-process walk, or a
+            # dry run, which allocates nothing worth isolating.
+            walk = ladder
+            if args.rung_index >= 0:
+                if args.rung_index >= len(ladder):
+                    logger.error("[runner] --rung-index %d is past the end of "
+                                 "a %d-rung ladder", args.rung_index, len(ladder))
+                    return EXIT_ERROR
+                walk = ladder[args.rung_index:args.rung_index + 1]
+            outcome = train_with_ladder(
+                model_id=args.model,
+                telemetry_dir=telemetry_dir,
+                output_dir=output_dir,
+                ladder=walk,
+                guard=guard,
+                trainable_only=not args.include_untrainable,
+                max_prompts=args.max_prompts or None,
+                only_prompts=contrast_prompts,
+                gptq_backend=args.gptq_backend,
+                use_qlora=not args.no_qlora,
+                config_overrides=overrides,
+                dry_run=args.dry_run,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[runner] training failed")
         report["error"] = f"{type(exc).__name__}: {exc}"[:500]
@@ -822,10 +974,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     report["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     _write(args.json_out, report)
 
+    if outcome["status"] == "refused":
+        return EXIT_REFUSED
     if outcome["status"] == "ladder-exhausted":
+        if args.rung_index >= 0:
+            # CHILD: one rung, and it did not fit. Say so in the exit code
+            # so the parent descends instead of aborting -- the distinction
+            # EXIT_ERROR cannot carry.
+            logger.warning("[runner] rung %d ran out of memory", args.rung_index)
+            return EXIT_RUNG_OOM
         logger.error(
             "[runner] every rung ran out of memory. The smallest tried was "
-            "%d generations x %d tokens; this model does not fit here.",
+            "%d generations x %d tokens, each in its own process.",
             ladder[-1].num_generations, ladder[-1].max_completion_length,
         )
         return EXIT_LADDER_EXHAUSTED
