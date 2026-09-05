@@ -154,3 +154,67 @@ def test_the_completion_ceiling_default_is_512() -> None:
     import re
     m = re.search(r'"--max-completion-length", type=int, default=(\d+)', src)
     assert m is not None and int(m.group(1)) == 512
+
+
+# ---------------------------------------------------------------------------
+# The ladder must be able to DESCEND
+#
+# Both defects below were invisible until 2026-09-05, the first time a rung
+# actually OOM'd. Rung 1 (16 generations x 512 tokens) failed on a clean
+# card; rung 2's load then died at 28.22 GiB allocated against a 30.25 GiB
+# cap, because rung 1's 15.64 GiB model was still bound to `trainer`. The
+# loader reported that second OOM as `RuntimeError: We encountered some
+# issues during automatic conversion of the weights`, whose class and
+# message say nothing about memory, so the ladder concluded "not for memory
+# -- descending would not help" and gave up on the one failure it exists to
+# absorb.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTrainer:
+    def __init__(self) -> None:
+        self.model = object()
+        self.optimizer = object()
+        self.lr_scheduler = object()
+        self.model_wrapped = object()
+        self.callback_handler = SimpleNamespace(callbacks=[1, 2, 3])
+
+
+def test_release_trainer_drops_every_handle_on_the_model() -> None:
+    freed = {"n": 0}
+    guard = SimpleNamespace(free_cuda_memory=lambda: freed.__setitem__("n", freed["n"] + 1))
+    t = _FakeTrainer()
+    runner.release_trainer(t, guard)
+    assert t.model is None and t.optimizer is None
+    assert t.lr_scheduler is None and t.model_wrapped is None
+    assert t.callback_handler.callbacks == [], "the handler pins the model too"
+    assert freed["n"] == 1
+
+
+def test_release_trainer_never_raises_on_the_failure_path() -> None:
+    """It runs where an exception is already in flight; a second one masks
+    the first."""
+    freed = {"n": 0}
+    guard = SimpleNamespace(free_cuda_memory=lambda: freed.__setitem__("n", freed["n"] + 1))
+
+    class _Hostile:
+        @property
+        def model(self):
+            raise RuntimeError("boom")
+
+        def __setattr__(self, k, v):
+            raise RuntimeError("no setattr for you")
+
+    runner.release_trainer(_Hostile(), guard)
+    runner.release_trainer(None, guard)
+    assert freed["n"] == 2, "the cache is emptied regardless"
+
+
+def test_the_ladder_releases_before_descending() -> None:
+    import inspect
+    src = inspect.getsource(runner.train_with_ladder)
+    assert src.count("release_trainer(trainer, guard)") >= 2, (
+        "both descent paths -- OOM and stopped-at-ceiling -- must release")
+    assert "trainer = None" in src, "and rebind, so the loop holds nothing"
+    assert src.index("trainer = None") < src.index("watchdog = guard.MemoryWatchdog"), (
+        "bound before the try, since build_trainer itself can raise")

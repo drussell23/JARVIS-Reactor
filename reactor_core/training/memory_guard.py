@@ -1155,6 +1155,27 @@ def is_oom(exc: BaseException) -> bool:
     kernels each raise their own class on an allocation failure, and only
     torch's is a ``torch.cuda.OutOfMemoryError``.
     """
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if _is_oom_here(cur):
+            return True
+        # Walk the CHAIN, because a loader may re-raise something generic
+        # over an allocation failure. Measured 2026-09-05: rung 1 OOM'd,
+        # and transformers' weight conversion reported the underlying
+        # torch.OutOfMemoryError as `RuntimeError: We encountered some
+        # issues during automatic conversion of the weights`. Nothing in
+        # that class or message is about memory, so the ladder concluded
+        # "not for memory -- descending would not help" and gave up on the
+        # one failure it exists to absorb. The real error was on __context__
+        # the whole time.
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_oom_here(exc: BaseException) -> bool:
+    """One link of the chain, by type then by message."""
     name = type(exc).__name__
     if name in {"OutOfMemoryError", "CudaOutOfMemoryError"}:
         return True

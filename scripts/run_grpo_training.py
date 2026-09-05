@@ -335,6 +335,45 @@ def _make_truncation_callback(*, mask_truncated: bool, patience: int = 0) -> Any
     return _TruncationCallback()
 
 
+def release_trainer(trainer: Any, guard: Any) -> None:
+    """Drop this rung's model BEFORE the next rung loads one.
+
+    ``free_cuda_memory`` collects garbage and empties the allocator cache,
+    but a LIVE reference keeps the weights alive and ``empty_cache`` only
+    returns blocks nothing points at. The ladder held the failed rung's
+    ``trainer`` for the whole descent, so the next rung loaded a second
+    copy on top of the first.
+
+    Measured 2026-09-05, the first time a rung ever actually OOM'd: rung 1
+    (512 tokens) failed on a clean card, its 15.64 GiB model stayed bound,
+    and rung 2's load died at **28.22 GiB allocated** against a 30.25 GiB
+    cap -- two 30B models on one card. The ladder could not descend, which
+    is the single thing it exists to do, and the defect was invisible until
+    a rung failed for real.
+
+    Attributes are cleared rather than trusted to refcounting because the
+    Trainer's callback handler, optimiser and scheduler all hold the model
+    too, and any one of them is enough to pin 15 GiB. NEVER raises: this
+    runs on the failure path, where a second exception would mask the
+    first.
+    """
+    try:
+        if trainer is not None:
+            for attr in ("optimizer", "lr_scheduler", "model_wrapped",
+                         "ref_model", "model"):
+                try:
+                    setattr(trainer, attr, None)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                trainer.callback_handler.callbacks.clear()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        logger.debug("[runner] could not clear the trainer", exc_info=True)
+    guard.free_cuda_memory()
+
+
 def _dataset_len(trainer: Any) -> int:
     """Rows the trainer will actually iterate. NEVER raises."""
     try:
@@ -428,6 +467,9 @@ def train_with_ladder(
             "num_generations": rung.num_generations,
             "max_completion_length": rung.max_completion_length,
         }
+        # Bound before the try: build_trainer itself can raise, and the
+        # descent path must still be able to release whatever exists.
+        trainer = None
         watchdog = guard.MemoryWatchdog(label=f"rung{index}")
         started = time.time()
         try:
@@ -491,7 +533,8 @@ def train_with_ladder(
                 raise
             logger.warning("[runner] rung '%s' ran out of memory: %s",
                            rung.name, attempt["error"])
-            guard.free_cuda_memory()
+            release_trainer(trainer, guard)
+            trainer = None
             continue
 
         attempt["watchdog"] = watchdog.report()
@@ -503,7 +546,8 @@ def train_with_ladder(
             # the whole point of having tripped.
             attempt["status"] = "stopped-at-ceiling"
             attempts.append(attempt)
-            guard.free_cuda_memory()
+            release_trainer(trainer, guard)
+            trainer = None
             continue
 
         if not attempt["global_step"]:
@@ -577,6 +621,16 @@ def main(argv: Optional[List[str]] = None) -> int:
              "2026-09-05: 242 prompts vs 27, which at 656.8s per optimiser "
              "step is 44.2 hours against 4.9. The default narrows to the "
              "gate's selection; this restores the old behaviour.",
+    )
+    ap.add_argument(
+        "--train-truncated", action="store_true",
+        help="set mask_truncated_completions=False, so completions that hit "
+             "the ceiling still contribute to the loss. The escape hatch for "
+             "when the ceiling CANNOT be raised: measured 2026-09-05, 16 "
+             "generations x 512 tokens OOMs on a 32 GiB card while 256 "
+             "tokens clips every completion, so masking leaves the policy "
+             "loss empty. Trades training on unfinished text for training "
+             "on nothing.",
     )
     ap.add_argument("--skip-admission", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
@@ -732,6 +786,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     }
     if args.max_steps > 0:
         overrides["max_steps"] = args.max_steps
+    if args.train_truncated:
+        # Rides build_grpo_config's existing **overrides -- no new parameter
+        # for a value the config already owns.
+        overrides["mask_truncated_completions"] = False
+        report["train_truncated"] = True
+        logger.warning(
+            "[runner] --train-truncated: clipped completions will CONTRIBUTE "
+            "to the loss. Use this only when the ceiling cannot be raised; "
+            "the gradient then comes from text the model did not finish.",
+        )
 
     try:
         outcome = train_with_ladder(
