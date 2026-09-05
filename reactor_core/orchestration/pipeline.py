@@ -85,6 +85,13 @@ class PipelineState:
     model_path: Optional[str] = None
     adapter_path: Optional[str] = None
     quantized_path: Optional[str] = None
+    #: The ollama tag a deployment landed on; empty when none did.
+    deployed_tag: Optional[str] = None
+    #: True when the trainer DECLINED (a busy card, a corpus with no
+    #: contrast) rather than failed. A scheduled loop should retry a
+    #: refusal and investigate a failure; collapsing the two loses
+    #: exactly the distinction the next run needs.
+    training_refused: bool = False
 
     # Error tracking
     error: Optional[str] = None
@@ -116,6 +123,8 @@ class PipelineState:
             "model_path": self.model_path,
             "adapter_path": self.adapter_path,
             "quantized_path": self.quantized_path,
+            "deployed_tag": self.deployed_tag,
+            "training_refused": self.training_refused,
             "error": self.error,
             "error_stage": self.error_stage.value if self.error_stage else None,
             "stage_errors": self.stage_errors,
@@ -150,6 +159,8 @@ class PipelineState:
             model_path=data.get("model_path"),
             adapter_path=data.get("adapter_path"),
             quantized_path=data.get("quantized_path"),
+            deployed_tag=data.get("deployed_tag"),
+            training_refused=bool(data.get("training_refused", False)),
             error=data.get("error"),
             error_stage=(
                 PipelineStage(data["error_stage"])
@@ -340,6 +351,43 @@ class PipelineConfig:
     # Quantization
     quantization_method: str = "q4_k_m"
     skip_quantization: bool = False
+
+    # -- trainer choice ----------------------------------------------------
+    #: WHICH trainer this cycle runs. Empty resolves through
+    #: ``trainer_strategy.resolve_name``: request, then
+    #: ``REACTOR_TRAINING_STRATEGY``, then ``lora_sft`` -- so an
+    #: unconfigured pipeline behaves exactly as it did before strategies
+    #: existed. ``"grpo"`` runs the GRPO runner, which reads the telemetry
+    #: corpus itself rather than the formatted/distilled files on disk.
+    training_strategy: str = field(
+        default_factory=lambda: os.getenv("REACTOR_TRAINING_STRATEGY", "")
+    )
+    #: Strategy-specific knobs, forwarded verbatim; a strategy ignores what
+    #: it does not know, so one config can serve several.
+    trainer_options: Dict[str, Any] = field(default_factory=dict)
+
+    # -- serving -----------------------------------------------------------
+    #: Publish through ``OllamaDeployer`` (gate, GPU lease, rollback
+    #: snapshot, verify-by-serving) instead of copying files into a models
+    #: directory. Required for an ADAPTER, which is not servable as a file:
+    #: it has to be layered over a base tag at load time.
+    deploy_via_ollama: bool = field(
+        default_factory=lambda: (
+            os.getenv("REACTOR_DEPLOY_VIA_OLLAMA", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+    )
+    #: The tag an adapter is layered over. Empty makes the adapter deploy
+    #: REFUSE rather than guess -- layering a LoRA over the wrong weights
+    #: yields a model that loads and answers wrongly.
+    ollama_base_tag: str = field(
+        default_factory=lambda: os.getenv("REACTOR_OLLAMA_BASE_TAG", "")
+    )
+    #: The tag the adapter is published as. Empty uses the deployer's own
+    #: default, so the tag lives in one place.
+    ollama_adapter_tag: str = field(
+        default_factory=lambda: os.getenv("REACTOR_OLLAMA_ADAPTER_TAG", "")
+    )
 
     # Recovery
     state_file: Optional[Path] = None
@@ -975,6 +1023,23 @@ class NightShiftPipeline:
         """
         logger.info("Starting training stage...")
 
+        # WHICH trainer runs is resolved, never named here. A strategy that
+        # sources its own corpus (GRPO reads telemetry through its gate)
+        # must be dispatched BEFORE the file-based data check below, which
+        # would otherwise raise "No training data found" for a corpus that
+        # was never meant to be on disk.
+        from reactor_core.training import trainer_strategy as _ts  # noqa: PLC0415
+
+        _strategy = _ts.resolve_name(
+            _ts.TrainerRequest(
+                base_model=self.config.base_model,
+                output_dir=Path(self.config.output_dir or self.config.work_dir),
+                strategy=self.config.training_strategy or "",
+            )
+        )
+        if _strategy != _ts.STRATEGY_SFT:
+            return await self._run_training_strategy(_strategy)
+
         # Determine source directory (distilled if available, else formatted)
         distilled_dir = self.config.work_dir / "distilled"
         formatted_dir = self.config.work_dir / "formatted"
@@ -1085,6 +1150,60 @@ class NightShiftPipeline:
                      f"steps={training_result.get('total_steps', 0)}")
         return training_result
 
+    async def _run_training_strategy(self, name: str) -> Dict[str, Any]:
+        """Run a registered trainer and return this stage's result shape.
+
+        The dict is exactly what the SFT path returns, because every stage
+        after this one reads it -- evaluation, quantization and deployment
+        must not care which trainer produced the artifact.
+        """
+        from reactor_core.training import trainer_strategy as _ts  # noqa: PLC0415
+
+        output_dir = Path(self.config.output_dir or (self.config.work_dir / "output"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        request = _ts.TrainerRequest(
+            base_model=self.config.base_model,
+            output_dir=output_dir,
+            telemetry_dir=Path(self.config.jarvis_repo_path)
+            if getattr(self.config, "jarvis_repo_path", None) else None,
+            strategy=name,
+            options=dict(self.config.trainer_options or {}),
+        )
+        outcome = await _ts.run(request)
+        logger.info("[NightShift] %s", outcome.summary())
+
+        if not outcome.ok:
+            # A REFUSAL is not a defect: a busy card or a corpus with no
+            # contrast means "not now", and a scheduled loop should retry
+            # rather than treat the night as broken. Both still stop this
+            # cycle -- there is no artifact -- but they are recorded apart.
+            if self._state:
+                self._state.training_refused = outcome.refused
+            raise RuntimeError(
+                f"training strategy {name!r} "
+                f"{'refused' if outcome.refused else 'failed'}: {outcome.reason}"
+            )
+
+        adapter = str(outcome.adapter_path or "")
+        training_result: Dict[str, Any] = {
+            # An adapter IS the artifact for this strategy; there is no
+            # merged model, and claiming one would send quantization into a
+            # 57 GiB merge this host cannot survive.
+            "model_path": adapter,
+            "adapter_path": adapter,
+            "final_loss": float(outcome.metrics.get("final_loss") or 0.0),
+            "total_steps": int(outcome.metrics.get("total_steps") or 0),
+            "training_time_seconds": 0.0,
+            "success": True,
+            "strategy": name,
+        }
+        if self._state:
+            self._state.model_path = training_result["model_path"]
+            self._state.adapter_path = training_result["adapter_path"]
+            self._save_state()
+        return training_result
+
     async def _run_evaluation(self) -> Dict[str, float]:
         """
         Run evaluation stage — benchmark the trained model.
@@ -1172,6 +1291,49 @@ class NightShiftPipeline:
             return ""
 
         model_path = Path(model_path)
+
+        # ASK what training produced rather than assuming a full model. A
+        # PEFT adapter converts through llama.cpp's convert_lora_to_gguf,
+        # which reads only the adapter; turning it into a full model first
+        # would need the base in bf16 (~57 GiB against a 47 GiB guest).
+        from reactor_core.quantization.adapter_gguf import (  # noqa: PLC0415
+            ArtifactKind,
+            classify_artifact,
+            convert_adapter_to_gguf,
+        )
+
+        kind = classify_artifact(model_path)
+        if kind is ArtifactKind.GGUF:
+            logger.info("[Quantize] %s is already GGUF — nothing to convert",
+                        model_path)
+            if self._state:
+                self._state.quantized_path = str(model_path)
+            return str(model_path)
+        if kind is ArtifactKind.ADAPTER:
+            out_dir = Path(self.config.output_dir or self.config.work_dir)
+            out_path = out_dir / f"{model_path.name}-adapter.gguf"
+            outcome = await convert_adapter_to_gguf(model_path, out_path)
+            result_path = str(outcome.output_path) if outcome.success else ""
+            if outcome.success:
+                logger.info(
+                    "[Quantize] adapter -> %s (%.1f MB)",
+                    result_path, outcome.quantized_size_mb,
+                )
+            else:
+                logger.error("[Quantize] adapter conversion failed: %s",
+                             outcome.error)
+            if self._state:
+                self._state.quantized_path = result_path
+            return result_path
+        if kind is ArtifactKind.UNKNOWN:
+            logger.error(
+                "[Quantize] %s is neither a model nor an adapter — refusing "
+                "to guess a conversion", model_path,
+            )
+            if self._state:
+                self._state.quantized_path = ""
+            return ""
+
         logger.info(f"Starting quantization stage ({self.config.quantization_method})...")
 
         output_path = ""
@@ -1281,6 +1443,15 @@ class NightShiftPipeline:
             logger.error(f"Deploy source not found: {deploy_source}")
             return
 
+        # An ADAPTER is not servable as a file: it has to be layered over a
+        # base tag at load time, which is what OllamaDeployer.deploy_adapter
+        # does (with the gate, the cross-process GPU lease, a rollback
+        # snapshot and verify-by-serving). Copying it into a models
+        # directory would "succeed" and serve nothing.
+        if self._is_adapter_deploy(deploy_source):
+            await self._deploy_adapter_to_ollama(deploy_source)
+            return
+
         # Find J-Prime models directory (env-var-driven discovery)
         jprime_dir = None
         jprime_env = os.getenv("JPRIME_MODELS_DIR")
@@ -1341,6 +1512,80 @@ class NightShiftPipeline:
                 logger.info(f"Published model_ready event for {dest_path.name}")
         except Exception as e:
             logger.debug(f"Trinity model_ready notification failed (non-critical): {e}")
+
+    def _is_adapter_deploy(self, source: Path) -> bool:
+        """True when this artifact must be published as an adapter.
+
+        Two independent signals, either of which is decisive: the operator
+        asked for ollama publishing, or the training stage recorded an
+        adapter and this is it. The second matters because an adapter is
+        not deployable the old way at all -- so a config that forgot the
+        flag gets correct behaviour rather than a silent no-op.
+        """
+        if source.suffix.lower() != ".gguf":
+            return False
+        if self.config.deploy_via_ollama:
+            return True
+        recorded = (self._state.adapter_path if self._state else "") or ""
+        return bool(recorded) and "adapter" in source.name.lower()
+
+    async def _deploy_adapter_to_ollama(self, adapter_gguf: Path) -> None:
+        """Publish an adapter GGUF by layering it over the base tag."""
+        try:
+            from reactor_core.deployment.ollama_deployer import (  # noqa: PLC0415
+                OllamaDeployer,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[Deploy] ollama deployer unavailable: %s", exc)
+            return
+
+        deployer = OllamaDeployer(
+            tag=self.config.ollama_adapter_tag or None,
+        )
+        result = await deployer.deploy_adapter(
+            adapter_gguf,
+            base_tag=self.config.ollama_base_tag or None,
+            tag=self.config.ollama_adapter_tag or None,
+        )
+        logger.info("[Deploy] %s", result.summary())
+        if self._state:
+            self._state.deployed_tag = result.tag if result.ok else ""
+            self._save_state()
+        if not result.ok:
+            # Deployment is the last stage; a refusal here must be loud.
+            # The artifact is intact and the previous tag still serves, so
+            # this stops the cycle rather than the system.
+            raise RuntimeError(
+                f"adapter deployment failed at {result.stage}: {result.reason}"
+            )
+        await self._publish_model_ready(
+            Path(adapter_gguf), extra={"tag": result.tag, "kind": "adapter"},
+        )
+
+    async def _publish_model_ready(
+        self, artifact: Path, *, extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Announce a deployment on the Trinity bus. Never fatal."""
+        try:
+            from reactor_core.integration.trinity_publisher import (  # noqa: PLC0415
+                get_trinity_publisher,
+            )
+            publisher = get_trinity_publisher()
+            if not publisher:
+                return
+            payload: Dict[str, Any] = {
+                "model_path": str(artifact),
+                "model_name": artifact.name,
+                "deployed_at": datetime.now().isoformat(),
+                "source": "nightshift_pipeline",
+                "gatekeeper_metrics": self._state.eval_metrics if self._state else {},
+            }
+            payload.update(extra or {})
+            await publisher.publish_event(event_type="model_ready", payload=payload)
+            logger.info("Published model_ready event for %s", artifact.name)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Trinity model_ready notification failed "
+                         "(non-critical): %s", e)
 
     async def run(
         self,
