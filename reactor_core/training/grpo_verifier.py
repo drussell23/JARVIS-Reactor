@@ -375,6 +375,15 @@ _Q_WEIGHTS = {
 #: to one variable.
 _CONTEXT_METRICS = _envb("CONTEXT_METRICS", True)
 
+#: Re-weight a group's grade onto the sub-metrics that actually SEPARATE
+#: it. Off restores the fixed-weight mean exactly.
+_DISCRIMINATING_WEIGHTS = _envb("Q_DISCRIMINATING_WEIGHTS", True)
+
+#: Two sub-metric readings closer than this are the same reading. Tied to
+#: `grpo_reward._FLAT_EPS` in spirit: below it there is no difference for
+#: the trainer to learn from either.
+_AXIS_EPS = _envf("Q_AXIS_EPS", 1e-6)
+
 #: How much of the passing grade is carried by the DIFFERENTIAL FOOTPRINT
 #: (the code a sibling chose differently) versus the whole file it lands
 #: in. Not 1.0: a candidate that fixes the bug and wrecks the rest of the
@@ -442,6 +451,104 @@ def _soft(value: float, target: float) -> float:
     return float(target) / (float(target) + max(0.0, float(value)))
 
 
+def _quality_parts(tree, src, defs, stmts) -> Dict[str, float]:
+    """The six raw measurements, before any weighting. Never raises.
+
+    Split out of :func:`_quality` because the group layer needs to know
+    which AXES separate a group before it can decide what to weigh, and a
+    second copy of these formulas would drift from the one the score is
+    actually built from.
+
+    ## The two denominators are different ON PURPOSE
+
+    ``density`` divides by TOP-LEVEL statements and ``concision`` by ALL
+    statements, and that asymmetry is the measurement, not an oversight:
+
+      * density asks "is this module organised into definitions, or is it
+        a script?", which is a question about the top level. Measured over
+        all statements it collapses -- 239 of 271 corpus sources land under
+        0.11, because a module's body is mostly the statements INSIDE its
+        functions.
+      * concision asks "how verbose is the code per unit of work?" A unit
+        of work is a statement anywhere. Measured over the top level it is
+        characters-per-top-level-statement, which for a real module is
+        ~780 against a target of 90, so `_soft` pinned it near its floor:
+        109 of 271 sources at or below 0.11, median 0.123. The target
+        constant itself is the proof -- 90 characters is a LINE, not a
+        module section. Against all statements the same corpus reads
+        median 0.495 with nothing saturated.
+
+    Both were previously divided by the top level, so density measured
+    what it meant and concision measured almost nothing.
+    """
+    n_defs = max(1, len(defs))
+    n_stmts = max(1, len(stmts))
+    # Every statement at any depth, which is what "per statement" means
+    # for a verbosity measure. `defs` is already walked this way, so the
+    # two were being compared at incompatible depths.
+    n_all_stmts = max(1, sum(1 for n in ast.walk(tree) if isinstance(n, ast.stmt)))
+
+    documented = sum(1 for d in defs if ast.get_docstring(d))
+    docs = documented / n_defs
+
+    annotatable = 0
+    annotated = 0
+    for d in defs:
+        if not isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        a = d.args
+        params = list(a.args) + list(a.kwonlyargs) + list(getattr(a, "posonlyargs", []))
+        for arg in params:
+            if arg.arg in ("self", "cls"):
+                continue
+            annotatable += 1
+            annotated += 1 if arg.annotation is not None else 0
+        annotatable += 1                                  # the return
+        annotated += 1 if d.returns is not None else 0
+    types = (annotated / annotatable) if annotatable else 1.0
+
+    density = min(1.0, len(defs) / n_stmts)
+
+    branches = sum(1 for n in ast.walk(tree) if isinstance(n, _BRANCH_NODES))
+    simplicity = _soft(branches / n_defs, _SIMPLICITY_TARGET)
+
+    # NESTING is a different axis from branch COUNT, which is why it is its
+    # own sub-metric rather than folded into `simplicity`: ten sequential
+    # guard clauses and one ten-deep pyramid have the same branch count and
+    # are not the same code. Measured on the deepest nesting of any
+    # BRANCHING construct, so a module of long flat functions is not
+    # punished for being long.
+    flatness = _soft(_max_branch_depth(tree), _DEPTH_TARGET)
+
+    # `src.strip()`, not `src`: surrounding whitespace is PRESENTATION, and
+    # letting it move the score reintroduces the defect the fence stripper
+    # exists to remove -- two candidates whose code is byte-identical would
+    # score differently because one arrived with a trailing newline. Caught
+    # by the fence tests, which assert stripped and clean score the SAME.
+    concision = _soft(len(src.strip()) / n_all_stmts, _CONCISION_TARGET)
+
+    return {
+        "docs": docs, "types": types, "density": density,
+        "simplicity": simplicity, "concision": concision,
+        "flatness": flatness,
+    }
+
+
+def _aggregate_q(parts: Dict[str, float],
+                 q_weights: Optional[Dict[str, float]] = None) -> float:
+    """Weighted mean of the sub-metrics, clamped to [0, 1]. THE only one.
+
+    Weight lookup tolerates a sub-metric the env has not been told about,
+    so adding a dimension can never divide by a stale total or KeyError a
+    training run mid-batch.
+    """
+    base = q_weights if q_weights is not None else _Q_WEIGHTS
+    weights = {k: float(base.get(k, 0.0)) for k in parts}
+    total_w = sum(weights.values()) or 1.0
+    q = sum(parts[k] * weights[k] for k in parts) / total_w
+    return max(0.0, min(1.0, q))
+
+
 def _quality(tree, src, defs, stmts, q_weights=None):
     """Continuous quality of code that already PARSES. Returns (q, detail).
 
@@ -477,68 +584,16 @@ def _quality(tree, src, defs, stmts, q_weights=None):
         padding a file cannot buy reward
 
     `q_weights` overrides the module policy for ONE call — the seam the
-    task-intent layer uses. Absent, the configured `_Q_WEIGHTS` apply, so
-    every pre-existing caller is byte-identical.
+    task-intent layer AND the group's discriminating-axis layer both use.
+    Absent, the configured `_Q_WEIGHTS` apply.
     """
-    n_defs = len(defs)
-    n_stmts = max(1, len(stmts))
-
-    documented = sum(1 for d in defs if ast.get_docstring(d))
-    docs = documented / n_defs
-
-    annotatable = 0
-    annotated = 0
-    for d in defs:
-        if not isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        a = d.args
-        params = list(a.args) + list(a.kwonlyargs) + list(getattr(a, "posonlyargs", []))
-        for arg in params:
-            if arg.arg in ("self", "cls"):
-                continue
-            annotatable += 1
-            annotated += 1 if arg.annotation is not None else 0
-        annotatable += 1                                  # the return
-        annotated += 1 if d.returns is not None else 0
-    types = (annotated / annotatable) if annotatable else 1.0
-
-    density = min(1.0, n_defs / n_stmts)
-
-    branches = sum(1 for n in ast.walk(tree) if isinstance(n, _BRANCH_NODES))
-    simplicity = _soft(branches / n_defs, _SIMPLICITY_TARGET)
-
-    # NESTING is a different axis from branch COUNT, which is why it is its
-    # own sub-metric rather than folded into `simplicity`: ten sequential
-    # guard clauses and one ten-deep pyramid have the same branch count and
-    # are not the same code. Measured on the deepest nesting of any
-    # BRANCHING construct, so a module of long flat functions is not
-    # punished for being long.
-    flatness = _soft(_max_branch_depth(tree), _DEPTH_TARGET)
-
-    # `src.strip()`, not `src`: surrounding whitespace is PRESENTATION, and
-    # letting it move the score reintroduces the defect the fence stripper
-    # exists to remove -- two candidates whose code is byte-identical would
-    # score differently because one arrived with a trailing newline. Caught
-    # by the fence tests, which assert stripped and clean score the SAME.
-    concision = _soft(len(src.strip()) / n_stmts, _CONCISION_TARGET)
-
-    parts = {
-        "docs": docs, "types": types, "density": density,
-        "simplicity": simplicity, "concision": concision,
-        "flatness": flatness,
-    }
-    # Weight lookup tolerates a sub-metric the env has not been told about,
-    # so adding a dimension can never divide by a stale total or KeyError a
-    # training run mid-batch.
-    base = q_weights if q_weights is not None else _Q_WEIGHTS
-    weights = {k: float(base.get(k, 0.0)) for k in parts}
-    total_w = sum(weights.values()) or 1.0
-    q = sum(parts[k] * weights[k] for k in parts) / total_w
-    q = max(0.0, min(1.0, q))
+    parts = _quality_parts(tree, src, defs, stmts)
+    q = _aggregate_q(parts, q_weights)
     detail = (
-        f"q={q:.3f},docs={docs:.2f},types={types:.2f},den={density:.2f},"
-        f"simp={simplicity:.2f},con={concision:.2f},flat={flatness:.2f},"
-        f"defs={n_defs},stmt={n_stmts}"
+        f"q={q:.3f},docs={parts['docs']:.2f},types={parts['types']:.2f},"
+        f"den={parts['density']:.2f},simp={parts['simplicity']:.2f},"
+        f"con={parts['concision']:.2f},flat={parts['flatness']:.2f},"
+        f"defs={len(defs)},stmt={max(1, len(stmts))}"
     )
     return q, detail
 
@@ -709,6 +764,117 @@ def _statement_keys(src: str) -> List[Tuple[str, "ast.stmt"]]:
         except Exception:  # noqa: BLE001
             continue
     return out
+
+
+def _parts_for_source(src: str) -> Optional[Dict[str, float]]:
+    """The six measurements for one source, or None if it is not gradeable.
+
+    None, never a zero-filled dict: a source that does not parse or defines
+    nothing has no reading on these axes, and a fabricated zero would look
+    to the group layer like a real value that happens to differ.
+    """
+    try:
+        tree = ast.parse(src)
+        stmts = list(getattr(tree, "body", None) or [])
+        defs = [n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef))]
+        if not defs or not stmts:
+            return None
+        return _quality_parts(tree, src, defs, stmts)
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        return None
+
+
+def _discriminating_weights(
+    parts_list: Sequence[Optional[Dict[str, float]]],
+    base: Dict[str, float],
+) -> Tuple[Dict[str, float], int]:
+    """Re-weight onto the axes that actually SEPARATE this group.
+
+    ## The defect
+
+    Measured on the 2026-09-05 corpus, near-flat groups looked like this::
+
+        docs=1.00 types=0.40 den=0.33 simp=0.43 con=0.10 flat=0.27
+        docs=1.00 types=0.40 den=0.33 simp=0.44 con=0.10 flat=0.30
+        docs=1.00 types=0.40 den=0.33 simp=0.48 con=0.10 flat=0.33
+
+    Three of six axes are IDENTICAL across every sibling, and they carry
+    2.6 of the 4.6 total weight. A sub-metric with the same reading for
+    every candidate says nothing about which candidate is better -- but it
+    still sits in the denominator of the weighted mean, shrinking the
+    contribution of the axes that do separate them by the ratio of total
+    weight to varying weight. Here that ratio is 3.3, and the resulting q
+    spread of 0.021 became a score spread of 0.0074 once mapped through
+    the 0.35-wide passing band, against a 0.01 floor.
+
+    ## Why this is resolution and not a tiebreak
+
+    Dropping the constant axes is an AFFINE transform of q with
+    group-constant coefficients: the constant axes contribute the same
+    additive amount to every sibling, so removing them rescales by
+    ``W_total / W_varying`` and subtracts a constant. **At the aggregation
+    step order is preserved exactly** and amplification is bounded by the
+    weight policy itself rather than by a clamp -- at most
+    ``sum(_Q_WEIGHTS) / min(_Q_WEIGHTS)``, 7.67 at the defaults. Nothing
+    here can manufacture spread from an axis that did not move.
+
+    Two identical candidates still tie: nothing varies, so nothing is
+    dropped and the fixed-weight mean applies unchanged. That is the
+    safety property, and it holds at every layer.
+
+    ## The honest limit, measured rather than assumed
+
+    `refine_group` does not grade one quantity -- it BLENDS the whole-file
+    grade with the differential footprint. Both are read on these narrowed
+    axes, so the two statements above hold of each TERM and not of the
+    blend. Measured across the 114 corpus groups: one group reordered, and
+    it is the case this predicts -- two candidates whose whole-file grades
+    were equal to the last digit, separated by their footprints, which the
+    narrowing re-ranked. Re-aiming a tiebreak at the axes that actually
+    differ is what this layer is for. Three groups amplified by 8.83
+    against the 7.67 aggregation bound, for the same reason: their
+    footprints diverge on the surviving axis more than their whole files
+    do. Neither is a defect in the narrowing; both are properties of the
+    blend it feeds, and `refine_group` documents that it re-ranks.
+
+    ## What it does NOT preserve
+
+    The ABSOLUTE score, which drops by the contribution of the axes that
+    were dropped. GRPO normalises advantage within the group, so a common
+    offset changes nothing it consumes, and band containment is
+    unaffected because a weighted mean of values in [0, 1] is still in
+    [0, 1]. Do not compare a refined score against an unrefined one.
+
+    Returns ``(weights, n_varying)``. On anything unexpected -- fewer than
+    two readings, a missing reading, nothing varying, or a varying set
+    that carries no weight -- the base weights are returned unchanged,
+    because a coarse reward is better than a wrong one.
+    """
+    usable = [p for p in parts_list if p]
+    if not _DISCRIMINATING_WEIGHTS or len(usable) < 2 or len(usable) != len(parts_list):
+        return dict(base), 0
+    try:
+        eps = max(0.0, float(_AXIS_EPS))
+        varying = set()
+        for axis in base:
+            vals = [float(p.get(axis, 0.0)) for p in usable]
+            if (max(vals) - min(vals)) > eps:
+                varying.add(axis)
+        if not varying:
+            return dict(base), 0
+        narrowed = {k: (float(base.get(k, 0.0)) if k in varying else 0.0)
+                    for k in base}
+        if sum(narrowed.values()) <= 0.0:
+            # Every axis that moved carries zero weight under this policy.
+            # The operator has said those axes do not matter; honour that
+            # rather than reweighting onto them.
+            return dict(base), 0
+        return narrowed, len(varying)
+    except Exception:  # noqa: BLE001 — a grader must never break training
+        logger.debug("discriminating weights faulted", exc_info=True)
+        return dict(base), 0
 
 
 def _footprint_q(
@@ -1071,6 +1237,14 @@ def refine_group(
         # is one answer, and its files were already reduced to a single
         # verdict by worst-file semantics upstream.
         joined = ["\n".join(sources[i]) for i in idx]
+        # Re-aim the weights onto the axes this group is NOT unanimous on,
+        # before anything is graded. Order-preserving; see
+        # `_discriminating_weights`. Applied to the whole-file grade and
+        # the footprint alike, so the two halves of the blend are read on
+        # the same axes rather than through two different lenses.
+        q_weights, n_axes = _discriminating_weights(
+            [_parts_for_source(s) for s in joined], q_weights,
+        )
         fps = _footprint_q(joined, q_weights)
         for slot, i in enumerate(idx):
             grades = [_grade_source(s, q_weights) for s in sources[i]]
@@ -1091,6 +1265,12 @@ def refine_group(
             reason = f"{worst.reason},{note}"
             if intent:
                 reason = f"{reason},intent={intent}"
+            if n_axes:
+                # Say how many axes the grade rests on. A group separated
+                # on one axis and a group separated on five are different
+                # kinds of evidence, and a reader of the corpus cannot
+                # tell them apart from the score alone.
+                reason = f"{reason},axes={n_axes}"
             out[i] = _verdict_for_grade(
                 SourceGrade(q_eff, _BAND_PASSING, reason), w,
                 str(out[i].schema_version or ""),
