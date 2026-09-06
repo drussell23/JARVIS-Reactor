@@ -181,6 +181,72 @@ def default_num_generations() -> int:
     return max(2, _envi(_ENV_NUM_GENERATIONS, DEFAULT_NUM_GENERATIONS))
 
 
+#: Group draws by the TASK they answer rather than by the exact prompt
+#: bytes. Set falsy to restore byte-exact grouping.
+_ENV_TASK_GROUPING = "REACTOR_GRPO_TASK_GROUPING"
+
+
+def task_group_key(prompt: str) -> str:
+    """The key two draws of the same task must share.
+
+    ## Why this is not `prompt.strip()`
+
+    Measured on the 2026-09-05 corpus: 152 of 244 prompts were singletons,
+    and of the 146 that had no admissible sibling under their own text,
+    **100 had one on the same ``op_id`` under a DIFFERENT prompt text**.
+    Both prompts were usually the SAME LENGTH and diverged after a common
+    prefix of ~1,770 characters. The divergence is not in the task. Across
+    45 such ops, ``## Task`` was byte-identical in 45 of 45; what differed
+    was ambient memory injected at prompt-build time -- ``Recent
+    Episodes`` in 38, ``Rust Subsystems`` in 23, ``What Happened`` in 12.
+
+    Draw 2 of an op is composed after draw 1 has completed, so the
+    episodic memory has advanced by one entry. Grouping on exact bytes
+    therefore split genuine sibling groups into singletons, and the corpus
+    reported a sibling-generation failure that never happened.
+
+    ## Why the protected set, and nothing looser
+
+    The key is the concatenation of the sections
+    :mod:`prompt_budget` already calls task-bearing -- one classification,
+    not a second opinion. ``Target`` and ``Structural Index`` are among
+    them, so two draws that saw DIFFERENT file content keep different keys
+    and stay apart: they answered different questions, and pairing them is
+    the same error the ``repair`` exclusion exists to prevent. Verified on
+    the corpus: of the groups this key forms, ZERO span more than one
+    ``op_id``.
+
+    ## What it is worth, stated honestly
+
+    Singletons fall 152 to 67 and groups of 2+ rise 92 to 114, but
+    trainable groups rise only 88 to 91 (27 to 30 at the operative
+    ``--min-spread 0.01``). Most rejoined siblings grade identically. The
+    split was real and this corrects it; the binding constraint on this
+    corpus is reward SPREAD, not group count.
+
+    A prompt with no protected section falls back to its own text, so an
+    unrecognised prompt shape is never collapsed onto an unrelated one.
+    NEVER raises -- a key that throws would empty the corpus.
+    """
+    text = str(prompt or "")
+    if not _envb(_ENV_TASK_GROUPING, True):
+        return text.strip()
+    try:
+        from reactor_core.training.prompt_budget import (  # noqa: PLC0415
+            is_protected, split_sections,
+        )
+
+        _, sections = split_sections(text)
+        keep = [body for heading, body in sections if is_protected(heading)]
+        if not keep:
+            return text.strip()
+        return "".join(keep).strip()
+    except Exception:  # noqa: BLE001 — grouping must never break ingestion
+        logger.warning("[GRPO] task_group_key fell back to exact text",
+                       exc_info=True)
+        return text.strip()
+
+
 def is_genuine_row(meta: Optional[Dict[str, Any]]) -> bool:
     """Does this row answer the op's own GENERATE prompt?
 

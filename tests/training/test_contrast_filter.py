@@ -154,16 +154,20 @@ def test_gate_publishes_one_full_prompt_per_trainable_group(monkeypatch, tmp_pat
         _row("C" * 200, out="def h():\n    return 3\n"),
     ]
     # preflight resolves its dependencies lazily through ``_load(name)``,
-    # so that is the seam -- the corpus reader is stubbed and the real
-    # verifier and reward are left alone, because the grades they produce
-    # are what the group verdict is being tested on.
-    from types import SimpleNamespace
-    real_load = preflight._load
-    stub = SimpleNamespace(iter_trajectory_rows=lambda _d, **_k: iter(rows))
-    monkeypatch.setattr(
-        preflight, "_load",
-        lambda name: stub if name == "grpo_pipeline" else real_load(name),
-    )
+    # so that is the seam -- only the corpus READER is replaced, and the
+    # real verifier and reward are left alone, because the grades they
+    # produce are what the group verdict is being tested on.
+    #
+    # Patch the ONE function on the REAL module, never swap the module for
+    # a hand-built stand-in. A `SimpleNamespace` carrying just the stubbed
+    # name silently omits everything else the module offers: when `analyse`
+    # began calling `task_group_key`, the stub raised AttributeError and
+    # this test failed for a reason that had nothing to do with what it
+    # asserts. Worse, a namespace can never exercise the real grouping,
+    # which is precisely what "publishes what the loader consumes" means.
+    real_pipeline = preflight._load("grpo_pipeline")
+    monkeypatch.setattr(real_pipeline, "iter_trajectory_rows",
+                        lambda _d, **_k: iter(rows))
     v = preflight.analyse(tmp_path, min_group=2, trainable_only=True, min_spread=0.0)
     published = v["trainable_prompts"]
     assert len(published) == v["trainable_groups"]

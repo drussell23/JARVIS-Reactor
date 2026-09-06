@@ -75,22 +75,63 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _load(mod_name: str):
-    """Import one training module BY PATH.
+def _install_light_packages() -> None:
+    """Make ``reactor_core.training.*`` importable WITHOUT running either
+    package ``__init__``.
 
-    ``reactor_core/__init__`` eagerly imports the ML stack, so a normal
-    import drags torch/peft/trl into a venv that may have none of them.
-    Each module loaded here is stdlib-only at module scope; the heavy
-    imports inside them are lazy and never reached on this path.
+    ``reactor_core/__init__`` eagerly imports the ML stack, so a plain
+    import drags torch/peft/trl into a venv that has none of them. The
+    previous approach loaded each module from a bare file spec under a
+    private ``_pf_`` name, and it worked only while every training module
+    was stdlib-only at module scope -- an invariant stated in a docstring
+    and enforced by nothing.
+
+    It stopped being true. `grpo_pipeline` gained
+    ``from reactor_core.training.prompt_budget import ...`` at module
+    scope, Python resolved that through the REAL package, and the gate
+    died with ``No module named 'reactor_core'`` from the soak venv --
+    reporting an ERROR (exit 1) where its whole purpose is to answer
+    "trainable or not". A gate that cannot run is worse than no gate,
+    because the caller reads a fault where it expected a verdict.
+
+    So the boundary is made structural instead of promised. Two namespace
+    packages are placed in ``sys.modules`` with nothing but a
+    ``__path__``; ordinary import machinery then finds every sibling by
+    absolute name, and neither ``__init__`` is ever executed. Any future
+    absolute sibling import just works, and no module has to remember a
+    rule about what it may import at the top of the file.
+
+    Loading is normal after this, so a module has ONE identity. The old
+    ``_pf_`` aliasing gave a module two, and a dataclass or isinstance
+    check spanning them would have compared unrelated types.
+
+    A real ``reactor_core`` already imported (the trainer venv, running
+    with torch present) is left completely alone.
     """
-    path = _TRAINING / f"{mod_name}.py"
-    spec = importlib.util.spec_from_file_location(f"_pf_{mod_name}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod          # dataclasses needs it registered
-    spec.loader.exec_module(mod)
-    return mod
+    if "reactor_core" in sys.modules:
+        return
+    import types  # noqa: PLC0415 — stdlib, only needed on this path
+
+    pkg = types.ModuleType("reactor_core")
+    pkg.__path__ = [str(_REPO / "reactor_core")]      # type: ignore[attr-defined]
+    sub = types.ModuleType("reactor_core.training")
+    sub.__path__ = [str(_TRAINING)]                   # type: ignore[attr-defined]
+    pkg.training = sub                                # type: ignore[attr-defined]
+    sys.modules["reactor_core"] = pkg
+    sys.modules["reactor_core.training"] = sub
+
+
+def _load(mod_name: str):
+    """Import one training module without the package ``__init__``.
+
+    The heavy imports inside these modules are lazy and never reached on
+    this path; see :func:`_install_light_packages` for why the isolation
+    is done with namespace packages rather than by-path specs.
+    """
+    _install_light_packages()
+    if not (_TRAINING / f"{mod_name}.py").is_file():
+        raise ImportError(f"cannot load {_TRAINING / (mod_name + '.py')}")
+    return importlib.import_module(f"reactor_core.training.{mod_name}")
 
 
 def _default_telemetry_dir() -> Path:
@@ -119,13 +160,19 @@ def analyse(
     verifier = _load("grpo_verifier")
     reward = _load("grpo_reward")
 
+    # Keyed on the TASK, not on the exact prompt bytes. Ambient memory
+    # sections advance between draw 1 and draw 2 of the same op, which
+    # split genuine sibling groups into singletons and made the corpus
+    # report a sibling failure that never happened. `task_group_key` is
+    # reactor's own function, so the gate and the trainer cannot hold two
+    # notions of "the same prompt".
     groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     rows_seen = 0
     for row in pipeline.iter_trajectory_rows(
         telemetry_dir, trainable_only=trainable_only,
     ):
         rows_seen += 1
-        groups[str(row.get("user_input") or "")].append(row)
+        groups[pipeline.task_group_key(row.get("user_input"))].append(row)
 
     trainable: List[Dict[str, Any]] = []
     #: The FULL prompt text of every trainable group, in group order.
@@ -140,7 +187,14 @@ def analyse(
     singleton = 0
     verdict_sources: Dict[str, int] = defaultdict(int)
 
-    for prompt, rows in groups.items():
+    for _key, rows in groups.items():
+        # The group is KEYED on the task, but everything downstream needs a
+        # real prompt: the verifier must grade in the context the trainer
+        # will generate from, and `build_prompt_dataset(only_prompts=...)`
+        # matches on the FULL text's `.strip()`. Handing either of them the
+        # key would silently select nothing. First row wins, deterministic
+        # because `iter_trajectory_rows` walks files in sorted order.
+        prompt = str(rows[0].get("user_input") or "")
         for r in rows:
             src = str((r.get("metadata") or {}).get("verdict_source") or "")
             verdict_sources[src or "__unset__"] += 1
