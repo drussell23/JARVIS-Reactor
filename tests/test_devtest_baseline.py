@@ -72,7 +72,7 @@ def test_the_real_session_shape_scores_zero(tmp_path) -> None:
     assert m.completed == 1, "the raw counter still says 1"
     assert m.noop_completions == 1
     assert m.substantive == 0, "but nothing was delivered"
-    assert db.score_v1(m) == 0.0
+    assert db.work_units(m) == 0.0
 
 
 def test_a_model_that_only_declines_cannot_farm_the_score(tmp_path) -> None:
@@ -80,7 +80,7 @@ def test_a_model_that_only_declines_cannot_farm_the_score(tmp_path) -> None:
                                 for i in range(50)])
     m = db.read_session(d)
     assert m.completed == 50
-    assert db.score_v1(m) == 0.0, (
+    assert db.work_units(m) == 0.0, (
         "50 clean completions that changed nothing must not outrank one real fix")
 
 
@@ -90,8 +90,8 @@ def test_one_real_fix_outranks_fifty_declines(tmp_path) -> None:
                              for i in range(50)])
     one_fix = _session(tmp_path, name="b",
                        ops=[_op("completed", 1, "applied")])
-    assert db.score_v1(db.read_session(one_fix)) > \
-        db.score_v1(db.read_session(declines))
+    assert db.work_units(db.read_session(one_fix)) > \
+        db.work_units(db.read_session(declines))
 
 
 def test_a_completion_that_changed_a_file_is_substantive(tmp_path) -> None:
@@ -118,27 +118,27 @@ def test_zero_applies_still_scores_from_substantive_work(tmp_path) -> None:
                                 for i in range(4)])
     m = db.read_session(d)
     assert m.applies == 0
-    assert db.score_v1(m) == 4.0, "not a binary zero"
+    assert db.work_units(m) == 4.0, "not a binary zero"
 
 
 def test_the_weights_order_the_chain_by_what_it_proves(tmp_path) -> None:
-    sub = db.score_v1(db.SessionMetrics(substantive=1))
-    app = db.score_v1(db.SessionMetrics(substantive=1, applies=1))
-    com = db.score_v1(db.SessionMetrics(substantive=1, applies=1, commits=1))
+    sub = db.work_units(db.SessionMetrics(substantive=1))
+    app = db.work_units(db.SessionMetrics(substantive=1, applies=1))
+    com = db.work_units(db.SessionMetrics(substantive=1, applies=1, commits=1))
     assert sub < app < com, "an apply proves more than a completion; a commit more"
 
 
 def test_the_score_is_a_pure_function_of_the_metrics() -> None:
     m = db.SessionMetrics(substantive=2, applies=1, commits=1)
-    assert db.score_v1(m) == db.score_v1(m)
-    assert db.score_v1(m) == 2 * db.W_SUBSTANTIVE + db.W_APPLY + db.W_COMMIT
+    assert db.work_units(m) == db.work_units(m)
+    assert db.work_units(m) == 2 * db.W_SUBSTANTIVE + db.W_APPLY + db.W_COMMIT
 
 
 def test_the_metric_name_is_versioned() -> None:
     """Change the weights and the name must change, so the gate refuses to
     compare across the change instead of reporting a formula revision as a
     model improvement."""
-    assert db.METRIC.endswith("_v1")
+    assert db.METRIC.endswith("_v2")
     import inspect
     src = inspect.getsource(db)
     assert "METRIC = " in src
@@ -185,7 +185,10 @@ def test_a_stale_metric_name_refuses_rather_than_comparing(tmp_path, monkeypatch
     d = _session(tmp_path, ops=[_op("completed", 1, "applied")])
     db.record_from_session(d, base_model=BASE)
     v = pg.evaluate_promotion(candidate_score=99.0,
-                              candidate_metric="devtest_chain_closure_v2",
+                              # DERIVED, never a literal: a hardcoded "next version" becomes the
+                              # CURRENT one the moment the formula changes, and
+                              # this test then asserts that matching names refuse.
+                              candidate_metric=db.METRIC + "-not-this-one",
                               base_model=BASE, path=path)
     assert not v.promote and v.unanswerable
     assert "unlike things" in v.reason
@@ -205,7 +208,7 @@ def test_a_partial_summary_still_parses(tmp_path) -> None:
                                     encoding="utf-8")
     m = db.read_session(d)
     assert m.attempted == 0 and m.substantive == 0
-    assert db.score_v1(m) == 0.0
+    assert db.work_units(m) == 0.0
 
 
 def test_a_session_that_attempted_nothing_is_refused_by_the_cli(tmp_path, capsys) -> None:

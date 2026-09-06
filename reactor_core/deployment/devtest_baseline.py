@@ -20,8 +20,24 @@ as common, and an op that declines to act completes just as cleanly as one
 that ships a fix. A headline score built on `stats.completed` alone would
 rank a model that does nothing above one that tries and sometimes fails.
 
-`score_v1` therefore counts completions that DID something, and adds the
+The score therefore counts completions that DID something, and adds the
 rarer, harder outcomes on top.
+
+## And the denominator is not `attempted`
+
+Measured on the 2026-09-05 pair: 7 operations attempted, and 5 of them
+never reached the model at all -- 3 `self_modification_unsanctioned_source`
+and 2 `exploration_self_modification`, refused by the cage before GENERATE
+because they were sensor-emitted proposals to modify governance source
+tracing to no signed goal. The cage was right to refuse them; they are
+simply not evidence about a model that was never shown them.
+
+Dividing by 7 grades the model on five questions it never saw, and it is
+why the base model and the fine-tuned adapter both scored exactly 0.0 and
+"tied": the number was dominated by a governance decision neither
+participated in. `score_v2` divides by the ELIGIBLE operations, and
+returns None -- not 0.0 -- when none were, because a session that never
+consulted the model contains no evidence about it.
 
 ## Why the formula never changes shape
 
@@ -47,18 +63,47 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 #: The formula's identity. The gate compares only records whose metric
 #: matches, so bumping this makes an old baseline refuse rather than be
 #: silently compared against a differently-computed number.
-METRIC = "devtest_chain_closure_v1"
+#:
+#: v1 -> v2: v1 summed work over ALL attempted operations. Measured on the
+#: 2026-09-05 pair, 5 of 7 operations never reached the model at all --
+#: they were refused by the self-modification cage before GENERATE. Scoring
+#: a model against operations it was never shown measures the CAGE, and
+#: both the base model and the adapter scored 0.0 for that reason, which is
+#: why they tied. v2 divides by the operations that were actually eligible.
+METRIC = "devtest_chain_closure_v2"
+
+#: Terminal codes meaning GOVERNANCE refused the operation before the model
+#: could do anything. These are the cage working correctly -- a sensor-
+#: emitted proposal to modify governance source that traces to no signed
+#: goal SHOULD be refused -- but an op the model never saw cannot be
+#: evidence about the model.
+#:
+#: Matched as a prefix set rather than exact strings: the cage names its
+#: refusals by family (`self_modification_*`), and a new member of that
+#: family is still a refusal. Overridable so a box can name codes this
+#: build has not seen.
+ENV_CAGE_CODES = "REACTOR_DEVTEST_CAGE_CODES"
+DEFAULT_CAGE_PREFIXES: Tuple[str, ...] = (
+    "self_modification",          # self_modification_unsanctioned_source
+    "exploration_self_modification",
+    "touches_kernel",
+    "touches_supervisor",
+    "touches_security",
+    "target_out_of_scope",
+    "delegated_provenance",
+)
 
 #: Weights. A substantive completion is the unit; an apply is worth more
 #: because reaching APPLY means the candidate survived VALIDATE and GATE;
@@ -84,6 +129,12 @@ class SessionMetrics:
     failed: int = 0
     substantive: int = 0          # completed AND changed something
     noop_completions: int = 0
+    #: Refused by governance BEFORE the model was consulted. Counted so
+    #: a reader can see how much of `attempted` the model never saw.
+    caged: int = 0
+    #: attempted MINUS caged -- the operations the model was actually
+    #: asked to do something about. The score's denominator.
+    eligible: int = 0
     applies: int = 0              # ops that changed >=1 file
     files_changed: int = 0
     commits: int = 0
@@ -95,8 +146,8 @@ class SessionMetrics:
         return asdict(self)
 
 
-def score_v1(m: SessionMetrics) -> float:
-    """The headline. One formula, always the same shape.
+def work_units(m: SessionMetrics) -> float:
+    """Work DELIVERED, unnormalised. One formula, always the same shape.
 
     Substantive completions are the base; applies and commits add on. A run
     with zero applies still scores from its substantive completions rather
@@ -108,6 +159,44 @@ def score_v1(m: SessionMetrics) -> float:
         + W_APPLY * m.applies
         + W_COMMIT * m.commits
     )
+
+
+def score_v2(m: SessionMetrics) -> Optional[float]:
+    """Work delivered PER ELIGIBLE OPERATION, or None if none were.
+
+    The denominator is the correction. Measured on the 2026-09-05 pair: 7
+    operations attempted, 5 refused by the self-modification cage before
+    GENERATE, so the model was asked to do something exactly twice. Dividing
+    by 7 grades the model on five questions it was never shown, and it is
+    why the base and the adapter tied at 0.0 -- the score was dominated by
+    a governance decision neither of them participated in.
+
+    None, not 0.0, when nothing was eligible. A session in which the model
+    was never consulted contains no evidence about the model, and 0.0 would
+    assert the opposite -- that it was asked and delivered nothing. The
+    promotion gate already refuses a candidate whose score is None, so this
+    surfaces as CANNOT ANSWER rather than as a regression.
+    """
+    if m.eligible <= 0:
+        return None
+    return work_units(m) / float(m.eligible)
+
+
+def _cage_prefixes() -> Tuple[str, ...]:
+    raw = (os.environ.get(ENV_CAGE_CODES, "") or "").strip()
+    if raw:
+        parts = tuple(p.strip() for p in raw.split(",") if p.strip())
+        if parts:
+            return parts
+    return DEFAULT_CAGE_PREFIXES
+
+
+def is_caged(op: Dict[str, Any]) -> bool:
+    """True when governance refused this op before the model could work."""
+    code = str(op.get("terminal_reason_code") or "").strip().lower()
+    if not code:
+        return False
+    return any(code.startswith(p) for p in _cage_prefixes())
 
 
 def _op_is_noop(op: Dict[str, Any]) -> bool:
@@ -148,6 +237,9 @@ def read_session(session_dir: Path) -> SessionMetrics:
         if int(o.get("files_changed") or 0) > 0 or not _op_is_noop(o)
     ]
     applies = [o for o in ops if int(o.get("files_changed") or 0) > 0]
+    # Refused before GENERATE: the model never saw these, so they are not
+    # evidence about it. See `is_caged` for why this is a family match.
+    caged_ops = [o for o in ops if is_caged(o)]
 
     return SessionMetrics(
         session_id=str(raw.get("session_id") or Path(session_dir).name),
@@ -156,6 +248,8 @@ def read_session(session_dir: Path) -> SessionMetrics:
         failed=int(stats.get("failed") or 0),
         substantive=len(substantive),
         noop_completions=len(noops),
+        caged=len(caged_ops),
+        eligible=max(0, len(ops) - len(caged_ops)),
         applies=len(applies),
         files_changed=sum(int(o.get("files_changed") or 0) for o in ops),
         commits=int(branch.get("commits") or 0),
@@ -187,7 +281,7 @@ def build_record(
     }
     detail.update(extra or {})
     return BaselineRecord(
-        score=score_v1(metrics),
+        score=score_v2(metrics),
         metric=METRIC,
         base_model=base_model,
         measured_at=datetime.now(tz=timezone.utc).isoformat(),

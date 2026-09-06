@@ -58,16 +58,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"REFUSING: cannot read {args.session_dir}: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    score = db.score_v1(metrics)
+    score = db.score_v2(metrics)
     print("=== candidate ===")
     print(f"  tag         : {args.candidate_tag}")
     print(f"  session     : {metrics.session_id}")
-    print(f"  attempted   : {metrics.attempted}")
+    # ELIGIBLE is printed next to attempted because the gap between them is
+    # the single most misread number here: 7 attempted with 5 caged is a
+    # sample of TWO, and a reader who sees only "7" will over-trust the score.
+    print(f"  attempted   : {metrics.attempted}  "
+          f"({metrics.caged} caged by governance, {metrics.eligible} eligible)")
     print(f"  completed   : {metrics.completed} "
           f"({metrics.noop_completions} no-op, {metrics.substantive} substantive)")
     print(f"  applies     : {metrics.applies}  files: {metrics.files_changed}")
     print(f"  commits     : {metrics.commits}")
-    print(f"  score       : {score:.4f}  [{db.METRIC}]")
+    if score is None:
+        print(f"  score       : n/a — no eligible operations  [{db.METRIC}]")
+    else:
+        print(f"  score       : {score:.4f}  "
+              f"({db.work_units(metrics):.1f} work / {metrics.eligible} eligible)"
+              f"  [{db.METRIC}]")
 
     path = Path(args.baseline) if args.baseline else None
     baseline = pg.load_baseline(path=path)
