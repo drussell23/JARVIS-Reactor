@@ -92,3 +92,33 @@ def test_steps_are_fitted_to_the_time_the_cycle_has():
 def test_calibration_round_trips_through_its_json_shape():
     c = cal()
     assert mg.MemoryCalibration.from_dict({**c.__dict__, "extra": 1}) == c
+
+
+# ---------------------------------------------------------------------------
+# Decode cost grows with context: integrated, not single-point
+# ---------------------------------------------------------------------------
+
+def test_decode_integral_matches_the_per_token_sum():
+    c = cal(decode_s_per_token=0.8, decode_ref_ctx=1044, decode_s_per_token_per_ctx=0.0001)
+    brute = sum(0.8 + 0.0001 * (2978 + t - 1044) for t in range(1955))
+    assert mg.decode_seconds(c, prompt_tokens=2978, completion_tokens=1955) == pytest.approx(brute)
+
+
+def test_a_single_point_calibration_is_unchanged():
+    c = cal(decode_s_per_token=0.8)                         # no ref ctx: no growth known
+    assert mg.decode_seconds(c, prompt_tokens=2978, completion_tokens=1955) == pytest.approx(0.8 * 1955)
+    legacy = mg.MemoryCalibration.from_dict({k: v for k, v in cal().__dict__.items()
+                                             if k not in ("decode_ref_ctx", "decode_s_per_token_per_ctx")})
+    assert legacy.decode_s_per_token_per_ctx == 0.0
+
+
+def test_growth_shrinks_the_steps_that_fit_the_budget():
+    """The 2026-10-07 shape: decode timed at ~1k context, rollouts at ~3k-5k."""
+    flat = cal(decode_s_per_token=0.8, train_s_per_token=0.00048)
+    grown = cal(decode_s_per_token=0.8, train_s_per_token=0.00048,
+                decode_ref_ctx=1044, decode_s_per_token_per_ctx=0.00025)
+    kw = dict(completion_tokens=1955, prompt_tokens_mean=2978.4, accumulation=16,
+              time_budget_s=22500, steps_per_epoch=780)
+    steps_flat, s_flat = mg.fit_steps_to_time(flat, **kw)
+    steps_grown, s_grown = mg.fit_steps_to_time(grown, **kw)
+    assert s_grown > s_flat and steps_grown < steps_flat

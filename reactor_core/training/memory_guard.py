@@ -1241,11 +1241,19 @@ class MemoryCalibration:
     gen_bytes_per_token: float      # generation peak slope, whole group
     act_bytes_per_token: float      # training micro-step activation slope
     logit_bytes_per_token: float    # per completion token with logits kept
-    decode_s_per_token: float       # one decode step for the whole group
+    decode_s_per_token: float       # one decode step for the whole group, at decode_ref_ctx
     train_s_per_token: float        # fwd+bwd time per token, one sequence
     num_generations: int
     num_iterations: int = 1
     context_limit: int = 0          # the model's max positions (0 = unknown)
+    #: Context (tokens already in the sequence) at which decode_s_per_token
+    #: was timed, and how much one decode step's time grows per extra token of
+    #: context. Every new token attends over everything before it, so a step
+    #: timed at a short context undercounts a rollout decoding at the training
+    #: context -- measured live 2026-10-07: >41 min for a step calibrated at
+    #: ~26 min of decode. 0 = a single-point calibration (no growth known).
+    decode_ref_ctx: int = 0
+    decode_s_per_token_per_ctx: float = 0.0
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "MemoryCalibration":
@@ -1305,13 +1313,26 @@ def fit_completion_window(
     return CompletionFit(tokens, binding, p, g, t, budget, reason)
 
 
+def decode_seconds(cal: MemoryCalibration, *, prompt_tokens: float, completion_tokens: int) -> float:
+    """Wall clock to decode ``completion_tokens`` after a ``prompt_tokens``
+    prompt, integrating the per-step cost over the context each step sees:
+    sum over t of [d0 + k * (prompt + t - ref)], with d0 the step time timed
+    at context ``ref`` and k its measured growth per token of context."""
+    n = max(0, int(completion_tokens))
+    d0, k = float(cal.decode_s_per_token), max(0.0, float(cal.decode_s_per_token_per_ctx))
+    offset = float(prompt_tokens) - float(cal.decode_ref_ctx or 0)
+    if not cal.decode_ref_ctx:
+        k = 0.0                                   # no second point: no growth known
+    return max(0.0, n * d0 + k * (n * offset + n * (n - 1) / 2.0))
+
+
 def estimate_step_seconds(cal: MemoryCalibration, *, completion_tokens: int,
                           prompt_tokens_mean: float, accumulation: int) -> float:
     """Wall clock of one optimiser step: the group's batched decode (shared by
     ``num_iterations`` steps) plus ``accumulation`` one-sequence micro-steps.
     Decode is charged at the FULL window: a batch decodes until its longest
     member stops, and the longest is the one the window was sized for."""
-    gen = cal.decode_s_per_token * max(0, int(completion_tokens))
+    gen = decode_seconds(cal, prompt_tokens=prompt_tokens_mean, completion_tokens=completion_tokens)
     train = (cal.train_s_per_token * (float(prompt_tokens_mean) + completion_tokens)
              * max(1, int(accumulation)))
     return gen / max(1, int(cal.num_iterations)) + train
@@ -1338,6 +1359,7 @@ __all__ = [
     "Rung",
     "build_ladder",
     "check_admission",
+    "decode_seconds",
     "free_cuda_memory",
     "gpu_occupancy_pct",
     "is_oom",

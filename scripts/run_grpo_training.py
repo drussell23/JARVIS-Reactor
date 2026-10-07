@@ -857,8 +857,15 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
         try:
             gp1, _ = measure(gen(l1, 4), f"generation probe at {l1} tokens")
             gp2, _ = measure(gen(l2, 4), f"generation probe at {l2} tokens")
+            # Decode timed at TWO contexts (the same two probe lengths the
+            # memory slopes use): a step's time grows with the context it
+            # attends over, and rollouts decode at the training context, far
+            # past the short probe. Each pair differences 36 vs 4 new tokens,
+            # so prefill cancels; the midpoint context is where it was timed.
             _, td1 = measure(gen(l1, 4), "decode timing (4)")
             _, td2 = measure(gen(l1, 36), "decode timing (36)")
+            _, td3 = measure(gen(l2, 4), f"decode timing at {l2} (4)")
+            _, td4 = measure(gen(l2, 36), f"decode timing at {l2} (36)")
         except ProbeOOM as exc:
             return {"error": "probe_oom", "detail": str(exc),
                     "prompts": {"rows": len(lengths), "max": p_max, "mean": sum(lengths) / len(lengths)}}
@@ -907,6 +914,8 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
         act_bytes_per_token=max(0.0, (ap2 - ap1) / (l2 - l1)),
         logit_bytes_per_token=max(0.0, (lp2 - ap1) / (k2 - k1)),
         decode_s_per_token=max(0.0, (td2 - td1) / 32.0),
+        decode_ref_ctx=l1 + 20,
+        decode_s_per_token_per_ctx=max(0.0, ((td4 - td3) - (td2 - td1)) / 32.0 / max(1, l2 - l1)),
         train_s_per_token=max(0.0, (tt2 - tt1) / (l2 - l1)),
         num_generations=g,
         num_iterations=int(getattr(args, "num_iterations", 1) or 1),
