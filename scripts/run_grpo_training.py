@@ -53,7 +53,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 def _default_num_generations() -> int:
     """The group size default, owned by grpo_pipeline.
@@ -341,7 +341,8 @@ def _make_truncation_callback(*, mask_truncated: bool, patience: int = 0) -> Any
     return _TruncationCallback()
 
 
-def child_argv(rung_index: int, json_out: str) -> List[str]:
+def child_argv(rung_index: int, json_out: str,
+               resolved: Optional[Dict[str, str]] = None) -> List[str]:
     """This process's own argv, aimed at exactly one rung.
 
     Reusing argv rather than reconstructing a command line means a flag
@@ -350,23 +351,32 @@ def child_argv(rung_index: int, json_out: str) -> List[str]:
     drift that once had the profiler measuring a different configuration
     than the runner it was supposed to mirror.
     """
+    # ``resolved``: values the PARENT decided (an "auto" completion window,
+    # a time-fitted step count). They replace the parent's own spelling of
+    # the flag, so every child trains exactly what was fitted instead of
+    # re-deciding -- and a child never re-runs the calibration.
+    resolved = dict(resolved or {})
+    replaced = {"--rung-index", "--json-out", *resolved}
     argv: List[str] = []
     skip = False
     for arg in sys.argv[1:]:
         if skip:
             skip = False
             continue
-        if arg in ("--rung-index", "--json-out"):
+        if arg in replaced:
             skip = True
             continue
-        if arg.startswith("--rung-index=") or arg.startswith("--json-out="):
+        if any(arg.startswith(f + "=") for f in replaced):
             continue
         argv.append(arg)
+    for flag, value in resolved.items():
+        argv += [flag, value]
     return argv + ["--rung-index", str(rung_index), "--json-out", json_out]
 
 
 def train_with_isolated_ladder(
     *, ladder: List[Any], report: Dict[str, Any],
+    resolved: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Walk the ladder with each rung in a process of its own.
 
@@ -424,7 +434,7 @@ def train_with_isolated_ladder(
             # A guard that watches the log for progress cannot work
             # against a child that only reports posthumously.
             code = subprocess.call([sys.executable, "-u", script]
-                                   + child_argv(index, child_json))
+                                   + child_argv(index, child_json, resolved))
             child: Dict[str, Any] = {}
             try:
                 with open(child_json, "r", encoding="utf-8") as fh:
@@ -706,6 +716,183 @@ def train_with_ladder(
 # ---------------------------------------------------------------------------
 
 
+
+# ---------------------------------------------------------------------------
+# Calibration: measure what a completion token costs on THIS model and card
+# ---------------------------------------------------------------------------
+
+def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) -> Dict[str, Any]:
+    """Measure the slopes ``memory_guard.fit_completion_window`` needs, on
+    the trainer that will train, in the configuration it will train in.
+
+    Every number is a difference between two runs of the real model, so
+    fixed costs (weights, the adapter, a constant number of kept logits)
+    cancel and only the per-token cost remains:
+
+    * generation: ``model.generate`` for the whole group at two prompt
+      lengths -> peak bytes per token; at two decode lengths -> seconds per
+      decode step. Prefill activations per token exceed decode KV per
+      token, so charging completion tokens at this slope is conservative;
+    * training: one-sequence forward+backward through the LoRA path at two
+      lengths (fixed ``logits_to_keep``) -> activation bytes and seconds per
+      token; at two ``logits_to_keep`` values -> bytes per kept logit row;
+    * prompts: the training set's own prompts, tokenized by the trainer's
+      own tokenizer -- the longest sets the window, the mean the time.
+    """
+    import torch  # noqa: PLC0415
+
+    model, tok = trainer.model, trainer.processing_class
+    args = trainer.args
+    g = int(args.num_generations)
+    dev = next(p for p in model.parameters()).device
+    prompts = [str(p) for p in trainer.train_dataset["prompt"]]
+    lengths = [len(tok(p, add_special_tokens=False)["input_ids"]) for p in prompts]
+    p_max = max(lengths)
+    seed_ids = tok(prompts[lengths.index(p_max)], add_special_tokens=False)["input_ids"]
+
+    def ids(length: int, batch: int) -> Any:
+        reps = -(-length // len(seed_ids))
+        row = (seed_ids * reps)[:length]
+        return torch.tensor([row] * batch, device=dev)
+
+    class ProbeOOM(RuntimeError):
+        pass
+
+    def measure(fn: Callable[[], Any], what: str = "") -> Tuple[int, float]:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        t0 = time.perf_counter()
+        try:
+            fn()
+        except torch.OutOfMemoryError as exc:
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            raise ProbeOOM(f"{what}: {str(exc)[:200]}") from None
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base, time.perf_counter() - t0
+
+    torch.cuda.synchronize()
+    resident = torch.cuda.memory_allocated()
+    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    l1, l2 = max(64, p_max // 4), max(128, p_max // 2)
+
+    # The TRAINER's generation config, not the model's: gradient
+    # checkpointing turns model.config.use_cache off, and timing a decode
+    # without the KV cache would measure a different algorithm.
+    import copy  # noqa: PLC0415
+    base_gc = getattr(trainer, "generation_config", None)
+
+    def gc_for(new: int) -> Any:
+        gc = copy.deepcopy(base_gc) if base_gc is not None else None
+        if gc is not None:
+            gc.max_new_tokens, gc.min_new_tokens, gc.use_cache = new, new, True
+            gc.pad_token_id = pad
+        return gc
+
+    model.eval()
+    with torch.no_grad():
+        def gen(length: int, new: int) -> Callable[[], Any]:  # noqa: E306
+            gc = gc_for(new)
+            if gc is not None:
+                return lambda: model.generate(ids(length, g), generation_config=gc)
+            return lambda: model.generate(ids(length, g), max_new_tokens=new, min_new_tokens=new,
+                                          use_cache=True, pad_token_id=pad)
+        try:
+            gp1, _ = measure(gen(l1, 4), f"generation probe at {l1} tokens")
+            gp2, _ = measure(gen(l2, 4), f"generation probe at {l2} tokens")
+            _, td1 = measure(gen(l1, 4), "decode timing (4)")
+            _, td2 = measure(gen(l1, 36), "decode timing (36)")
+        except ProbeOOM as exc:
+            return {"error": "probe_oom", "detail": str(exc),
+                    "prompts": {"rows": len(lengths), "max": p_max, "mean": sum(lengths) / len(lengths)}}
+    model.train()
+    # transformers.Trainer enables gradient checkpointing INSIDE train(), not
+    # at construction (trainer.py: "Activate gradient checkpointing if
+    # needed"), so a probe run on the freshly built trainer measures a
+    # backward that keeps every layer's activations -- a configuration
+    # training never runs (it OOM'd at a quarter of the prompt, live). Mirror
+    # the Trainer's own call, with its own kwargs.
+    if getattr(args, "gradient_checkpointing", False):
+        gc_kwargs = dict(getattr(args, "gradient_checkpointing_kwargs", None) or {})
+        every_n = gc_kwargs.pop("every_n_layers", 1)
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs or None,
+                                                every_n_layers=every_n)
+        except TypeError:   # a transformers without every_n_layers
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gc_kwargs or None)
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+
+    def step(length: int, keep: int) -> Callable[[], Any]:
+        def run() -> None:
+            out = model(input_ids=ids(length, 1), logits_to_keep=keep)
+            out.logits.float().log_softmax(-1).mean().backward()
+            model.zero_grad(set_to_none=True)
+        return run
+    k1, k2 = 32, 288
+    try:
+        ap1, tt1 = measure(step(l1, k1), f"training probe at {l1} tokens")
+        ap2, tt2 = measure(step(l2, k1), f"training probe at {l2} tokens")
+        lp2, _ = measure(step(l1, k2), f"logits probe keeping {k2}")
+    except ProbeOOM as exc:
+        return {"error": "probe_oom", "detail": str(exc),
+                "prompts": {"rows": len(lengths), "max": p_max, "mean": sum(lengths) / len(lengths)}}
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    grad_elem = next((p.element_size() for p in model.parameters() if p.requires_grad), 4)
+    total = torch.cuda.get_device_properties(dev).total_memory
+    cal = guard.MemoryCalibration(
+        cap_bytes=int(total * (allocator_fraction or 1.0)),
+        resident_bytes=int(resident),
+        optimizer_bytes=int(trainable * 8),          # AdamW: two fp32 moments
+        grad_bytes=int(trainable * grad_elem),
+        gen_bytes_per_token=max(0.0, (gp2 - gp1) / (l2 - l1)),
+        act_bytes_per_token=max(0.0, (ap2 - ap1) / (l2 - l1)),
+        logit_bytes_per_token=max(0.0, (lp2 - ap1) / (k2 - k1)),
+        decode_s_per_token=max(0.0, (td2 - td1) / 32.0),
+        train_s_per_token=max(0.0, (tt2 - tt1) / (l2 - l1)),
+        num_generations=g,
+        num_iterations=int(getattr(args, "num_iterations", 1) or 1),
+        context_limit=int(getattr(model.config, "max_position_embeddings", 0) or 0),
+    )
+    return {"calibration": cal.__dict__,
+            "prompts": {"rows": len(lengths), "max": p_max, "mean": sum(lengths) / len(lengths)},
+            "probe": {"gen_lengths": [l1, l2], "train_lengths": [l1, l2], "keep": [k1, k2]}}
+
+
+def run_calibration_child(guard: Any) -> Dict[str, Any]:
+    """Calibrate in a process of its own (its exit frees the CUDA context,
+    as for every rung). Always returns a report; it holds ``calibration`` on
+    success and ``error`` (with the child's exit code) otherwise."""
+    import subprocess  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    handle, out = tempfile.mkstemp(prefix="grpo-calibration-", suffix=".json")
+    os.close(handle)
+    try:
+        argv = child_argv(0, out, resolved={"--max-completion-length": "64"}) + ["--calibrate"]
+        code = subprocess.call([sys.executable, "-u", str(Path(__file__).resolve())] + argv)
+        try:
+            with open(out, "r", encoding="utf-8") as fh:
+                report = json.load(fh)
+        except (OSError, ValueError):
+            report = {"error": f"calibration child exited rc={code} without a report (see its log above)"}
+        report["exit"] = code
+        if "calibration" not in report and "error" not in report:
+            report["error"] = f"calibration child exited rc={code} with no measurement"
+        return report
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[runner] calibration child failed")
+        return {"error": f"calibration child could not run: {type(exc).__name__}: {exc}"[:300]}
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -722,7 +909,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "IS the GRPO signal, so this is the main lever on a "
                          "small corpus")
     ap.add_argument(
-        "--max-completion-length", type=int, default=512,
+        "--max-completion-length", default="auto",
         help="tokens per completion. 512, not 256, because at 256 EVERY "
              "rollout hit the ceiling (clipped_ratio 1.0, "
              "mean_terminated_length 0) and mask_truncated_completions then "
@@ -790,6 +977,19 @@ def main(argv: Optional[List[str]] = None) -> int:
              "room. Isolation is the default because process death is the "
              "only reclamation the driver guarantees.",
     )
+    ap.add_argument(
+        "--time-budget-s", type=float, default=0.0,
+        help="wall clock this run may take. With an 'auto' window, the step "
+             "count is fitted so the run FINISHES inside it -- a run killed by "
+             "its caller's timeout produces no adapter at all. 0 = one epoch.",
+    )
+    ap.add_argument(
+        "--vram-headroom-gib", type=float,
+        default=float(os.environ.get("REACTOR_GRPO_VRAM_HEADROOM_GIB", "") or 1.0),
+        help="allocator slack kept free when fitting the 'auto' completion "
+             "window (env REACTOR_GRPO_VRAM_HEADROOM_GIB)",
+    )
+    ap.add_argument("--calibrate", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--skip-admission", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and validate everything, take no step")
@@ -916,6 +1116,74 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         args.gradient_accumulation_steps = accumulation
     global_batch = accumulation
+
+    # --- the completion window ---------------------------------------------
+    if args.calibrate:
+        # CHILD: load exactly as a rung would, measure, report, exit. Its
+        # exit frees the CUDA context before any rung loads.
+        from reactor_core.training import grpo_pipeline  # noqa: PLC0415
+        trainer = grpo_pipeline.build_trainer(
+            args.model, telemetry_dir, str(output_dir),
+            trainable_only=not args.include_untrainable, max_prompts=args.max_prompts or None,
+            only_prompts=contrast_prompts, max_prompt_tokens=args.max_prompt_tokens or None,
+            use_qlora=not args.no_qlora, gptq_backend=args.gptq_backend,
+            num_generations=args.num_generations, max_completion_length=64,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            num_train_epochs=args.epochs)
+        report.update(calibrate(trainer, guard, allocator_fraction=report["cuda_allocator_fraction"]))
+        _write(args.json_out, report)
+        return EXIT_OK
+    resolved: Dict[str, str] = {}
+    if str(args.max_completion_length).strip().lower() == "auto":
+        cal_report = run_calibration_child(guard)
+        if "calibration" not in cal_report:
+            report["completion_window"] = {"error": cal_report.get("error"), "detail": cal_report.get("detail"),
+                                           "prompts": cal_report.get("prompts")}
+            logger.error("[runner] completion-window calibration failed: %s %s",
+                         cal_report.get("error"), cal_report.get("detail") or "")
+            if cal_report.get("error") == "probe_oom":
+                # A probe at a FRACTION of the longest prompt did not fit:
+                # no window can. A refusal, not an error.
+                report["refused"] = "completion_window"
+                _write(args.json_out, report)
+                return EXIT_REFUSED
+            report["error"] = f"completion-window calibration failed: {cal_report.get('error')}"
+            _write(args.json_out, report)
+            return EXIT_ERROR
+        cal = guard.MemoryCalibration.from_dict(cal_report["calibration"])
+        prompts = cal_report["prompts"]
+        fit = guard.fit_completion_window(
+            cal, prompt_tokens_max=int(prompts["max"]),
+            headroom_bytes=int(args.vram_headroom_gib * guard.GIB))
+        groups_per_step = max(1, global_batch // max(1, args.num_generations))
+        steps_per_epoch = max(1, int(-(-prompts["rows"] * args.epochs // groups_per_step))) * cal.num_iterations
+        steps, step_s = guard.fit_steps_to_time(
+            cal, completion_tokens=fit.tokens, prompt_tokens_mean=float(prompts["mean"]),
+            accumulation=global_batch, time_budget_s=args.time_budget_s, steps_per_epoch=steps_per_epoch)
+        report["completion_window"] = {
+            "tokens": fit.tokens, "binding": fit.binding, "reason": fit.reason,
+            "prompt_tokens_max": prompts["max"], "prompt_tokens_mean": round(prompts["mean"], 1),
+            "calibration": cal_report["calibration"], "probe": cal_report.get("probe"),
+            "est_step_s": round(step_s, 1), "steps_per_epoch": steps_per_epoch,
+            "steps_fitted": steps, "est_run_h": round(steps * step_s / 3600, 2)}
+        logger.info("[runner] completion window: %s; ~%.0f s/step, %d of %d epoch step(s) fit "
+                    "a %.1f h budget", fit.reason, step_s, steps, steps_per_epoch,
+                    args.time_budget_s / 3600)
+        if not fit.tokens:
+            report["refused"] = "completion_window"
+            _write(args.json_out, report)
+            return EXIT_REFUSED
+        if args.time_budget_s > 0 and steps < 1:
+            report["refused"] = "time_budget"
+            _write(args.json_out, report)
+            return EXIT_REFUSED
+        args.max_completion_length = fit.tokens
+        resolved["--max-completion-length"] = str(fit.tokens)
+        if args.time_budget_s > 0 and args.max_steps <= 0 and steps < steps_per_epoch:
+            args.max_steps = steps
+            resolved["--max-steps"] = str(steps)
+    args.max_completion_length = int(args.max_completion_length)
+
     ladder = guard.build_ladder(
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
@@ -960,7 +1228,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # PARENT: hand each rung to a process that will die and take its
             # CUDA context with it. Gates 1 and 2 already ran above, so the
             # children inherit a corpus and a card that were checked once.
-            outcome = train_with_isolated_ladder(ladder=ladder, report=report)
+            outcome = train_with_isolated_ladder(ladder=ladder, report=report, resolved=resolved)
         else:
             # CHILD (--rung-index), or an explicit in-process walk, or a
             # dry run, which allocates nothing worth isolating.

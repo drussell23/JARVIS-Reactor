@@ -1205,6 +1205,132 @@ def free_cuda_memory() -> None:
         logger.debug("[memguard] could not free CUDA memory", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Completion window: fitted to the card from measurements, never assumed
+# ---------------------------------------------------------------------------
+#
+# A GRPO step has two memory peaks and the completion length moves both:
+#
+#   GENERATION  resident + optimiser + gen_slope x (prompt + completion)
+#               -- num_generations sequences decoded together, KV + prefill
+#               activations growing linearly in the sequence (measured
+#               2026-09-05: "2.296 MB per prompt token, identical to 4 s.f.
+#               at every length");
+#   TRAINING    resident + optimiser + grads + act_slope x (prompt + completion)
+#                 + logit_slope x completion
+#               -- one sequence per micro-step through the LoRA path, with
+#               logits materialised only for the completion (logits_to_keep).
+#
+# Every slope is MEASURED by the calibration probe (run_grpo_training.py
+# --calibrate) on the model that will train, in the process configuration
+# that will train it; nothing here is a constant of this card or this model.
+# The window is the largest completion that keeps BOTH peaks under the
+# allocator cap minus the operator's headroom, for the LONGEST prompt in the
+# batch (a group's peak is set by its own prompt; an average would admit the
+# group that OOMs).
+
+
+@dataclass(frozen=True)
+class MemoryCalibration:
+    """What the calibration probe measured. Bytes and seconds."""
+
+    cap_bytes: int                  # allocator cap (fraction x device total)
+    resident_bytes: int             # base weights + adapter, after load
+    optimizer_bytes: int            # AdamW state for the trainable params
+    grad_bytes: int                 # gradients for the trainable params
+    gen_bytes_per_token: float      # generation peak slope, whole group
+    act_bytes_per_token: float      # training micro-step activation slope
+    logit_bytes_per_token: float    # per completion token with logits kept
+    decode_s_per_token: float       # one decode step for the whole group
+    train_s_per_token: float        # fwd+bwd time per token, one sequence
+    num_generations: int
+    num_iterations: int = 1
+    context_limit: int = 0          # the model's max positions (0 = unknown)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "MemoryCalibration":
+        names = cls.__dataclass_fields__.keys()   # type: ignore[attr-defined]
+        return cls(**{k: d[k] for k in names if k in d})
+
+
+@dataclass(frozen=True)
+class CompletionFit:
+    tokens: int                     # the window; 0 = nothing fits
+    binding: str                    # "generation" | "training" | "context"
+    prompt_tokens: int
+    gen_peak_bytes: int
+    train_peak_bytes: int
+    budget_bytes: int
+    reason: str
+
+
+def fit_completion_window(
+    cal: MemoryCalibration,
+    *,
+    prompt_tokens_max: int,
+    headroom_bytes: int,
+    min_tokens: int = 1,
+) -> CompletionFit:
+    """The largest completion length whose generation AND training peaks fit
+    under ``cap - headroom`` for the longest prompt. Pure; NEVER raises.
+    ``tokens == 0`` means even ``min_tokens`` does not fit -- refuse, do not
+    guess a smaller number the measurements say will OOM."""
+    p = max(0, int(prompt_tokens_max))
+    budget = int(cal.cap_bytes) - int(headroom_bytes)
+    fixed_gen = cal.resident_bytes + cal.optimizer_bytes
+    fixed_train = fixed_gen + cal.grad_bytes
+    candidates: List[Tuple[float, str]] = []
+    if cal.gen_bytes_per_token > 0:
+        candidates.append(((budget - fixed_gen) / cal.gen_bytes_per_token - p, "generation"))
+    per_completion = cal.act_bytes_per_token + cal.logit_bytes_per_token
+    if per_completion > 0:
+        candidates.append(((budget - fixed_train - cal.act_bytes_per_token * p) / per_completion,
+                           "training"))
+    if cal.context_limit > 0:
+        candidates.append((cal.context_limit - p, "context"))
+    if not candidates:
+        return CompletionFit(0, "unmeasured", p, 0, 0, budget, "calibration measured no slope")
+    limit, binding = min(candidates, key=lambda c: c[0])
+    tokens = int(limit) if limit >= min_tokens else 0
+
+    def peaks(c: int) -> Tuple[int, int]:
+        return (int(fixed_gen + cal.gen_bytes_per_token * (p + c)),
+                int(fixed_train + cal.act_bytes_per_token * (p + c) + cal.logit_bytes_per_token * c))
+    g, t = peaks(tokens)
+    reason = (f"{tokens} completion tokens for a {p}-token prompt; bound by {binding}; "
+              f"peaks gen {g / GIB:.2f} / train {t / GIB:.2f} GiB vs budget {budget / GIB:.2f} GiB")
+    if not tokens:
+        reason = (f"no completion window fits: even {min_tokens} tokens exceed the "
+                  f"{binding} budget for a {p}-token prompt")
+    return CompletionFit(tokens, binding, p, g, t, budget, reason)
+
+
+def estimate_step_seconds(cal: MemoryCalibration, *, completion_tokens: int,
+                          prompt_tokens_mean: float, accumulation: int) -> float:
+    """Wall clock of one optimiser step: the group's batched decode (shared by
+    ``num_iterations`` steps) plus ``accumulation`` one-sequence micro-steps.
+    Decode is charged at the FULL window: a batch decodes until its longest
+    member stops, and the longest is the one the window was sized for."""
+    gen = cal.decode_s_per_token * max(0, int(completion_tokens))
+    train = (cal.train_s_per_token * (float(prompt_tokens_mean) + completion_tokens)
+             * max(1, int(accumulation)))
+    return gen / max(1, int(cal.num_iterations)) + train
+
+
+def fit_steps_to_time(cal: MemoryCalibration, *, completion_tokens: int, prompt_tokens_mean: float,
+                      accumulation: int, time_budget_s: float, steps_per_epoch: int) -> Tuple[int, float]:
+    """``(steps, est_step_s)``: the most optimiser steps that finish inside the
+    budget, never more than an epoch. A cycle cut off by its timeout produces
+    no adapter at all, so the step count is fitted to the time the cycle
+    actually has. ``time_budget_s <= 0`` = no budget (the whole epoch)."""
+    step_s = estimate_step_seconds(cal, completion_tokens=completion_tokens,
+                                   prompt_tokens_mean=prompt_tokens_mean, accumulation=accumulation)
+    epoch = max(1, int(steps_per_epoch))
+    if time_budget_s <= 0 or step_s <= 0:
+        return epoch, step_s
+    return max(0, min(epoch, int(time_budget_s // step_s))), step_s
+
+
 __all__ = [
     "Admission",
     "MemorySample",
@@ -1225,4 +1351,9 @@ __all__ = [
     "write_abort_report",
     "DEFAULT_WIN_COMMIT_FLOOR_GIB",
     "DEFAULT_CUDA_ALLOCATOR_FRACTION",
+    "MemoryCalibration",
+    "CompletionFit",
+    "fit_completion_window",
+    "estimate_step_seconds",
+    "fit_steps_to_time",
 ]

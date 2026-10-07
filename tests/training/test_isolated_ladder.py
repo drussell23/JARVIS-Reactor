@@ -189,3 +189,29 @@ def test_oom_exit_code_is_distinct_from_error() -> None:
     codes = {runner.EXIT_OK, runner.EXIT_ERROR, runner.EXIT_REFUSED,
              runner.EXIT_LADDER_EXHAUSTED, runner.EXIT_RUNG_OOM}
     assert len(codes) == 5, "the parent's response to OOM is the opposite of error"
+
+
+def test_resolved_values_replace_the_parents_spelling(monkeypatch) -> None:
+    """An 'auto' window is decided ONCE, by the parent. A child that saw
+    'auto' would re-run the calibration and could train a different window
+    than the one the ladder and the time budget were fitted to."""
+    monkeypatch.setattr(sys, "argv", [
+        "run_grpo_training.py", "--model", "M", "--max-completion-length", "auto",
+        "--max-steps=-1", "--time-budget-s", "25000"])
+    argv = runner.child_argv(0, "/c.json", {"--max-completion-length": "1834", "--max-steps": "9"})
+    assert "auto" not in argv and argv.count("--max-completion-length") == 1
+    assert argv[argv.index("--max-completion-length") + 1] == "1834"
+    assert argv[argv.index("--max-steps") + 1] == "9" and "--max-steps=-1" not in argv
+    assert argv[argv.index("--time-budget-s") + 1] == "25000"
+
+
+def test_the_isolated_ladder_hands_children_the_resolved_window(monkeypatch) -> None:
+    import subprocess
+    spawner = _Spawner([0], [{"attempts": [{"rung": "a"}]}])
+    monkeypatch.setattr(subprocess, "call", spawner)
+    monkeypatch.setattr(sys, "argv", ["run_grpo_training.py", "--model", "m",
+                                      "--max-completion-length", "auto"])
+    runner.train_with_isolated_ladder(ladder=[_rung("a")], report={},
+                                      resolved={"--max-completion-length": "1500"})
+    cmd = spawner.calls[0]
+    assert cmd[cmd.index("--max-completion-length") + 1] == "1500"

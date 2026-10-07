@@ -146,14 +146,15 @@ def test_the_ladder_arms_the_guard_from_the_trainers_own_config() -> None:
     assert 'attempt["truncation_tripped"]' in src
 
 
-def test_the_completion_ceiling_default_is_512() -> None:
-    """256 is the value that produced clipped_ratio 1.0 and a masked loss."""
-    import argparse
-    parser = None
-    src = (_REPO / "scripts" / "run_grpo_training.py").read_text(encoding="utf-8")
+def test_the_completion_ceiling_default_is_measured_not_fixed() -> None:
+    """256 produced clipped_ratio 1.0 and a masked loss; the 512 that replaced
+    it still truncated the 30B's answers. Any fixed number is wrong for some
+    prompt length on some card, so the default is 'auto': the window fitted
+    from the calibration probe (memory_guard.fit_completion_window)."""
     import re
-    m = re.search(r'"--max-completion-length", type=int, default=(\d+)', src)
-    assert m is not None and int(m.group(1)) == 512
+    src = (_REPO / "scripts" / "run_grpo_training.py").read_text(encoding="utf-8")
+    m = re.search(r'"--max-completion-length", default="(\w+)"', src)
+    assert m is not None and m.group(1) == "auto"
 
 
 # ---------------------------------------------------------------------------
