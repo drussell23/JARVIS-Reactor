@@ -109,6 +109,24 @@ def _load_memory_guard() -> Any:
     return mod
 
 
+async def memory_admission() -> Optional[Tuple[bool, str]]:
+    """``memory_guard.check_admission`` off the event loop, as (allowed, reason).
+
+    None when the guard cannot be loaded or the probe wedges -- callers treat
+    None as a refusal. It shells out to nvidia-smi (and powershell.exe for
+    Windows commit under WSL), so it never runs on the loop.
+    """
+    guard = _load_memory_guard()
+    if guard is None:
+        return None
+    try:
+        adm = await asyncio.wait_for(asyncio.to_thread(guard.check_admission), timeout=30.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[scheduler] memory admission probe failed: %s", exc)
+        return None
+    return bool(adm.allowed), str(adm.reason)
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -124,13 +142,8 @@ class SchedulerConfig:
     CPU_THRESHOLD = float(os.getenv("SCHEDULER_CPU_THRESHOLD", "80.0"))
     MEMORY_THRESHOLD = float(os.getenv("SCHEDULER_MEMORY_THRESHOLD", "85.0"))
     GPU_THRESHOLD = float(os.getenv("SCHEDULER_GPU_THRESHOLD", "90.0"))
-    # VRAM OCCUPANCY, not GPU utilization. A resident LLM holds its weights
-    # while computing nothing between requests, so utilization reads ~0% at
-    # 89% VRAM. Admitting training there OOMs the card, so this is a
-    # separate gate with a tighter default.
-    GPU_MEMORY_THRESHOLD = float(
-        os.getenv("SCHEDULER_GPU_MEMORY_THRESHOLD", "85.0")
-    )
+    # VRAM occupancy is NOT thresholded here: training.memory_guard owns
+    # memory admission (REACTOR_TRAIN_MAX_VRAM_OCCUPANCY_PCT et al.).
 
     # Experience triggers
     EXPERIENCE_THRESHOLD = int(os.getenv("SCHEDULER_EXP_THRESHOLD", "100"))
@@ -241,6 +254,9 @@ class ResourceSnapshot:
     gpu_memory_percent: Optional[float] = None
     disk_percent: float = 0.0
     load_average: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: memory_guard.check_admission's verdict, taken with the snapshot.
+    #: None = not taken (guard unloadable), which REFUSES -- see below.
+    memory_admission: Optional[Tuple[bool, str]] = None
 
     def is_training_allowed(self) -> Tuple[bool, str]:
         """Check if resource levels allow training."""
@@ -250,18 +266,15 @@ class ResourceSnapshot:
             return False, f"Memory usage too high: {self.memory_percent:.1f}%"
         if self.gpu_percent is not None and self.gpu_percent > SchedulerConfig.GPU_THRESHOLD:
             return False, f"GPU usage too high: {self.gpu_percent:.1f}%"
-        # Checked separately from gpu_percent: an idle-but-resident model is
-        # invisible to utilization and fatal to an admitted training job.
-        if (
-            self.gpu_memory_percent is not None
-            and self.gpu_memory_percent > SchedulerConfig.GPU_MEMORY_THRESHOLD
-        ):
-            return False, (
-                f"GPU memory too high: {self.gpu_memory_percent:.1f}% "
-                f"(threshold {SchedulerConfig.GPU_MEMORY_THRESHOLD:.1f}%) — "
-                "deferring, another model is resident"
-            )
-        return True, "Resources available"
+        # Memory admission has ONE authority: training.memory_guard, the same
+        # gate the GRPO runner uses (VRAM occupancy, guest memory, Windows
+        # commit). This snapshot used to carry its own 85% VRAM threshold,
+        # which admitted training beside the resident 30B serving model
+        # (26.7/32.6 GiB = 82%, ~6 GiB free) and passed an UNREADABLE card as
+        # free. Two thresholds for one question drift; unknown is not free.
+        if self.memory_admission is None:
+            return False, "memory admission unavailable -- refusing to train blind"
+        return self.memory_admission
 
 
 # ============================================================================
@@ -455,6 +468,7 @@ class ResourceMonitor:
 
         # Try GPU metrics
         snapshot.gpu_percent, snapshot.gpu_memory_percent = await self._get_gpu_metrics()
+        snapshot.memory_admission = await memory_admission()
 
         return snapshot
 

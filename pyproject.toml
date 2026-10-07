@@ -67,6 +67,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    # Reactor-Core API server (reactor_core/api/server.py, run_reactor.py).
+    # The server imports all of these at module level; they were never
+    # declared, so no environment built from this file could start it.
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.5",
+    "websockets>=12.0",
+]
+
 local = [
     # M1 Mac optimizations
     "mlx>=0.0.10",              # Apple MLX support

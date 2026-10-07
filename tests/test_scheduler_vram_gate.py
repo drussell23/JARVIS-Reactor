@@ -52,55 +52,55 @@ SchedulerConfig = scheduler.SchedulerConfig
 # ---------------------------------------------------------------------------
 
 
-def test_idle_gpu_holding_vram_is_refused() -> None:
-    """The exact live measurement: 0% utilization, 89.2% VRAM held."""
-    snap = ResourceSnapshot(
-        cpu_percent=5.0,
-        memory_percent=30.0,
-        gpu_percent=0.0,
-        gpu_memory_percent=100.0 * 29078 / 32607,
-    )
-    allowed, reason = snap.is_training_allowed()
-    assert allowed is False
-    assert "GPU memory too high" in reason
-    assert "89.2%" in reason
+# Memory admission is memory_guard.check_admission's verdict, carried on the
+# snapshot. The snapshot used to hold its own 85% VRAM threshold, which
+# admitted training beside the resident 30B serving model (26.7/32.6 GiB =
+# 82%) and passed an unreadable card as free.
 
 
-def test_free_card_is_admitted() -> None:
-    snap = ResourceSnapshot(
-        cpu_percent=5.0,
-        memory_percent=30.0,
-        gpu_percent=2.0,
-        gpu_memory_percent=4.0,
-    )
-    allowed, reason = snap.is_training_allowed()
-    assert allowed is True
-    assert reason == "Resources available"
+def test_guard_refusal_is_the_snapshot_refusal() -> None:
+    """The live case: 30B resident at 82% -- under the old 85% bar, refused now."""
+    reason = "VRAM occupancy 82.0% > 55.0% -- something is already resident"
+    snap = ResourceSnapshot(cpu_percent=5.0, memory_percent=30.0, gpu_percent=0.0,
+                            gpu_memory_percent=82.0, memory_admission=(False, reason))
+    assert snap.is_training_allowed() == (False, reason)
 
 
-def test_threshold_is_85_percent_by_default() -> None:
-    assert SchedulerConfig.GPU_MEMORY_THRESHOLD == pytest.approx(85.0)
+def test_guard_admission_is_the_snapshot_admission() -> None:
+    snap = ResourceSnapshot(cpu_percent=5.0, memory_percent=30.0, gpu_percent=2.0,
+                            gpu_memory_percent=4.0,
+                            memory_admission=(True, "resources available"))
+    assert snap.is_training_allowed() == (True, "resources available")
 
 
-@pytest.mark.parametrize(
-    ("vram_pct", "expected_allowed"),
-    [(84.9, True), (85.0, True), (85.1, False), (99.0, False)],
-)
-def test_gate_boundary(vram_pct: float, expected_allowed: bool) -> None:
-    snap = ResourceSnapshot(gpu_percent=0.0, gpu_memory_percent=vram_pct)
-    assert snap.is_training_allowed()[0] is expected_allowed
-
-
-def test_unknown_vram_does_not_block() -> None:
-    """No GPU / no nvidia-smi ⇒ None ⇒ the gate abstains (CPU-only hosts
-    must still be able to train)."""
+def test_no_guard_verdict_refuses() -> None:
+    """Unknown is not free: a snapshot whose admission was never taken refuses.
+    (A CPU-only host still trains -- the guard itself admits when it can read
+    host memory and there is no card; only an UNTAKEN verdict refuses.)"""
     snap = ResourceSnapshot(gpu_percent=None, gpu_memory_percent=None)
-    assert snap.is_training_allowed()[0] is True
+    allowed, reason = snap.is_training_allowed()
+    assert allowed is False and "blind" in reason
+
+
+def test_scheduler_carries_no_vram_threshold_of_its_own() -> None:
+    assert not hasattr(SchedulerConfig, "GPU_MEMORY_THRESHOLD")
+
+
+def test_memory_admission_delegates_to_the_guard(monkeypatch) -> None:
+    class Guard:
+        @staticmethod
+        def check_admission():
+            return type("A", (), {"allowed": False, "reason": "occupied"})()
+    monkeypatch.setattr(scheduler, "_load_memory_guard", lambda: Guard)
+    assert asyncio.run(scheduler.memory_admission()) == (False, "occupied")
+    monkeypatch.setattr(scheduler, "_load_memory_guard", lambda: None)
+    assert asyncio.run(scheduler.memory_admission()) is None
 
 
 def test_utilization_gate_still_independent() -> None:
     """A busy-but-empty card is still refused by the older gate."""
-    snap = ResourceSnapshot(gpu_percent=99.0, gpu_memory_percent=1.0)
+    snap = ResourceSnapshot(gpu_percent=99.0, gpu_memory_percent=1.0,
+                            memory_admission=(True, "resources available"))
     allowed, reason = snap.is_training_allowed()
     assert allowed is False
     assert "GPU usage too high" in reason

@@ -2343,6 +2343,16 @@ async def get_experience_count():
     return ExperienceCountResponse(count=count, last_ingested=last)
 
 
+@app.get("/api/v1/experiences/receiver", tags=["Experiences"])
+async def get_experience_receiver_metrics():
+    """What the Trinity experience receiver has seen: events read from the
+    file streams (incl. O+V's tailed JSONL), ingested, deduplicated, flushed.
+    The count above only covers HTTP-streamed experiences."""
+    from reactor_core.integration.trinity_experience_receiver import get_experience_receiver
+    receiver = await get_experience_receiver()
+    return receiver.get_metrics()
+
+
 # ============================================================================
 # Corrections Endpoints (JARVIS-Prime → Reactor-Core)
 # ============================================================================
@@ -2630,6 +2640,20 @@ async def run_training_job(job_id: str) -> None:
     job = await job_manager.get_job(job_id)
     if not job:
         logger.error(f"[Pipeline] Job not found for dispatch: {job_id}")
+        return
+
+    # Every training path ends here -- the scheduler's cron and experience
+    # triggers AND the /api/v1/train(ing/trigger) endpoints, which had no
+    # memory check at all. So the admission is taken HERE, at dispatch, from
+    # the single authority, rather than trusted from whoever queued the job:
+    # a job admitted at queue time can find the serving model reloaded by the
+    # time it runs.
+    from reactor_core.api.scheduler import memory_admission  # noqa: PLC0415
+    verdict = await memory_admission()
+    if verdict is None or not verdict[0]:
+        reason = verdict[1] if verdict else "memory admission unavailable -- refusing to train blind"
+        logger.warning(f"[Pipeline] Job {job_id} refused at dispatch: {reason}")
+        await job_manager.fail_job(job_id, f"refused: {reason}")
         return
 
     mode = _normalize_training_mode(job.get("mode"))

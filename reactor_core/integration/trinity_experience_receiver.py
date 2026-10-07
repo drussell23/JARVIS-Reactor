@@ -519,8 +519,28 @@ FILE_POLL_INTERVAL = float(os.getenv("EXPERIENCE_FILE_POLL_INTERVAL", "5.0"))
 FLUSH_THRESHOLD = int(os.getenv("EXPERIENCE_FLUSH_THRESHOLD", "100"))
 MAX_BATCH_SIZE = int(os.getenv("EXPERIENCE_MAX_BATCH_SIZE", "500"))
 
+# Append-only experience streams, read by TAILING (never deleted). O+V's
+# trajectory recorder writes one canonical ExperienceEvent per line to
+# experience_YYYYMMDD.jsonl -- the same files GRPO's preflight and trainer read
+# as their corpus. The *.json path below deletes what it processes; pointed at
+# these files it would destroy the corpus, so they get their own reader with a
+# persisted per-file byte offset instead.
+JSONL_PATTERNS = tuple(
+    p.strip() for p in os.getenv("TRINITY_JSONL_PATTERNS", "experience_*.jsonl").split(",") if p.strip()
+)
+JSONL_OFFSETS_FILE = EXPERIENCE_QUEUE_DIR / "jsonl_offsets.json"
+JSONL_MAX_READ_BYTES = int(os.getenv("TRINITY_JSONL_MAX_READ_BYTES", str(8 * 1024 * 1024)))
+
+# Ingestion is not a training decision. A flush hands experiences to the
+# unified trainer's buffer; with autotrain on, crossing its threshold starts a
+# training cycle from that buffer (itself memory-admitted). Default OFF:
+# training is started by the scheduler / API, which own the policy.
+RECEIVER_AUTOTRAIN = os.getenv("TRINITY_RECEIVER_AUTOTRAIN", "false").strip().lower() in ("1", "true", "yes", "on")
+
 # Event types we process
 EXPERIENCE_EVENT_TYPES = {
+    # O+V trajectory recorder: one generation + its verdict (canonical ExperienceEvent)
+    "interaction",
     "learning_signal",
     "interaction_end",
     "correction",
@@ -970,11 +990,17 @@ class TrinityExperienceReceiver:
                 for dir_path in [TRINITY_EVENTS_DIR, JARVIS_EVENTS_DIR, EXPERIENCE_QUEUE_DIR]:
                     if dir_path.exists():
                         await self._scan_directory(dir_path)
+                        await self._scan_jsonl(dir_path)
 
                 # Check if we should flush
+                # Size checked under the lock, flush called OUTSIDE it:
+                # _flush_buffer takes _buffer_lock itself and asyncio.Lock is
+                # not re-entrant, so flushing while holding it deadlocked this
+                # loop the first time a buffer ever filled.
                 async with self._buffer_lock:
-                    if len(self._buffer) >= FLUSH_THRESHOLD:
-                        await self._flush_buffer()
+                    due = len(self._buffer) >= FLUSH_THRESHOLD
+                if due:
+                    await self._flush_buffer()
 
             except asyncio.CancelledError:
                 break
@@ -996,6 +1022,68 @@ class TrinityExperienceReceiver:
 
         except Exception as e:
             self.logger.error(f"Directory scan error for {dir_path}: {e}")
+
+    def _load_jsonl_offsets(self) -> Dict[str, int]:
+        try:
+            data = json.loads(JSONL_OFFSETS_FILE.read_text(encoding="utf-8"))
+            return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_jsonl_offsets(self) -> None:
+        tmp = JSONL_OFFSETS_FILE.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(self._jsonl_offsets), encoding="utf-8")
+            os.replace(tmp, JSONL_OFFSETS_FILE)
+        except OSError as e:
+            self.logger.debug(f"Could not persist JSONL offsets: {e}")
+
+    @staticmethod
+    def _read_new_lines(path: Path, offset: int) -> Tuple[List[str], int]:
+        """Complete lines appended since ``offset`` (bounded per call), and the
+        new offset. A trailing partial line is left for the next scan; a file
+        shorter than the offset was rotated/truncated and is read from 0."""
+        size = path.stat().st_size
+        if size < offset:
+            offset = 0
+        if size == offset:
+            return [], offset
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(JSONL_MAX_READ_BYTES)
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return [], offset
+        lines = chunk[: end + 1].decode("utf-8", errors="replace").splitlines()
+        return [ln for ln in lines if ln.strip()], offset + end + 1
+
+    async def _scan_jsonl(self, dir_path: Path) -> None:
+        """Tail append-only experience streams. Never deletes or renames them."""
+        if not hasattr(self, "_jsonl_offsets"):
+            self._jsonl_offsets = self._load_jsonl_offsets()
+        changed = False
+        try:
+            for pattern in JSONL_PATTERNS:
+                for path in sorted(dir_path.glob(pattern)):
+                    key = str(path.resolve())
+                    lines, new_off = await asyncio.to_thread(
+                        self._read_new_lines, path, self._jsonl_offsets.get(key, 0))
+                    for line in lines:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            self._metrics.errors += 1
+                            continue
+                        if event.get("event_type", event.get("type", "")) in EXPERIENCE_EVENT_TYPES:
+                            await self._process_event(event)
+                    if new_off != self._jsonl_offsets.get(key):
+                        self._jsonl_offsets[key] = new_off
+                        self._metrics.files_processed += 1 if lines else 0
+                        changed = True
+        except Exception as e:
+            self.logger.error(f"JSONL scan error for {dir_path}: {e}")
+        if changed:
+            await asyncio.to_thread(self._save_jsonl_offsets)
 
     async def _process_file(self, file_path: Path) -> None:
         """Process a single event file."""
@@ -1267,9 +1355,10 @@ class TrinityExperienceReceiver:
         self._metrics.last_event_time = time.time()
 
         # Check flush threshold
-        async with self._buffer_lock:
-            if len(self._buffer) >= MAX_BATCH_SIZE:
-                await self._flush_buffer()
+        async with self._buffer_lock:   # see _watch_loop: never flush while holding it
+            due = len(self._buffer) >= MAX_BATCH_SIZE
+        if due:
+            await self._flush_buffer()
 
     async def _flush_buffer(self, force: bool = False) -> None:
         """
@@ -1310,7 +1399,7 @@ class TrinityExperienceReceiver:
                 from reactor_core.training.unified_pipeline import get_unified_trainer_async
 
                 trainer = await get_unified_trainer_async()
-                await trainer.add_experiences(experiences, flush=True)
+                await trainer.add_experiences(experiences, flush=RECEIVER_AUTOTRAIN)
 
             # Success - update metrics and circuit breaker
             self._metrics.last_flush_time = time.time()

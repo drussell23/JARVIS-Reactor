@@ -576,6 +576,18 @@ class UnifiedTrainingPipeline:
         This converts buffered experiences to the format expected by
         _build_dataset and triggers a training cycle.
         """
+        # This path trains IMMEDIATELY when ingestion crosses a threshold, so
+        # it answers to the same memory authority as every scheduled or API
+        # job (training.memory_guard). Refused -> the buffer is kept and the
+        # next threshold crossing asks again; nothing is dropped. Without
+        # this, real-time ingestion would start an SFT run beside the
+        # resident serving model.
+        from reactor_core.training import memory_guard  # noqa: PLC0415
+        adm = await asyncio.to_thread(memory_guard.check_admission)
+        if not adm.allowed:
+            logger.warning(f"[Pipeline] Experience-triggered training deferred: {adm.reason}")
+            return None
+
         async with self._experience_lock:
             if len(self._experience_buffer) < self.config.min_samples:
                 logger.info(
