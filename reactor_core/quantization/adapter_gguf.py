@@ -242,3 +242,32 @@ async def convert_adapter_to_gguf(
         success=True, output_path=out_path, quantized_size_mb=size_mb,
         kind=kind, command=argv, log_tail=tail,
     )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """``python adapter_gguf.py ADAPTER_DIR OUT.gguf`` -- the cross-repo contract.
+
+    Stdlib-only and runnable BY PATH, so a caller (O+V's training handoff)
+    does not pay ``reactor_core/__init__``'s eager training-stack import to
+    convert 25 MB. Prints one JSON object; exit 0 = converted, 1 = refused or
+    failed (the JSON says which).
+    """
+    import argparse
+    import json
+
+    ap = argparse.ArgumentParser(description="Convert a PEFT LoRA adapter to a GGUF adapter")
+    ap.add_argument("adapter_dir")
+    ap.add_argument("out_path")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    res = asyncio.run(convert_adapter_to_gguf(Path(args.adapter_dir), Path(args.out_path)))
+    print(json.dumps({
+        "success": res.success, "output_path": str(res.output_path) if res.output_path else None,
+        "error": res.error, "size_mb": round(res.quantized_size_mb, 2), "kind": res.kind.value,
+        "log_tail": res.log_tail[-5:],
+    }))
+    return 0 if res.success else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
