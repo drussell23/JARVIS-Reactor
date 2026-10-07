@@ -791,8 +791,10 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
             gc.pad_token_id = pad
         return gc
 
-    model.eval()
-    with torch.no_grad():
+    from reactor_core.training.grpo_pipeline import rollout_mode  # noqa: PLC0415
+
+    # Timed in the mode training samples in -- the same context manager.
+    with rollout_mode(model), torch.no_grad():
         def gen(length: int, new: int) -> Callable[[], Any]:  # noqa: E306
             gc = gc_for(new)
             if gc is not None:

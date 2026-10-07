@@ -34,6 +34,7 @@ otherwise would produce a config that silently ignores them:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -983,6 +984,48 @@ def load_training_model(
     return model
 
 
+@contextlib.contextmanager
+def rollout_mode(model: Any) -> Any:
+    """Sample rollouts in eval mode; restore the caller's mode after.
+
+    transformers drops the KV cache in any layer that is
+    ``gradient_checkpointing and self.training`` (modeling_layers:
+    "Caching is incompatible with gradient checkpointing"), and TRL calls
+    ``generate`` from inside ``training_step``, after ``model.train()``.
+    Training-time rollouts therefore re-ran the whole prompt+completion
+    through every layer for EACH new token -- quadratic in length. Live
+    2026-10-07: 1422 s for one step at a 512-token window, ~2.8 s per
+    decoded token against 0.80 s with the cache, and the gap grows with
+    the window. Sampling needs no autograd and no dropout; the policy's
+    log-probs are recomputed by the trainer's own forward afterwards, so
+    eval mode changes the speed of the rollout, not what is learned from it.
+    """
+    was_training = bool(getattr(model, "training", False))
+    model.eval()
+    try:
+        yield model
+    finally:
+        if was_training:
+            model.train()
+
+
+def rollout_trainer_class() -> Any:
+    """``GRPOTrainer`` whose rollouts run under :func:`rollout_mode`.
+
+    One override at the one generation seam every rollout passes through
+    (``_generate_single_turn``: plain and tool-calling turns alike), so the
+    algorithm the calibration times is the algorithm training runs.
+    """
+    from trl import GRPOTrainer  # noqa: PLC0415
+
+    class RolloutGRPOTrainer(GRPOTrainer):
+        def _generate_single_turn(self, *args: Any, **kwargs: Any) -> Any:
+            with rollout_mode(self.model):
+                return super()._generate_single_turn(*args, **kwargs)
+
+    return RolloutGRPOTrainer
+
+
 def build_trainer(
     model_id: str,
     telemetry_dir: Path,
@@ -1004,8 +1047,6 @@ def build_trainer(
     see there for why the gate's selection is passed in rather than
     recomputed.
     """
-    from trl import GRPOTrainer  # noqa: PLC0415
-
     from reactor_core.training.grpo_reward import candidate_reward  # noqa: PLC0415
 
     count_tokens: Optional[Callable[[str], int]] = None
@@ -1035,7 +1076,7 @@ def build_trainer(
         kwargs["peft_config"] = build_lora_config(model_id)
     # A model OBJECT, never the id: see load_training_model for the host-RAM
     # OOM and the double-quantization this avoids.
-    return GRPOTrainer(
+    return rollout_trainer_class()(
         model=load_training_model(
             model_id, use_qlora=use_qlora,
             device_map=device_map, gptq_backend=gptq_backend,
@@ -1058,5 +1099,7 @@ __all__ = [
     "build_prompt_dataset",
     "build_qlora_config",
     "build_trainer",
+    "rollout_mode",
+    "rollout_trainer_class",
     "iter_trajectory_rows",
 ]
