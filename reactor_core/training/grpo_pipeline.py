@@ -273,6 +273,66 @@ def is_genuine_row(meta: Optional[Dict[str, Any]]) -> bool:
         return True
 
 
+#: Where O+V's landing-provenance labeler writes (a SUBDIRECTORY of the corpus
+#: dir: this reader globs ``*.jsonl`` non-recursively and must never read a
+#: label as a row). Overridable for a corpus copied elsewhere.
+_ENV_LANDING_LABELS = "REACTOR_LANDING_LABELS_PATH"
+
+
+def load_landing_labels(telemetry_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """``subject_event_id -> latest landing label`` from O+V's provenance ledger.
+
+    The ledger is written and VERIFIED by its single owner (JARVIS'
+    ``observability.landing_provenance``: content-hash proof against the
+    promoted branch, hash-chained, MAC'd). A row that does not chain to its
+    predecessor is skipped here too, so a truncated or hand-edited ledger
+    cannot promote a row; the MAC needs the operator's secret and is checked
+    by the owner. Absent ledger -> no labels. NEVER raises.
+    """
+    raw = os.environ.get(_ENV_LANDING_LABELS, "").strip()
+    path = Path(raw) if raw else Path(telemetry_dir) / "provenance" / "landing_labels.jsonl"
+    latest: Dict[str, Dict[str, Any]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return latest
+    prev = None
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            payload = rec["payload"]
+            if prev is not None and rec.get("prev_hash") != prev:
+                logger.warning("[GRPO] landing ledger chain broken at %s; later labels ignored",
+                               payload.get("label_id"))
+                break
+            prev = rec.get("record_hash")
+            latest[str(payload["subject_event_id"])] = payload
+        except (ValueError, KeyError, TypeError):
+            continue
+    return latest
+
+
+def apply_landing_label(row: Dict[str, Any], label: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """A candidate PROVEN to be the content on the promoted branch, and still
+    there, is a success with full confidence -- the strongest label the corpus
+    can carry. A landed-then-undone candidate (reverted hollow test) keeps its
+    recorded outcome and is marked, never promoted. Pure."""
+    if not label or not label.get("landed"):
+        return row
+    meta = dict(row.get("metadata") or {})
+    meta["landed_commit"] = label.get("commit_sha", "")
+    meta["landed"] = True
+    meta["landing_surviving"] = bool(label.get("surviving"))
+    out = dict(row)
+    if label.get("surviving"):
+        out["outcome"] = "success"
+        out["confidence"] = 1.0
+        meta["should_train"] = True
+        meta["verdict_source"] = "landing_provenance"
+    out["metadata"] = meta
+    return out
+
+
 def iter_trajectory_rows(
     telemetry_dir: Path,
     *,
@@ -297,6 +357,9 @@ def iter_trajectory_rows(
     avoid.
     """
     seen_keys: set = set()
+    # Joined HERE, the one reader every training path uses, so preflight, the
+    # GRPO dataset and the runner all see the same landed truth.
+    landing = load_landing_labels(Path(telemetry_dir))
     for f in sorted(Path(telemetry_dir).glob("*.jsonl")):
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
@@ -328,6 +391,7 @@ def iter_trajectory_rows(
                 continue
             if not row.get("user_input") or not row.get("assistant_output"):
                 continue
+            row = apply_landing_label(row, landing.get(str(row.get("event_id", ""))))
             if trainable_only and not row.get("metadata", {}).get("should_train", False):
                 continue
             meta = row.get("metadata") or {}
