@@ -341,6 +341,53 @@ def _make_truncation_callback(*, mask_truncated: bool, patience: int = 0) -> Any
     return _TruncationCallback()
 
 
+def _make_deadline_callback(deadline_epoch: float, *, clock: Callable[[], float] = time.time) -> Any:
+    """Stop at a step boundary when the NEXT step cannot finish in time.
+
+    The step count is fitted to the budget from a calibrated estimate, but an
+    estimate is not a guarantee: a run whose steps prove slower than measured
+    reaches its caller's timeout mid-step, is killed, and saves NOTHING
+    (``save_strategy="no"``; the adapter is written after ``train()``
+    returns). This enforces the budget the estimate only predicted.
+
+    Judged on MEASURED steps, adaptively: the next step is assumed to take as
+    long as the slowest of the last ``num_iterations`` (a group's rollout is
+    generated once and reused for that many optimiser steps, so steps
+    alternate between "generate + train" and "train"; the slow kind must be
+    the one assumed). Before any step has finished there is nothing to
+    measure, so only a deadline already passed stops it. Asks the Trainer to
+    stop -- never kills -- so ``train()`` returns and the adapter is saved.
+    """
+    from transformers import TrainerCallback  # noqa: PLC0415
+
+    class _DeadlineCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.tripped: Optional[str] = None
+            self._began: Optional[float] = None
+            self._recent: List[float] = []
+
+        def on_step_begin(self, args, state, control, **kwargs):  # noqa: ANN001
+            self._began = clock()
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
+            now = clock()
+            if self._began is not None:
+                window = max(1, int(getattr(args, "num_iterations", 1) or 1))
+                self._recent = (self._recent + [now - self._began])[-window:]
+            nxt = max(self._recent) if self._recent else 0.0
+            if self.tripped is None and now + nxt > deadline_epoch:
+                self.tripped = (f"step {getattr(state, 'global_step', '?')}: the next step "
+                                f"(~{nxt:.0f}s, slowest of the last {len(self._recent)}) would end "
+                                f"{now + nxt - deadline_epoch:.0f}s past the deadline")
+                logger.warning("[runner] STOPPING at a step boundary so the adapter is saved: %s",
+                               self.tripped)
+                control.should_training_stop = True
+            return control
+
+    return _DeadlineCallback()
+
+
 def child_argv(rung_index: int, json_out: str,
                resolved: Optional[Dict[str, str]] = None) -> List[str]:
     """This process's own argv, aimed at exactly one rung.
@@ -591,6 +638,7 @@ def train_with_ladder(
     use_qlora: bool,
     config_overrides: Dict[str, Any],
     dry_run: bool,
+    deadline_epoch: float = 0.0,
 ) -> Dict[str, Any]:
     """Walk the ladder until one rung completes. Returns a report."""
     from reactor_core.training import grpo_pipeline  # noqa: PLC0415
@@ -656,6 +704,10 @@ def train_with_ladder(
                         trainer.args, "mask_truncated_completions", False)),
                 )
                 trainer.add_callback(truncation)
+                deadline = (_make_deadline_callback(deadline_epoch)
+                            if deadline_epoch > 0 else None)
+                if deadline is not None:
+                    trainer.add_callback(deadline)
                 result = trainer.train()
                 attempt["metrics"] = getattr(result, "metrics", None)
                 attempt["global_step"] = int(
@@ -663,6 +715,7 @@ def train_with_ladder(
                 )
                 attempt["guard_tripped"] = callback.tripped
                 attempt["truncation_tripped"] = truncation.tripped
+                attempt["deadline_tripped"] = deadline.tripped if deadline is not None else None
                 attempt["clipped_ratio"] = truncation.last_ratio
         except Exception as exc:  # noqa: BLE001
             attempt["error"] = f"{type(exc).__name__}: {exc}"[:500]
@@ -896,6 +949,7 @@ def run_calibration_child(guard: Any) -> Dict[str, Any]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    started_at = time.time()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -992,6 +1046,10 @@ def main(argv: Optional[List[str]] = None) -> int:
              "window (env REACTOR_GRPO_VRAM_HEADROOM_GIB)",
     )
     ap.add_argument("--calibrate", action="store_true", help=argparse.SUPPRESS)
+    # Absolute (epoch s): the moment training must stop at a step boundary.
+    # Set by the parent from ITS start + --time-budget-s and handed to every
+    # child, so a rung started late does not get a fresh budget.
+    ap.add_argument("--deadline-epoch", type=float, default=0.0, help=argparse.SUPPRESS)
     ap.add_argument("--skip-admission", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and validate everything, take no step")
@@ -1136,6 +1194,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write(args.json_out, report)
         return EXIT_OK
     resolved: Dict[str, str] = {}
+    if args.time_budget_s > 0 and args.deadline_epoch <= 0:
+        # The budget covers the run from HERE; the caller's own reserve
+        # (calibration, model load, saving) sits beyond it.
+        args.deadline_epoch = started_at + args.time_budget_s
+    if args.deadline_epoch > 0:
+        resolved["--deadline-epoch"] = repr(args.deadline_epoch)
+        report["deadline_epoch"] = args.deadline_epoch
     if str(args.max_completion_length).strip().lower() == "auto":
         cal_report = run_calibration_child(guard)
         if "calibration" not in cal_report:
@@ -1255,6 +1320,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 use_qlora=not args.no_qlora,
                 config_overrides=overrides,
                 dry_run=args.dry_run,
+                deadline_epoch=args.deadline_epoch,
             )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[runner] training failed")
