@@ -110,3 +110,19 @@ def test_the_gate_counts_only_current_contracts_and_says_which(tmp_path, monkeyp
     rep = pf.analyse(_corpus(tmp_path, rows), min_group=2, trainable_only=True)
     assert rep["rows"] == 2 and rep["prompts"] == 1
     assert rep["output_schemas"] == ["2b.1-diff"]
+
+
+def test_tagged_rows_accumulate_across_session_files_without_duplicates(tmp_path, monkeypatch):
+    """The corpus is append-only across sessions (one file per writer, many
+    sessions per file). The reader has no session boundary: rows from an
+    earlier, deferred session are read again next time, and a candidate
+    re-recorded later is still one row."""
+    monkeypatch.setenv("REACTOR_GRPO_OUTPUT_SCHEMAS", "2b.1-diff")
+    d = tmp_path / "events"
+    d.mkdir()
+    s1 = [_row(f"op-s1-{i}", f"v = {i}\n", "2b.1-diff") for i in range(14)]
+    s2 = [_row("op-s2-0", "w = 0\n", "2b.1-diff"), s1[3]]          # s1[3] recorded again
+    (d / "session1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in s1), encoding="utf-8")
+    (d / "session2.jsonl").write_text("".join(json.dumps(r) + "\n" for r in s2), encoding="utf-8")
+    ops = _ops(d)
+    assert len(ops) == 15 and len(set(ops)) == 15
