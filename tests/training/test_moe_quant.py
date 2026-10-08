@@ -314,7 +314,7 @@ def test_end_to_end_load_quantizes_experts_and_still_trains(tiny_checkpoint) -> 
     assert isinstance(model.model.layers[0].self_attn.q_proj, bnb.nn.Linear4bit)
     leftovers = [n for n, p in model.named_parameters() if p.ndim == 3]
     assert leftovers == [], f"bf16 fused experts survived: {leftovers}"
-    assert model.config._experts_implementation == "eager"
+    assert model.config._experts_implementation == mq.experts_implementation()
     assert getattr(model, "is_loaded_in_4bit", False) is True
 
     # 2. the forward agrees with the bf16 model

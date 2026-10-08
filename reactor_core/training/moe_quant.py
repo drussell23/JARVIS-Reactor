@@ -40,13 +40,45 @@ layout and numerics ``Linear4bit`` would give the same matrix. It IS the
 3-D-to-2-D unbinding, done at the one moment the fused tensor exists on the
 device and before it is retained anywhere.
 
+## Dispatch: grouped, one host sync per layer (2026-10-08)
+
+The eager loop paid ~5 host<->device synchronisations per ACTIVATED EXPERT
+per layer -- ``torch.where`` (a nonzero), ``expert_idx == num_experts`` (a
+tensor compared as a Python bool), ``int(index.item())`` here, and
+bitsandbytes' per-expert dequantize -- plus ~11 kernel launches each.
+Profiled live on the 30B, 16 sequences decoding: 9,088-31,461 syncs per
+token, wall = 44 us x syncs at every context, the GPU idle 73-83% of the
+time. The count followed how many distinct experts the group routed to per
+layer, not the context length.
+
+So the stack is stored FUSED: one packed NF4 buffer per projection, every
+expert an aligned row (NF4 blocks of 64 never straddle experts, nor do the
+nested-statistics blocks of 256 -- checked at quantization, and a shape that
+would straddle them is quantized without nesting instead). The registered
+experts implementation :func:`grouped_experts_forward`:
+
+1. sorts the (token, expert) assignments by expert on the device;
+2. reads the per-expert counts to the host ONCE per layer -- the only sync;
+3. dequantizes ONLY the experts actually hit, all in one bitsandbytes call
+   (their rows gathered by an on-device index -- no per-expert indexing),
+   in as many chunks as free device memory allows (:func:`_dequant_chunk`),
+   halving a chunk that still hits OOM;
+4. runs transformers' own ``_grouped_linear`` for both projections and the
+   model's own gate, then restores the order and reduces exactly as
+   transformers' ``grouped_mm`` path does.
+
+Under autograd the projection is :class:`_GroupedExpertLinear`: it keeps
+only the offsets and the hit indices and re-dequantizes in the backward, so
+no layer's bf16 experts are retained -- the reason ``_ExpertMatmul`` exists,
+kept for the grouped path. ``REACTOR_MOE_EXPERTS_IMPL=eager`` restores the
+per-expert loop (``stack[i]`` still answers it).
+
 ## Constraints that are enforced, not documented
 
-* **Eager dispatch only.** ``grouped_mm`` / ``batched_mm`` consume the whole
-  3-D tensor; only the eager implementation indexes per expert. The
-  quantizer pins ``_experts_implementation = "eager"`` on every config that
-  owns an expert module after loading. A kernel that read packed bytes as
-  bf16 would not fail loudly; it would train garbage.
+* **A known dispatch only.** ``grouped_mm`` / ``batched_mm`` consume a dense
+  3-D tensor and would read packed bytes as bf16 -- not loudly; they would
+  train garbage. The quantizer pins this module's implementation (or eager)
+  on every config that owns an expert module after loading.
 * **Every discovered expert tensor must end up quantized.** If one is still a
   bf16 ``Parameter`` after loading, the quantizer raises. A model that is
   silently half-quantized is the failure this file exists to end.
@@ -65,6 +97,7 @@ it off with this quantizer.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -83,6 +116,14 @@ QUANT_METHOD = "bnb_4bit_moe"
 
 #: ``Linear4bit``'s default; ``BitsAndBytesConfig`` carries no blocksize.
 DEFAULT_BLOCKSIZE = 64
+
+#: The experts implementation this module registers, and the env that may
+#: choose eager instead.
+EXPERTS_IMPL = "packed_nf4_grouped"
+_ENV_EXPERTS_IMPL = "REACTOR_MOE_EXPERTS_IMPL"
+#: Share of the device memory free at the moment a layer runs that one
+#: chunk of dequantized experts may take.
+_ENV_DEQUANT_FRACTION = "REACTOR_MOE_DEQUANT_FRACTION"
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +227,8 @@ class _PackedExpertWeight(torch.Tensor):
     @staticmethod
     def __new__(cls, stack: "QuantizedExpertStack", index: int) -> "_PackedExpertWeight":
         shape = torch.Size(tuple(stack.shape[1:]))
-        param = stack.experts[index]
         obj = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
-            cls, shape, dtype=stack.dtype, device=param.device,
+            cls, shape, dtype=stack.dtype, device=stack.device,
             requires_grad=False,
         )
         obj._stack = stack
@@ -205,7 +245,7 @@ class _PackedExpertWeight(torch.Tensor):
             x, w = args[0], args[1]
             if len(args) > 2 and args[2] is not None:
                 raise NotImplementedError("quantized experts carry no bias")
-            return _ExpertMatmul.apply(x, w._stack.experts[w._index].data,
+            return _ExpertMatmul.apply(x, w._stack.packed[w._index],
                                        w._stack, w._index)
         # Anything else gets the real tensor. Correctness first: an
         # unrecognised op must see the weight, not a hollow shell.
@@ -232,19 +272,35 @@ class _PackedExpertWeight(torch.Tensor):
 
 
 class QuantizedExpertStack(nn.Module):
-    """``stack[i]`` is the 2-D weight of expert ``i``.
+    """``stack[i]`` is the 2-D weight of expert ``i``; ``stack.gather(idx)``
+    is the weights of the experts in ``idx``, ``[len(idx), out, in]``, from
+    ONE dequantize call.
 
-    Holds one ``Params4bit`` per expert. Replaces a fused ``[E, out, in]``
-    parameter in place, on the same attribute, so the owning module's
-    forward -- which indexes that attribute by expert -- runs unchanged.
+    Storage is fused: ``packed`` is ``[E, out*in/2]`` NF4 bytes (a frozen
+    Parameter, so it moves and counts with the model), ``absmax`` the
+    per-block scales ``[E, blocks]`` -- uint8 when the statistics are nested,
+    with ``absmax2`` ``[E, blocks/blocksize2]`` and one ``offset`` -- and the
+    codebooks. Replaces a fused ``[E, out, in]`` parameter in place, on the
+    same attribute.
     """
 
-    def __init__(self, experts: List[nn.Parameter], shape: torch.Size,
+    def __init__(self, packed: torch.Tensor, quant_state: Any, shape: torch.Size,
                  dtype: torch.dtype) -> None:
         super().__init__()
-        if len(experts) != int(shape[0]):
-            raise ValueError(f"{len(experts)} experts for a stack of shape {tuple(shape)}")
-        self.experts = nn.ParameterList(experts)
+        e = int(shape[0])
+        qs = quant_state
+        self.packed = nn.Parameter(packed.reshape(e, -1), requires_grad=False)
+        self.register_buffer("absmax", qs.absmax.reshape(e, -1))
+        self.register_buffer("code", qs.code)
+        self.nested = bool(getattr(qs, "nested", False) and qs.state2 is not None)
+        if self.nested:
+            self.register_buffer("absmax2", qs.state2.absmax.reshape(e, -1))
+            self.register_buffer("code2", qs.state2.code)
+            self.register_buffer("offset", torch.as_tensor(qs.offset))
+            self.blocksize2 = int(qs.state2.blocksize)
+            self.absmax2_dtype = qs.state2.dtype
+        self.blocksize = int(qs.blocksize)
+        self.quant_type = str(qs.quant_type)
         self._shape = torch.Size(shape)
         self._dtype = dtype
 
@@ -258,40 +314,76 @@ class QuantizedExpertStack(nn.Module):
         blocksize: int = DEFAULT_BLOCKSIZE,
         quant_storage: torch.dtype = torch.uint8,
     ) -> "QuantizedExpertStack":
-        """Quantize a fused ``[E, out, in]`` tensor expert by expert.
+        """Quantize a fused ``[E, out, in]`` tensor in one call, with every
+        expert an aligned row of the result.
 
-        Each expert is a contiguous 2-D copy while it is quantized, then
-        only its packed bytes and quant state survive; the fused input is
-        the caller's to drop.
+        NF4 blocks run along the flattened tensor, so an expert of ``out*in``
+        elements owns whole blocks when ``out*in`` is a multiple of
+        ``blocksize`` (refused otherwise: a block straddling two experts has
+        no per-expert meaning). The nested statistics group ``blocksize2``
+        blocks; when an expert's block count is not a multiple of it, the
+        statistics are kept un-nested rather than shared across experts.
         """
-        import bitsandbytes as bnb  # noqa: PLC0415
+        import bitsandbytes.functional as bnbf  # noqa: PLC0415
 
         if fused.ndim != 3:
             raise ValueError(f"expected a fused [E, out, in] tensor, got shape {tuple(fused.shape)}")
         if not fused.is_floating_point():
             raise ValueError(f"expected floating weights, got {fused.dtype}")
-        experts: List[nn.Parameter] = []
-        for index in range(int(fused.shape[0])):
-            weight = fused[index].detach().contiguous()
-            param = bnb.nn.Params4bit(
-                weight, requires_grad=False, quant_type=quant_type,
-                compress_statistics=compress_statistics, blocksize=blocksize,
-                quant_storage=quant_storage,
-            ).to(weight.device)  # .to(cuda) is what triggers the quantization
-            param._is_hf_initialized = True  # never re-initialised by the loader
-            experts.append(param)
-        stack = cls(experts, fused.shape, fused.dtype)
+        if quant_storage != torch.uint8:
+            raise ValueError(f"fused expert stacks pack into uint8, not {quant_storage}")
+        e, out, inp = (int(s) for s in fused.shape)
+        per_expert = out * inp
+        if per_expert % blocksize:
+            raise ValueError(f"an expert of {out}x{inp} does not divide into {blocksize}-element "
+                             "blocks; a block would straddle two experts")
+        nest = bool(compress_statistics)
+        if nest:
+            nested_block = _nested_blocksize()
+            if (per_expert // blocksize) % nested_block:
+                logger.info("[moe-quant] %d blocks per expert do not divide into nested groups of %d; "
+                            "keeping this stack's statistics un-nested", per_expert // blocksize,
+                            nested_block)
+                nest = False
+        flat = fused.detach().reshape(e * out, inp).contiguous()
+        packed, qs = bnbf.quantize_4bit(flat, blocksize=blocksize, compress_statistics=nest,
+                                        quant_type=quant_type, quant_storage=quant_storage)
+        stack = cls(packed, qs, fused.shape, fused.dtype)
         stack._is_hf_initialized = True
         return stack
 
     # -- the protocol ------------------------------------------------------
 
+    def gather(self, index: torch.Tensor) -> torch.Tensor:
+        """The bf16 weights of the experts in ``index`` (a 1-D integer tensor
+        on this stack's device), ``[len(index), out, in]``, from ONE
+        dequantize call. Rows are gathered on the device; nothing here reads
+        a value back to the host. Allocates."""
+        import bitsandbytes.functional as bnbf  # noqa: PLC0415
+        from bitsandbytes.functional import QuantState  # noqa: PLC0415
+
+        idx = index.reshape(-1).to(device=self.packed.device, dtype=torch.long)
+        h = int(idx.numel())
+        out, inp = int(self._shape[1]), int(self._shape[2])
+        state2 = None
+        if self.nested:
+            state2 = QuantState(absmax=self.absmax2.index_select(0, idx).reshape(-1), code=self.code2,
+                                blocksize=self.blocksize2, dtype=self.absmax2_dtype)
+        qs = QuantState(absmax=self.absmax.index_select(0, idx).reshape(-1),
+                        shape=torch.Size((h * out, inp)), code=self.code, blocksize=self.blocksize,
+                        quant_type=self.quant_type, dtype=self._dtype,
+                        offset=self.offset if self.nested else None, state2=state2)
+        packed = self.packed.index_select(0, idx).reshape(-1, 1)
+        return bnbf.dequantize_4bit(packed, qs).view(h, out, inp)
+
     def dequantize(self, index: int) -> torch.Tensor:
         """The real 2-D bf16 weight of expert ``index``. Allocates."""
-        import bitsandbytes.functional as bnbf  # noqa: PLC0415
+        return self.gather(torch.arange(int(index), int(index) + 1, device=self.packed.device))[0]
 
-        param = self.experts[int(index)]
-        return bnbf.dequantize_4bit(param.data, param.quant_state)
+    @property
+    def expert_bytes(self) -> int:
+        """What one dequantized expert costs."""
+        return int(self._shape[1]) * int(self._shape[2]) * torch.tensor([], dtype=self._dtype).element_size()
 
     def __getitem__(self, index: Any) -> torch.Tensor:
         """The expert's weight -- expanded lazily, and never retained.
@@ -312,7 +404,7 @@ class QuantizedExpertStack(nn.Module):
         return _PackedExpertWeight(self, index)
 
     def __len__(self) -> int:
-        return len(self.experts)
+        return int(self._shape[0])
 
     @property
     def shape(self) -> torch.Size:
@@ -324,7 +416,7 @@ class QuantizedExpertStack(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self.experts[0].device
+        return self.packed.device
 
     def forward(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:  # pragma: no cover
         raise TypeError("QuantizedExpertStack is indexed per expert (stack[i]); it is not called")
@@ -332,6 +424,159 @@ class QuantizedExpertStack(nn.Module):
     def extra_repr(self) -> str:
         return (f"experts={len(self)}, expert_shape={tuple(self._shape[1:])}, "
                 f"dequantizes_to={self._dtype}")
+
+
+# ---------------------------------------------------------------------------
+# The grouped experts implementation
+# ---------------------------------------------------------------------------
+
+
+def _nested_blocksize() -> int:
+    """The block size bitsandbytes groups nested statistics in, asked of
+    bitsandbytes itself (a probe quantization) rather than assumed."""
+    import bitsandbytes.functional as bnbf  # noqa: PLC0415
+
+    global _NESTED_BLOCKSIZE
+    if _NESTED_BLOCKSIZE is None:
+        probe = torch.zeros(DEFAULT_BLOCKSIZE, 1)
+        _, qs = bnbf.quantize_4bit(probe, blocksize=DEFAULT_BLOCKSIZE, compress_statistics=True)
+        _NESTED_BLOCKSIZE = int(qs.state2.blocksize)
+    return _NESTED_BLOCKSIZE
+
+
+_NESTED_BLOCKSIZE: Optional[int] = None
+
+
+class _GroupedExpertLinear(torch.autograd.Function):
+    """``x_g @ W[e]^T`` for each expert's row range, W gathered from 4-bit.
+
+    Keeps the offsets and the hit indices, never the dequantized weights:
+    the backward gathers them again. The experts are frozen, so only
+    ``grad_input`` flows back -- the same economy as :class:`_ExpertMatmul`,
+    for a whole chunk of experts at once.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, offsets: torch.Tensor, stack: "QuantizedExpertStack",
+                hit: torch.Tensor) -> torch.Tensor:
+        from transformers.integrations.moe import _grouped_linear  # noqa: PLC0415
+
+        weight = stack.gather(hit)
+        out = _grouped_linear(x, weight, offsets)
+        del weight
+        ctx.save_for_backward(offsets, hit)
+        ctx.stack = stack
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # noqa: ANN001
+        from transformers.integrations.moe import _grouped_linear  # noqa: PLC0415
+
+        offsets, hit = ctx.saved_tensors
+        weight = ctx.stack.gather(hit)
+        # [C, out, in] is already (input_dim=out, output_dim=in) for grad_out.
+        grad_x = _grouped_linear(grad_out.contiguous(), weight, offsets, is_transposed=True)
+        del weight
+        return grad_x, None, None, None
+
+
+def _dequant_chunk(hit: int, expert_bytes: int, device: torch.device) -> int:
+    """How many hit experts one dequantize may expand at once: as many as
+    the configured share of the memory free right now holds (the device's
+    free memory plus what the caching allocator holds unused). Never fewer
+    than one; all of them off-GPU."""
+    if hit <= 0:
+        return 0
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return hit
+    try:
+        frac = float(os.environ.get(_ENV_DEQUANT_FRACTION, "") or 0.5)
+    except ValueError:
+        frac = 0.5
+    free, _total = torch.cuda.mem_get_info(device)
+    cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    budget = max(0.0, frac) * (free + max(0, cached))
+    return max(1, min(hit, int(budget // max(1, expert_bytes))))
+
+
+def grouped_experts_forward(self: nn.Module, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
+                            top_k_weights: torch.Tensor) -> torch.Tensor:
+    """The experts forward with one host sync per layer (module docstring).
+
+    Mirrors transformers' ``grouped_mm_experts_forward`` -- sort by expert,
+    grouped projections, the model's own gate, routing weights, restore the
+    order, reduce over top-k in fp32 -- with the weights expanded from 4-bit
+    for the hit experts only, chunked to fit."""
+    num_tokens, hidden_dim = hidden_states.shape[0], hidden_states.shape[-1]
+    num_top_k = top_k_index.shape[-1]
+    num_experts = int(self.num_experts)
+    device = hidden_states.device
+
+    expert_ids = top_k_index.reshape(-1)
+    sample_weights = top_k_weights.reshape(-1)
+    expert_ids_g, perm = torch.sort(expert_ids)
+    hidden_g = hidden_states[perm // num_top_k]
+    weights_g = sample_weights[perm]
+
+    # The one host read: how many assignments each expert received. Ids at or
+    # past num_experts (expert-parallel sentinels) sort to the tail and are
+    # left out of every group; their rows contribute zero.
+    counts = torch.bincount(expert_ids_g, minlength=num_experts)[:num_experts]
+    counts_host = counts.tolist()
+    hit_host = [e for e, c in enumerate(counts_host) if c]
+    routed = sum(counts_host)
+    hit = torch.nonzero_static(counts, size=len(hit_host)).reshape(-1)     # no sync: size is known
+    hit_counts = [counts_host[e] for e in hit_host]
+
+    gate_up, down = self.gate_up_proj, self.down_proj
+    chunk = _dequant_chunk(len(hit_host), max(gate_up.expert_bytes, down.expert_bytes), device)
+    outs: List[torch.Tensor] = []
+    e0 = r0 = 0
+    while e0 < len(hit_host):
+        e1 = min(len(hit_host), e0 + max(1, chunk))
+        r1 = r0 + sum(hit_counts[e0:e1])
+        try:
+            offsets = torch.cumsum(counts.index_select(0, hit[e0:e1]), dim=0, dtype=torch.int32)
+            h = _GroupedExpertLinear.apply(hidden_g[r0:r1], offsets, gate_up, hit[e0:e1])
+            h = self._apply_gate(h)
+            outs.append(_GroupedExpertLinear.apply(h, offsets, down, hit[e0:e1]))
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= 1:
+                raise
+            chunk = max(1, chunk // 2)                 # memory moved under us: halve and retry
+            logger.warning("[moe-quant] dequant chunk OOM; retrying with %d expert(s) per chunk", chunk)
+            continue
+        e0, r0 = e1, r1
+    if routed < expert_ids.numel():
+        outs.append(torch.zeros(expert_ids.numel() - routed, hidden_dim, device=device,
+                                dtype=outs[0].dtype if outs else hidden_states.dtype))
+    proj_out = torch.cat(outs, dim=0) if outs else hidden_g.new_zeros(expert_ids.numel(), hidden_dim)
+
+    weighted = proj_out * weights_g.unsqueeze(-1)
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=device)
+    weighted = weighted[inv_perm]
+    return weighted.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(hidden_states.dtype)
+
+
+def experts_implementation() -> str:
+    """The implementation to pin: this module's grouped one, unless the
+    operator chose eager. Anything else is refused -- a dense kernel would
+    read packed bytes as weights."""
+    chosen = (os.environ.get(_ENV_EXPERTS_IMPL, "") or EXPERTS_IMPL).strip()
+    if chosen not in (EXPERTS_IMPL, "eager"):
+        raise ValueError(f"{_ENV_EXPERTS_IMPL}={chosen!r}: quantized expert stacks support "
+                         f"{EXPERTS_IMPL!r} or 'eager' only")
+    return chosen
+
+
+def _register_experts_implementation() -> None:
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS  # noqa: PLC0415
+
+    ALL_EXPERTS_FUNCTIONS[EXPERTS_IMPL] = grouped_experts_forward
+
+
+_register_experts_implementation()
 
 
 # ---------------------------------------------------------------------------
@@ -476,21 +721,23 @@ class MoEBnb4BitQuantizer(Bnb4BitHfQuantizer):
             raise RuntimeError(
                 f"{len(left_over)} fused expert tensor(s) are still bf16 after "
                 f"loading, e.g. {left_over[0]} -- refusing a half-quantized model")
-        # Only eager indexes per expert. Pin it on every config an expert
-        # module reads (nested text configs included), plus the top level.
+        # Only an implementation that understands the stacks may run them.
+        # Pin it on every config an expert module reads (nested text configs
+        # included), plus the top level.
+        impl = experts_implementation()
         owners = 0
         for name in self.expert_params:
             module = _resolve(model, name.rpartition(".")[0])
             cfg = getattr(module, "config", None)
-            if cfg is not None and getattr(cfg, "_experts_implementation", "eager") != "eager":
-                cfg._experts_implementation = "eager"
+            if cfg is not None and getattr(cfg, "_experts_implementation", None) != impl:
+                cfg._experts_implementation = impl
                 owners += 1
-        if getattr(model.config, "_experts_implementation", "eager") != "eager":
-            model.config._experts_implementation = "eager"
+        if getattr(model.config, "_experts_implementation", None) != impl:
+            model.config._experts_implementation = impl
             owners += 1
         logger.info("[moe-quant] %d expert tensor(s) installed as stacks; experts "
-                    "implementation pinned to eager on %d config(s)",
-                    len(self.installed), owners)
+                    "implementation pinned to %s on %d config(s)",
+                    len(self.installed), impl, owners)
         return model
 
     def is_serializable(self, safe_serialization: Any = None) -> bool:
