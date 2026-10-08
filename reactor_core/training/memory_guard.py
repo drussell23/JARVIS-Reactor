@@ -66,7 +66,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -1352,6 +1352,60 @@ def fit_steps_to_time(cal: MemoryCalibration, *, completion_tokens: int, prompt_
     return max(0, min(epoch, int(time_budget_s // step_s))), step_s
 
 
+@dataclass(frozen=True)
+class WindowFit:
+    """Which prompts can teach inside the completion window, and why not."""
+    keep: Tuple[bool, ...]
+    window: int
+    num_generations: int
+    min_terminated: int
+    admitted: int
+    too_long: int
+    unmeasured: int
+
+    def report(self) -> Dict[str, Any]:
+        return {"window": self.window, "num_generations": self.num_generations,
+                "min_terminated": self.min_terminated, "admitted": self.admitted,
+                "too_long": self.too_long, "unmeasured": self.unmeasured,
+                "rule": (f"admit when num_generations x (share of measured answers <= {self.window} "
+                         f"tokens) >= {self.min_terminated}")}
+
+
+def admit_by_completion_window(answer_tokens: Sequence[Sequence[Optional[int]]], *, window: int,
+                               num_generations: int, min_terminated: int) -> WindowFit:
+    """Keep the prompts whose answers can FINISH inside ``window``.
+
+    With truncated completions masked out of the loss, a group teaches only
+    through the rollouts that terminate, and a contrast needs at least
+    ``min_terminated`` of them (two: one answer has nothing to be compared
+    with). Each prompt's answers already exist in the corpus, measured by the
+    engine that produced them, so the share that fit is an estimate of each
+    rollout's chance to terminate; a prompt is kept when ``num_generations``
+    rollouts are expected to yield ``min_terminated`` finished ones.
+
+    The criterion is the answer's MEASURED length, not its contract: on
+    2026-10-08 the full-content (2b.1) rows had a median of 2,316 completion
+    tokens against a 1,955-token window -- "full content" is not "short", and
+    "diff" is not guaranteed short either. A prompt with no engine-measured
+    answer cannot be shown to fit and is excluded, never guessed. Pure."""
+    g = max(1, int(num_generations))
+    need = max(1, int(min_terminated))
+    keep: List[bool] = []
+    too_long = unmeasured = 0
+    for answers in answer_tokens:
+        measured = [int(a) for a in answers or () if a]
+        if not measured:
+            keep.append(False)
+            unmeasured += 1
+            continue
+        share = sum(1 for a in measured if a <= window) / len(measured)
+        ok = g * share >= need
+        keep.append(ok)
+        too_long += 0 if ok else 1
+    return WindowFit(keep=tuple(keep), window=int(window), num_generations=g, min_terminated=need,
+                     admitted=sum(keep), too_long=too_long, unmeasured=unmeasured)
+
+
 __all__ = [
     "Admission",
     "MemorySample",
@@ -1378,4 +1432,6 @@ __all__ = [
     "fit_completion_window",
     "estimate_step_seconds",
     "fit_steps_to_time",
+    "WindowFit",
+    "admit_by_completion_window",
 ]

@@ -148,6 +148,18 @@ def _default_telemetry_dir() -> Path:
     return Path.home() / ".jarvis" / "trinity" / "events"
 
 
+def _measured_completion(row: Dict[str, Any]) -> Optional[int]:
+    """The answer's length as the engine reported it, or None when it was
+    not reported (absent / zero) or was estimated from the text."""
+    try:
+        if row.get("tokens_estimated"):
+            return None
+        n = int(row.get("completion_tokens") or 0)
+        return n if n > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def analyse(
     telemetry_dir: Path,
     *,
@@ -183,6 +195,12 @@ def analyse(
     #: which is the point: the runner must not form a second opinion about
     #: which prompts carry contrast.
     trainable_prompts: List[str] = []
+    #: Parallel to trainable_prompts: each group's answers, as the engine
+    #: that produced them counted them (None = not measured: absent, or
+    #: estimated from length). The trainer judges each prompt against its
+    #: calibrated completion window with them; travels with the prompts and
+    #: is popped with them before the report is written.
+    trainable_answer_tokens: List[List[Optional[int]]] = []
     flat: List[Dict[str, Any]] = []
     singleton = 0
     verdict_sources: Dict[str, int] = defaultdict(int)
@@ -241,6 +259,7 @@ def analyse(
         else:
             trainable.append(entry)
             trainable_prompts.append(prompt)
+            trainable_answer_tokens.append([_measured_completion(r) for r in rows])
 
     return {
         "telemetry_dir": str(telemetry_dir),
@@ -250,6 +269,7 @@ def analyse(
         "flat_groups": len(flat),
         "trainable_groups": len(trainable),
         "trainable_prompts": trainable_prompts,
+        "trainable_answer_tokens": trainable_answer_tokens,
         "flat_eps": getattr(reward, "_FLAT_EPS", None),
         "min_group": min_group,
         "min_spread": min_spread,

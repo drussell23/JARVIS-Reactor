@@ -1244,6 +1244,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     contrast_prompts: Optional[List[str]] = (
         verdict.pop("trainable_prompts", None) or None
     )
+    answer_tokens = verdict.pop("trainable_answer_tokens", None)
     report["corpus"] = verdict
     logger.info(
         "[runner] corpus: %d rows, %d prompts, %d trainable group(s) at "
@@ -1394,8 +1395,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         fit = guard.fit_completion_window(
             cal, prompt_tokens_max=int(prompts["max"]),
             headroom_bytes=int(args.vram_headroom_gib * guard.GIB))
+        # Before the step count: the time budget must be spent on the
+        # prompts that will actually train.
+        contrast_prompts, refused = _gate_by_window(contrast_prompts, answer_tokens, fit.tokens, report,
+                                                    args=args, guard=guard)
+        if refused:
+            return refused
+        answer_tokens = None                         # applied; the rung children re-derive it
+        rows = len(contrast_prompts) if contrast_prompts else prompts["rows"]
         groups_per_step = max(1, global_batch // max(1, args.num_generations))
-        steps_per_epoch = max(1, int(-(-prompts["rows"] * args.epochs // groups_per_step))) * cal.num_iterations
+        steps_per_epoch = max(1, int(-(-rows * args.epochs // groups_per_step))) * cal.num_iterations
         steps, step_s = guard.fit_steps_to_time(
             cal, completion_tokens=fit.tokens, prompt_tokens_mean=float(prompts["mean"]),
             accumulation=global_batch, time_budget_s=args.time_budget_s, steps_per_epoch=steps_per_epoch)
@@ -1422,6 +1431,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.max_steps = steps
             resolved["--max-steps"] = str(steps)
     args.max_completion_length = int(args.max_completion_length)
+    if answer_tokens is not None:
+        # A window given explicitly -- by an operator, or by the parent to a
+        # rung child, which re-reads the corpus and must narrow it exactly as
+        # the parent did.
+        contrast_prompts, refused = _gate_by_window(contrast_prompts, answer_tokens,
+                                                    args.max_completion_length, report,
+                                                    args=args, guard=guard)
+        if refused:
+            return refused
 
     ladder = guard.build_ladder(
         num_generations=args.num_generations,
@@ -1521,6 +1539,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_LADDER_EXHAUSTED
     logger.info("[runner] %s", outcome["status"])
     return EXIT_OK
+
+
+def _gate_by_window(prompts: Optional[List[str]], answer_tokens: Any, window: int,
+                    report: Dict[str, Any], *, args: Any, guard: Any
+                    ) -> Tuple[Optional[List[str]], Optional[int]]:
+    """Narrow the gate's contrast-bearing prompts to those whose measured
+    answers can finish inside ``window`` (memory_guard.admit_by_completion_window).
+    Returns ``(prompts, None)``, or ``(prompts, EXIT_REFUSED)`` when fewer than
+    ``--min-groups`` remain -- refused for the window, not the corpus, so the
+    cause is named. Without a contrast selection (``--all-prompts``) there are
+    no per-prompt answers to judge and nothing is narrowed; the report says so."""
+    if not prompts or answer_tokens is None or len(answer_tokens) != len(prompts):
+        report["window_fit"] = {"applied": False,
+                                "reason": "no contrast selection" if not prompts else "answer lengths unavailable"}
+        return prompts, None
+    fit = guard.admit_by_completion_window(answer_tokens, window=int(window),
+                                           num_generations=args.num_generations,
+                                           min_terminated=max(2, args.min_group_size))
+    kept = [p for p, k in zip(prompts, fit.keep) if k]
+    report["window_fit"] = {"applied": True, "before": len(prompts), **fit.report()}
+    report["training_prompts"] = len(kept)
+    logger.info("[runner] window fit: %d of %d contrast group(s) can finish inside %d tokens "
+                "(%d too long, %d unmeasured)", fit.admitted, len(prompts), window, fit.too_long,
+                fit.unmeasured)
+    if len(kept) < args.min_groups and not args.skip_corpus_gate:
+        logger.error("[runner] REFUSED: %d group(s) can finish inside the %d-token window, < required %d",
+                     len(kept), window, args.min_groups)
+        report["refused"] = "window_fit"
+        _write(args.json_out, report)
+        return kept, EXIT_REFUSED
+    return kept, None
 
 
 def _write(path: str, payload: Dict[str, Any], *, echo: bool = True) -> None:
