@@ -274,6 +274,40 @@ def is_genuine_row(meta: Optional[Dict[str, Any]]) -> bool:
         return True
 
 
+#: The output contracts a row's prompt must have imposed to be trained on,
+#: comma-separated (e.g. ``2b.1-diff,2b.1``). Set by the caller that knows
+#: which contracts its organism still asks for -- O+V's training handoff
+#: derives it from ``providers.single_file_output_schemas()`` -- because
+#: Reactor cannot know that itself. Unset = no contract filter.
+_ENV_OUTPUT_SCHEMAS = "REACTOR_GRPO_OUTPUT_SCHEMAS"
+
+
+def accepted_output_schemas() -> Optional[frozenset]:
+    """The contracts a trainable row must carry, or None when the caller set
+    none. NEVER raises."""
+    raw = os.environ.get(_ENV_OUTPUT_SCHEMAS, "") or ""
+    names = frozenset(s.strip() for s in raw.split(",") if s.strip())
+    return names or None
+
+
+def schema_admits(meta: Optional[Dict[str, Any]], accepted: Optional[frozenset]) -> bool:
+    """Was this row's prompt written under a contract still in force?
+
+    ``metadata.output_schema`` is recorded by O+V's prompt builder at the
+    moment it chose the contract. A row WITHOUT the tag predates it and is
+    excluded whenever a contract filter is set: its contract is unknown, and
+    the rows that taught the model whole-file rewrites (86% of the corpus on
+    2026-10-07, every completion truncated at the 1,955-token window) are
+    exactly the untagged ones. Excluded, never deleted -- the corpus is
+    append-only history. Pure; NEVER raises."""
+    if accepted is None:
+        return True
+    try:
+        return str((meta or {}).get("output_schema") or "") in accepted
+    except Exception:  # noqa: BLE001
+        return False
+
+
 #: Where O+V's landing-provenance labeler writes (a SUBDIRECTORY of the corpus
 #: dir: this reader globs ``*.jsonl`` non-recursively and must never read a
 #: label as a row). Overridable for a corpus copied elsewhere.
@@ -339,8 +373,15 @@ def iter_trajectory_rows(
     *,
     trainable_only: bool = True,
     genuine_only: bool = True,
+    output_schemas: Any = "env",
 ) -> Iterable[Dict[str, Any]]:
     """Stream recorder rows out of the corpus.
+
+    ``output_schemas`` keeps only rows whose prompt imposed one of these
+    contracts (:func:`schema_admits`); the default reads
+    :func:`accepted_output_schemas`, so preflight, the dataset and the runner
+    -- all of which read through here -- apply the same filter. None
+    disables it.
 
     ``genuine_only`` keeps only rows that answer the op's own GENERATE
     prompt, decided by :func:`is_genuine_row` -- primary/sibling draws (or
@@ -358,6 +399,9 @@ def iter_trajectory_rows(
     avoid.
     """
     seen_keys: set = set()
+    accepted = accepted_output_schemas() if output_schemas == "env" else (
+        frozenset(output_schemas) if output_schemas else None)
+    off_contract: Dict[str, int] = {}
     # Joined HERE, the one reader every training path uses, so preflight, the
     # GRPO dataset and the runner all see the same landed truth.
     landing = load_landing_labels(Path(telemetry_dir))
@@ -398,6 +442,10 @@ def iter_trajectory_rows(
             meta = row.get("metadata") or {}
             if genuine_only and not is_genuine_row(meta):
                 continue
+            if not schema_admits(meta, accepted):
+                tag = str(meta.get("output_schema") or "") or "untagged"
+                off_contract[tag] = off_contract.get(tag, 0) + 1
+                continue
             key = (str(meta.get("op_id", "") or ""), str(meta.get("candidate_hash", "") or ""))
             if key[1]:
                 if key in seen_keys:
@@ -410,6 +458,11 @@ def iter_trajectory_rows(
                 "the row being appended by a live soak; a persistent count "
                 "means the corpus is damaged.", f.name, malformed,
             )
+    if off_contract:
+        # Counted, so a corpus that shrank because of the contract filter is
+        # never mistaken for one that shrank for another reason.
+        logger.info("[GRPO] rows excluded by output contract (accepting %s): %s",
+                    ",".join(sorted(accepted or ())), off_contract)
 
 
 def build_prompt_dataset(

@@ -254,6 +254,9 @@ def analyse(
         "min_group": min_group,
         "min_spread": min_spread,
         "trainable_only": trainable_only,
+        # The contracts the reader admitted (None = no contract filter), so a
+        # refusal for too few groups says which contracts it counted.
+        "output_schemas": sorted(pipeline.accepted_output_schemas() or ()) or None,
         "verdict_sources": dict(verdict_sources),
         "examples": trainable[:5],
         "flat_examples": flat[:3],
