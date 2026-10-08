@@ -53,7 +53,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 def _default_num_generations() -> int:
     """The group size default, owned by grpo_pipeline.
@@ -774,6 +774,69 @@ def train_with_ladder(
 # Calibration: measure what a completion token costs on THIS model and card
 # ---------------------------------------------------------------------------
 
+class RolloutProbe:
+    """The inputs every rollout measurement shares, built ONCE from the
+    trainer that will train: its prompts tokenized by its own tokenizer, a
+    group-sized batch of real prompt text at any length, and ``generate``
+    under the trainer's OWN generation config (KV cache on -- gradient
+    checkpointing turns model.config.use_cache off, and a decode timed
+    without the cache would measure a different algorithm). Callers run
+    ``gen(...)`` inside ``grpo_pipeline.rollout_mode`` and ``no_grad``.
+    """
+
+    def __init__(self, trainer: Any) -> None:
+        import copy  # noqa: PLC0415
+
+        import torch  # noqa: PLC0415
+
+        self.torch = torch
+        self.model, self.tok = trainer.model, trainer.processing_class
+        self.g = int(trainer.args.num_generations)
+        self.dev = next(p for p in self.model.parameters()).device
+        prompts = [str(p) for p in trainer.train_dataset["prompt"]]
+        self.lengths = [len(self.tok(p, add_special_tokens=False)["input_ids"]) for p in prompts]
+        self.p_max = max(self.lengths)
+        self.p_mean = sum(self.lengths) / len(self.lengths)
+        self._seed = self.tok(prompts[self.lengths.index(self.p_max)], add_special_tokens=False)["input_ids"]
+        self.pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else self.tok.eos_token_id
+        self._base_gc = getattr(trainer, "generation_config", None)
+        self._copy = copy.deepcopy
+
+    def ids(self, length: int, batch: int) -> Any:
+        reps = -(-length // len(self._seed))
+        row = (self._seed * reps)[:length]
+        return self.torch.tensor([row] * batch, device=self.dev)
+
+    def gen(self, length: int, new: int, *, stop: Optional[Callable[[], Optional[str]]] = None
+            ) -> Callable[[], Any]:
+        """``stop`` (a reason, or None) ends ``generate`` at the NEXT token
+        instead of after ``new`` -- a decode at a long context runs for
+        minutes, and a stop that waits for it is not a stop. The caller must
+        treat a stopped generation as unmeasured."""
+        extra: Dict[str, Any] = {}
+        if stop is not None:
+            from transformers import StoppingCriteria, StoppingCriteriaList  # noqa: PLC0415
+
+            torch = self.torch
+
+            class _Stop(StoppingCriteria):
+                def __call__(self, input_ids: Any, scores: Any, **kw: Any) -> Any:
+                    # One verdict per sequence, the shape generate() expects.
+                    return torch.full((input_ids.shape[0],), bool(stop()), dtype=torch.bool,
+                                      device=input_ids.device)
+            extra["stopping_criteria"] = StoppingCriteriaList([_Stop()])
+        gc = self._copy(self._base_gc) if self._base_gc is not None else None
+        if gc is not None:
+            gc.max_new_tokens, gc.min_new_tokens, gc.use_cache = new, new, True
+            gc.pad_token_id = self.pad
+            return lambda: self.model.generate(self.ids(length, self.g), generation_config=gc, **extra)
+        return lambda: self.model.generate(self.ids(length, self.g), max_new_tokens=new, min_new_tokens=new,
+                                           use_cache=True, pad_token_id=self.pad, **extra)
+
+    def prompts_summary(self) -> Dict[str, Any]:
+        return {"rows": len(self.lengths), "max": self.p_max, "mean": self.p_mean}
+
+
 def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) -> Dict[str, Any]:
     """Measure the slopes ``memory_guard.fit_completion_window`` needs, on
     the trainer that will train, in the configuration it will train in.
@@ -794,19 +857,9 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
     """
     import torch  # noqa: PLC0415
 
-    model, tok = trainer.model, trainer.processing_class
-    args = trainer.args
-    g = int(args.num_generations)
-    dev = next(p for p in model.parameters()).device
-    prompts = [str(p) for p in trainer.train_dataset["prompt"]]
-    lengths = [len(tok(p, add_special_tokens=False)["input_ids"]) for p in prompts]
-    p_max = max(lengths)
-    seed_ids = tok(prompts[lengths.index(p_max)], add_special_tokens=False)["input_ids"]
-
-    def ids(length: int, batch: int) -> Any:
-        reps = -(-length // len(seed_ids))
-        row = (seed_ids * reps)[:length]
-        return torch.tensor([row] * batch, device=dev)
+    probe = RolloutProbe(trainer)
+    model, args, g, dev = probe.model, trainer.args, probe.g, probe.dev
+    lengths, p_max, ids = probe.lengths, probe.p_max, probe.ids
 
     class ProbeOOM(RuntimeError):
         pass
@@ -828,32 +881,13 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
 
     torch.cuda.synchronize()
     resident = torch.cuda.memory_allocated()
-    pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     l1, l2 = max(64, p_max // 4), max(128, p_max // 2)
-
-    # The TRAINER's generation config, not the model's: gradient
-    # checkpointing turns model.config.use_cache off, and timing a decode
-    # without the KV cache would measure a different algorithm.
-    import copy  # noqa: PLC0415
-    base_gc = getattr(trainer, "generation_config", None)
-
-    def gc_for(new: int) -> Any:
-        gc = copy.deepcopy(base_gc) if base_gc is not None else None
-        if gc is not None:
-            gc.max_new_tokens, gc.min_new_tokens, gc.use_cache = new, new, True
-            gc.pad_token_id = pad
-        return gc
+    gen = probe.gen
 
     from reactor_core.training.grpo_pipeline import rollout_mode  # noqa: PLC0415
 
     # Timed in the mode training samples in -- the same context manager.
     with rollout_mode(model), torch.no_grad():
-        def gen(length: int, new: int) -> Callable[[], Any]:  # noqa: E306
-            gc = gc_for(new)
-            if gc is not None:
-                return lambda: model.generate(ids(length, g), generation_config=gc)
-            return lambda: model.generate(ids(length, g), max_new_tokens=new, min_new_tokens=new,
-                                          use_cache=True, pad_token_id=pad)
         try:
             gp1, _ = measure(gen(l1, 4), f"generation probe at {l1} tokens")
             gp2, _ = measure(gen(l2, 4), f"generation probe at {l2} tokens")
@@ -924,6 +958,104 @@ def calibrate(trainer: Any, guard: Any, *, allocator_fraction: Optional[float]) 
     return {"calibration": cal.__dict__,
             "prompts": {"rows": len(lengths), "max": p_max, "mean": sum(lengths) / len(lengths)},
             "probe": {"gen_lengths": [l1, l2], "train_lengths": [l1, l2], "keep": [k1, k2]}}
+
+
+#: host-device synchronisations in a profiler table: each one stalls the CPU
+#: until the GPU drains, so the launch pipeline cannot run ahead.
+_SYNC_OPS = ("aten::_local_scalar_dense", "aten::item", "cudaStreamSynchronize",
+             "cudaDeviceSynchronize", "cudaMemcpy", "cudaEventSynchronize")
+
+
+def profile_rollout(trainer: Any, *, contexts: Sequence[int], short: int, long: int, top: int,
+                    stop: Optional[Callable[[], Optional[str]]] = None,
+                    sink: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+    """Where one DECODE step's time goes, per op, at each context.
+
+    The same differencing as calibration: profile ``generate`` at ``short``
+    and ``long`` new tokens from the same context and subtract, so prefill
+    cancels and every number is per decoded token. Reports self CPU and
+    self device time per op, the count of host syncs per token, and the
+    wall clock per token -- the evidence a speed fix must start from.
+
+    ``stop`` returns a reason to stop (the memory watchdog's breach, a
+    signal) or None. It is checked before each generation and inside it, at
+    every token; a context whose generations did not all finish is dropped,
+    never reported from a partial run. ``sink`` receives the report after
+    every completed context, so a run that is stopped -- or killed outright
+    by the watchdog's commit-floor abort -- leaves every context it finished
+    on disk. ``interrupted`` names why a run ended early.
+    """
+    import torch  # noqa: PLC0415
+    from torch.profiler import ProfilerActivity, profile  # noqa: PLC0415
+
+    from reactor_core.training.grpo_pipeline import rollout_mode  # noqa: PLC0415
+
+    probe = RolloutProbe(trainer)
+    n = max(1, long - short)
+
+    halt = stop or (lambda: None)
+
+    class _Stopped(Exception):
+        pass
+
+    def table(length: int, new: int) -> Tuple[Dict[str, Dict[str, float]], float]:
+        run = probe.gen(length, new, stop=halt)
+
+        def guarded(step: Callable[[], Any]) -> Any:
+            if halt():
+                raise _Stopped
+            res = step()
+            if halt():                              # stopped mid-decode: not a measurement
+                raise _Stopped
+            return res
+
+        guarded(run)                                # warm: allocator, kernels, cache shapes
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            t0 = time.perf_counter()
+            guarded(run)
+            torch.cuda.synchronize()
+            wall = time.perf_counter() - t0
+        rows: Dict[str, Dict[str, float]] = {}
+        for ev in prof.key_averages():
+            rows[ev.key] = {"count": float(ev.count), "cpu_us": float(ev.self_cpu_time_total),
+                            "dev_us": float(getattr(ev, "self_device_time_total", 0.0)
+                                            or getattr(ev, "self_cuda_time_total", 0.0))}
+        return rows, wall
+
+    out: Dict[str, Any] = {"prompts": probe.prompts_summary(), "group": probe.g, "decode_tokens": n,
+                           "contexts": {}, "planned_contexts": list(contexts), "interrupted": None}
+    with rollout_mode(probe.model), torch.no_grad():
+        for length in contexts:
+            try:
+                a, wa = table(length, short)
+                b, wb = table(length, long)
+            except _Stopped:
+                out["interrupted"] = f"at context {length}: {halt()}"
+                logger.warning("[profile] stopped %s; %d of %d context(s) measured",
+                               out["interrupted"], len(out["contexts"]), len(contexts))
+                break
+            per: List[Dict[str, Any]] = []
+            for key in set(a) | set(b):
+                ra, rb = a.get(key, {}), b.get(key, {})
+                d = {f: (rb.get(f, 0.0) - ra.get(f, 0.0)) / n for f in ("count", "cpu_us", "dev_us")}
+                per.append({"op": key, **{k: round(v, 2) for k, v in d.items()}})
+            syncs = sum(r["count"] for r in per if any(r["op"].startswith(s) for s in _SYNC_OPS))
+            out["contexts"][str(length)] = {
+                "wall_s_per_token": round((wb - wa) / n, 4),
+                "cpu_ms_per_token": round(sum(r["cpu_us"] for r in per) / 1e3, 2),
+                "device_ms_per_token": round(sum(r["dev_us"] for r in per) / 1e3, 2),
+                "host_syncs_per_token": round(syncs, 1),
+                "top_cpu": sorted(per, key=lambda r: -r["cpu_us"])[:top],
+                "top_device": sorted(per, key=lambda r: -r["dev_us"])[:top],
+            }
+            logger.info("[profile] ctx %d: %.3f s/token wall, %.1f ms cpu, %.1f ms device, %.0f syncs/token",
+                        length, out["contexts"][str(length)]["wall_s_per_token"],
+                        out["contexts"][str(length)]["cpu_ms_per_token"],
+                        out["contexts"][str(length)]["device_ms_per_token"], syncs)
+            if sink is not None:
+                sink(out)
+    return out
 
 
 def run_calibration_child(guard: Any) -> Dict[str, Any]:
@@ -1055,6 +1187,12 @@ def main(argv: Optional[List[str]] = None) -> int:
              "window (env REACTOR_GRPO_VRAM_HEADROOM_GIB)",
     )
     ap.add_argument("--calibrate", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--profile-rollout", action="store_true",
+                    help="profile one decode step per op at several contexts (diagnostic; writes --json-out)")
+    ap.add_argument("--profile-contexts", default="",
+                    help="comma-separated contexts for --profile-rollout (default: a quarter, the mean and "
+                         "the longest of the training prompts)")
+    ap.add_argument("--profile-top", type=int, default=15)
     # Absolute (epoch s): the moment training must stop at a step boundary.
     # Set by the parent from ITS start + --time-budget-s and handed to every
     # child, so a rung started late does not get a fresh budget.
@@ -1187,19 +1325,44 @@ def main(argv: Optional[List[str]] = None) -> int:
     global_batch = accumulation
 
     # --- the completion window ---------------------------------------------
-    if args.calibrate:
+    if args.calibrate or args.profile_rollout:
         # CHILD: load exactly as a rung would, measure, report, exit. Its
         # exit frees the CUDA context before any rung loads.
+        #
+        # Under the SAME watchdog a rung runs under, from the model load on:
+        # this child was the one GPU path with no memory guard. Its
+        # commit-floor abort applies as everywhere else. A soft breach (VRAM
+        # ceiling, host floor) STOPS a profile -- a diagnostic has no reason
+        # to press on -- while calibration only records it: its probes push
+        # memory on purpose, and a probe that does not fit is already caught
+        # as ProbeOOM.
         from reactor_core.training import grpo_pipeline  # noqa: PLC0415
-        trainer = grpo_pipeline.build_trainer(
-            args.model, telemetry_dir, str(output_dir),
-            trainable_only=not args.include_untrainable, max_prompts=args.max_prompts or None,
-            only_prompts=contrast_prompts, max_prompt_tokens=args.max_prompt_tokens or None,
-            use_qlora=not args.no_qlora, gptq_backend=args.gptq_backend,
-            num_generations=args.num_generations, max_completion_length=64,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            num_train_epochs=args.epochs)
-        report.update(calibrate(trainer, guard, allocator_fraction=report["cuda_allocator_fraction"]))
+        signalled = _trap_stop_signals()
+        watchdog = guard.MemoryWatchdog(label="profile" if args.profile_rollout else "calibrate")
+        with watchdog:
+            trainer = grpo_pipeline.build_trainer(
+                args.model, telemetry_dir, str(output_dir),
+                trainable_only=not args.include_untrainable, max_prompts=args.max_prompts or None,
+                only_prompts=contrast_prompts, max_prompt_tokens=args.max_prompt_tokens or None,
+                use_qlora=not args.no_qlora, gptq_backend=args.gptq_backend,
+                num_generations=args.num_generations, max_completion_length=64,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                num_train_epochs=args.epochs)
+            if args.profile_rollout:
+                probe = RolloutProbe(trainer)
+                contexts = ([int(c) for c in args.profile_contexts.split(",") if c.strip()]
+                            or sorted({max(64, probe.p_max // 4), int(probe.p_mean), probe.p_max}))
+                del probe
+
+                def flush(partial: Dict[str, Any]) -> None:
+                    _write(args.json_out, {**report, "profile": partial, "watchdog": watchdog.report()},
+                           echo=False)
+                report["profile"] = profile_rollout(
+                    trainer, contexts=contexts, short=4, long=20, top=args.profile_top,
+                    stop=lambda: watchdog.breached or signalled(), sink=flush)
+            else:
+                report.update(calibrate(trainer, guard, allocator_fraction=report["cuda_allocator_fraction"]))
+        report["watchdog"] = watchdog.report()
         _write(args.json_out, report)
         return EXIT_OK
     resolved: Dict[str, str] = {}
@@ -1360,12 +1523,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     return EXIT_OK
 
 
-def _write(path: str, payload: Dict[str, Any]) -> None:
+def _write(path: str, payload: Dict[str, Any], *, echo: bool = True) -> None:
+    """The report, written atomically (a reader -- or a kill -- mid-write
+    never sees half a file) and echoed unless ``echo`` is False."""
     text = json.dumps(payload, indent=2, sort_keys=True, default=str)
     if path:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(text + "\n", encoding="utf-8")
-    print(text)
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".tmp")
+        tmp.write_text(text + "\n", encoding="utf-8")
+        os.replace(tmp, out)
+    if echo:
+        print(text)
+
+
+def _trap_stop_signals() -> Callable[[], Optional[str]]:
+    """Turn SIGTERM / SIGINT / SIGHUP into a stop REQUEST for a measuring
+    child: what a Task Scheduler stop, a ``kill`` or Ctrl-C sends. The
+    default action ends the process before it writes anything; the request
+    is honoured at the next token. Returns the reader (a reason, or None).
+    A second signal of any kind ends the process at once, as an operator
+    repeating it means."""
+    import signal  # noqa: PLC0415
+
+    got: List[str] = []
+
+    def handler(signum: int, _frame: Any) -> None:
+        if got:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            return
+        got.append(signal.Signals(signum).name)
+        logger.warning("[runner] %s: stopping at the next token", got[0])
+
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):           # not the main thread / unsupported
+                pass
+    return lambda: (f"signal {got[0]}" if got else None)
 
 
 if __name__ == "__main__":  # pragma: no cover
