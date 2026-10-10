@@ -1080,8 +1080,124 @@ def _sub_envelope(v: Verdict, w: "TierWeights") -> Verdict:
     )
 
 
-def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
-    """Tiers 0-3. Pure, sub-millisecond, never raises."""
+# ---------------------------------------------------------------------------
+# Diff answers -- graded by where they land, with O+V's own applier
+# ---------------------------------------------------------------------------
+#
+# A `2b.1-diff` candidate's content is a PATCH, not a module. Measured
+# 2026-10-10: grading it with `_grade_source` parsed the diff text as Python,
+# so a correct diff and one whose context lines exist nowhere in the file
+# both scored 0.25 (`syntax_error:line1`) while any whole-file answer scored
+# 0.79. The held-out baseline the same day failed 28/30 tasks on exactly
+# that hallucination, and the reward could not see it.
+#
+# A diff is now judged against the file the model was SHOWN (the prompt's
+# snapshot), by the applier O+V itself uses -- jarvis
+# `governance/diff_apply.py`, loaded by path from REACTOR_GRPO_DIFF_APPLIER
+# (the training handoff sets it), never a second copy:
+#
+#   * every hunk placed, whole file shown -> the PATCHED FILE is graded like
+#     any source, so a diff that lands is worth what it produces;
+#   * a hunk that does not land -> the lower half of the syntax band, scaled
+#     by how much of its context exists in the file and in order: a diff
+#     that is almost right outranks one that invented its anchors, and both
+#     rank under any diff that applies;
+#   * the header's distance from where the hunk landed, and line numbers
+#     copied into the patch, shave the grade within its band;
+#   * nothing checkable (no applier, no snapshot, aimed outside a partial
+#     region) -> one neutral grade, so a group of them is flat and dropped
+#     rather than ranked by noise.
+
+_DIFF_HEADER_W = _envf("DIFF_HEADER_WEIGHT", 0.10)
+_DIFF_HEADER_SCALE = max(1.0, _envf("DIFF_HEADER_SCALE_LINES", 10.0))
+_DIFF_ECHO_W = _envf("DIFF_ECHO_WEIGHT", 0.05)
+
+_APPLIER: Dict[str, Any] = {}
+
+
+def _load_applier() -> Any:
+    """jarvis ``diff_apply`` loaded BY PATH (REACTOR_GRPO_DIFF_APPLIER), or
+    None. Cached per path; a load failure is logged once and is None."""
+    path = _envs("DIFF_APPLIER")
+    if not path:
+        return None
+    if path in _APPLIER:
+        return _APPLIER[path]
+    mod = None
+    try:
+        import importlib.util as _ilu  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+        name = "_ov_diff_apply"
+        spec = _ilu.spec_from_file_location(name, path)
+        mod = _ilu.module_from_spec(spec)
+        _sys.modules[name] = mod          # before exec: its dataclasses resolve through it
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[GRPO] diff applier %s unloadable (%s): diffs grade as unverifiable",
+                       path, exc)
+        mod = None
+    _APPLIER[path] = mod
+    return mod
+
+
+def _diff_candidates(text: str) -> List[Tuple[str, str]]:
+    """``[(file_path, unified_diff)]`` of a 2b.1-diff envelope."""
+    try:
+        obj = json.loads(_strip_code_fence(text or ""))
+        return [(str(c.get("file_path") or ""), _strip_code_fence(str(c.get("unified_diff") or "")))
+                for c in obj.get("candidates") or [] if isinstance(c, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _diff_penalty(hunks: Sequence[Dict[str, Any]]) -> Tuple[float, str]:
+    placed = [h for h in hunks if h.get("placed") and h.get("header_error") is not None]
+    acc = (sum(1.0 / (1.0 + float(h["header_error"]) / _DIFF_HEADER_SCALE) for h in placed)
+           / len(placed)) if placed else 1.0
+    lines = sum(max(1, int(h.get("anchors") or 0)) for h in hunks)
+    echo = min(1.0, sum(int(h.get("echoed") or 0) for h in hunks) / max(1, lines))
+    mult = (1.0 - _DIFF_HEADER_W * (1.0 - acc)) * (1.0 - _DIFF_ECHO_W * echo)
+    return max(0.0, mult), f"hdr={acc:.2f},echo={echo:.2f}"
+
+
+def _grade_diff(file_path: str, diff: str, prompt: str) -> Tuple["SourceGrade", Optional[str]]:
+    """``(grade, patched_file_or_None)`` for one diff candidate."""
+    applier = _load_applier()
+    if applier is None:
+        return SourceGrade(0.0, _BAND_STRUCTURE, "diff_unverifiable:no_applier"), None
+    known = applier.source_from_prompt(prompt, file_path) or applier.source_from_prompt(prompt, "")
+    if known is None:
+        return SourceGrade(0.0, _BAND_STRUCTURE, "diff_unverifiable:no_source"), None
+    rep = applier.alignment(known, diff)
+    hunks = list(rep.get("hunks") or [])
+    if not hunks:
+        return SourceGrade(0.0, _BAND_SYNTAX, "diff_no_hunks"), None
+    checkable = [h for h in hunks if h.get("checkable")]
+    if not checkable:
+        return SourceGrade(0.0, _BAND_STRUCTURE, "diff_unverifiable:outside_snapshot"), None
+    mult, note = _diff_penalty(checkable)
+    placed = sum(1 for h in checkable if h.get("placed"))
+    if placed < len(checkable) or rep.get("applies") is False:
+        align = sum(0.5 * float(h.get("present") or 0.0) + 0.5 * float(h.get("in_order") or 0.0)
+                    for h in checkable) / len(checkable)
+        return SourceGrade(0.5 * align * mult, _BAND_SYNTAX,
+                           f"diff_misplaced:{placed}/{len(checkable)},align={align:.3f},{note}"), None
+    patched = rep.get("patched")
+    if not isinstance(patched, str):
+        # Every checkable hunk landed, but the prompt showed only part of
+        # the file: placement is proven, the module's quality is not.
+        return SourceGrade(mult, _BAND_STRUCTURE, f"diff_placed_partial:{placed},{note}"), None
+    g = _grade_source(patched)
+    if g.band == _BAND_SYNTAX:
+        # It applied and broke the module: still above every diff that did
+        # not apply, which is the lower half of this band.
+        return SourceGrade(0.5 + 0.5 * g.q * mult, _BAND_SYNTAX, f"{g.reason},diff_applied,{note}"), patched
+    return SourceGrade(g.q * mult, g.band, f"{g.reason},diff_applied,{note}"), patched
+
+
+def verify_static(text: str, weights: Optional[TierWeights] = None, *, prompt: str = "") -> Verdict:
+    """Tiers 0-3. Pure, sub-millisecond, never raises. *prompt* is what the
+    completion answered: a diff is graded against the file it showed."""
     w = weights or TierWeights()
     try:
         ver, sources, reason = extract_sources(text)
@@ -1107,8 +1223,14 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         if kind in _SHAPE_FAULTS:
             return Verdict(w.shape * 0.6, 1, reason, ver)
 
-        # Tier 2/3 — the whole point: grade the extracted SOURCE.
-        graded = [_grade_source(s) for s in sources]
+        # Tier 2/3 — the whole point: grade the extracted SOURCE. A diff's
+        # source is what it does to the file it was written against.
+        if ver == SCHEMA_DIFF:
+            graded = [_grade_diff(p, d, prompt)[0] for p, d in _diff_candidates(text)]
+        else:
+            graded = [_grade_source(s) for s in sources]
+        if not graded:
+            return Verdict(w.shape * 0.6, 1, "no_content:unified_diff", ver)
         # Worst-file semantics: a multi-file candidate is only as valid as
         # its weakest file, because APPLY is all-or-nothing. Ranked by the
         # SCORE the band produces, not by `q` — `q` is a position within a
@@ -1121,7 +1243,7 @@ def verify_static(text: str, weights: Optional[TierWeights] = None) -> Verdict:
         return Verdict(w.envelope * 0.2, 0, "grader_fault")
 
 
-def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
+def verify_any(text: str, weights: Optional[TierWeights] = None, *, prompt: str = "") -> Verdict:
     """Grade a response whose LAYER is not known in advance.
 
     `verify_static` grades a COMPLETION -- the O+V response envelope, which
@@ -1147,7 +1269,7 @@ def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     JSON object would be graded as the Python dict literal it also is);
     source only when the text is demonstrably not an envelope.
     """
-    v = verify_static(text, weights)
+    v = verify_static(text, weights, prompt=prompt)
     if _reason_kind(v.reason) != "envelope_unparseable":
         return v
     w = weights or TierWeights()
@@ -1168,7 +1290,7 @@ def verify_any(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     return _verdict_for_grade(grade, w)
 
 
-def _sources_for(text: str) -> List[str]:
+def _sources_for(text: str, prompt: str = "") -> List[str]:
     """The Python source(s) inside one response, whatever LAYER it is.
 
     Mirrors `verify_any`'s decision exactly — envelope first, raw text only
@@ -1180,6 +1302,10 @@ def _sources_for(text: str) -> List[str]:
         ver, sources, reason = extract_sources(text or "")
     except Exception:  # noqa: BLE001
         return [text or ""]
+    if ver == SCHEMA_DIFF:
+        # The module a diff produces, as graded; none when it did not land.
+        patched = [_grade_diff(p, d, prompt)[1] for p, d in _diff_candidates(text or "")]
+        return list(patched) if patched and all(isinstance(x, str) for x in patched) else []
     if sources:
         return [str(s or "") for s in sources]
     if ver is None and _reason_kind(reason) == "envelope_unparseable":
@@ -1230,7 +1356,7 @@ def refine_group(
         # in a group has no divergence to measure and keeps its grade.
         if len(idx) < 2:
             return out
-        sources = {i: _sources_for(str(texts[i] or "")) for i in idx}
+        sources = {i: _sources_for(str(texts[i] or ""), prompt) for i in idx}
         if any(not s for s in sources.values()):
             return out
         # One source per candidate for the comparison: a multi-file answer
@@ -1293,7 +1419,7 @@ def verify_group(
     and any offline analysis — so that what Gate 3 measures and what the
     trainer optimises are produced by the same code path.
     """
-    grouped = [verify_any(str(t or ""), weights) for t in texts]
+    grouped = [verify_any(str(t or ""), weights, prompt=prompt) for t in texts]
     return refine_group(texts, grouped, prompt=prompt, weights=weights)
 
 
@@ -1428,7 +1554,7 @@ async def verify_authoritative(
                 pass
 
 
-async def verify(text: str, weights: Optional[TierWeights] = None) -> Verdict:
+async def verify(text: str, weights: Optional[TierWeights] = None, *, prompt: str = "") -> Verdict:
     """Full ladder: static tiers always, tier 4 when configured + affordable.
 
     Tier 4 is consulted ONLY when the static tiers already reached
@@ -1466,9 +1592,9 @@ async def verify(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     w = weights or TierWeights()
     loop = asyncio.get_running_loop()
     if _envb("REWARD_ENVELOPE_ONLY", False):
-        static = await loop.run_in_executor(None, verify_static, text, w)
+        static = await loop.run_in_executor(None, lambda: verify_static(text, w, prompt=prompt))
     else:
-        static = await loop.run_in_executor(None, verify_any, text, w)
+        static = await loop.run_in_executor(None, lambda: verify_any(text, w, prompt=prompt))
         if not static.schema_version:
             # Source-graded: no envelope was reached. Partial credit, banded
             # under every response that produced one -- see _sub_envelope.
@@ -1476,7 +1602,10 @@ async def verify(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     if static.tier < 3:
         return static
 
-    ver, sources, _ = await loop.run_in_executor(None, extract_sources, text)
+    ver, _sources, _ = await loop.run_in_executor(None, extract_sources, text)
+    # What the validator judges is the MODULE: a diff's is the file it
+    # produces (none when it did not land), never the patch text.
+    sources = await loop.run_in_executor(None, _sources_for, text, prompt)
     if not sources:
         return static
     ok = await verify_authoritative("\n".join(sources))
@@ -1490,13 +1619,14 @@ async def verify(text: str, weights: Optional[TierWeights] = None) -> Verdict:
     return Verdict(w.authority, 4, "authority_accepted", ver, authoritative=True)
 
 
-async def verify_batch(texts: Sequence[str], weights: Optional[TierWeights] = None):
+async def verify_batch(texts: Sequence[str], weights: Optional[TierWeights] = None, *,
+                       prompt: str = ""):
     """Grade a whole group concurrently.
 
     The static tiers are CPU-bound and the authoritative tier is I/O; both
     benefit, and a group is `num_generations` of them.
     """
-    return list(await asyncio.gather(*(verify(t, weights) for t in texts)))
+    return list(await asyncio.gather(*(verify(t, weights, prompt=prompt) for t in texts)))
 
 
 __all__ = [

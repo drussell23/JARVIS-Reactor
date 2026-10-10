@@ -221,13 +221,16 @@ async def candidate_reward(
         verify_batch,
     )
 
-    verdicts = await verify_batch(texts)
+    # The prompt is evidence too: a diff is graded against the file it
+    # showed (grpo_verifier._grade_diff), never as Python text.
+    prompt = _group_prompt(prompts)
+    verdicts = await verify_batch(texts, prompt=prompt)
     # The group is the unit of comparison, so the grade is refined in the
     # context the group shares: the task's intent, and the code each
     # sibling chose DIFFERENTLY from the others. Whole-file grading
     # measured ~90% shared text and reported a 0.06 disagreement as 0.017.
     # Authoritative verdicts pass through untouched — tests are evidence.
-    verdicts = refine_group(texts, verdicts, prompt=_group_prompt(prompts))
+    verdicts = refine_group(texts, verdicts, prompt=prompt)
     rewards: List[float] = [v.score for v in verdicts]
     _emit(log_extra, "verify_reason", [v.reason for v in verdicts])
     _emit(log_extra, "verify_tier", [v.tier for v in verdicts])
