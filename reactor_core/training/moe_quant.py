@@ -499,6 +499,21 @@ def _dequant_chunk(hit: int, expert_bytes: int, device: torch.device) -> int:
     return max(1, min(hit, int(budget // max(1, expert_bytes))))
 
 
+def _row_chunk(row_bytes: int, device: torch.device) -> int:
+    """How many routed rows one chunk may carry through both projections:
+    the same configured share of free memory the dequant budget uses.
+    Unbounded off-GPU."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return 1 << 62
+    try:
+        frac = float(os.environ.get(_ENV_DEQUANT_FRACTION, "") or 0.5)
+    except ValueError:
+        frac = 0.5
+    free, _total = torch.cuda.mem_get_info(device)
+    cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return max(1, int(max(0.0, frac) * (free + max(0, cached)) // max(1, row_bytes)))
+
+
 def grouped_experts_forward(self: nn.Module, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
                             top_k_weights: torch.Tensor) -> torch.Tensor:
     """The experts forward with one host sync per layer (module docstring).
@@ -515,7 +530,9 @@ def grouped_experts_forward(self: nn.Module, hidden_states: torch.Tensor, top_k_
     expert_ids = top_k_index.reshape(-1)
     sample_weights = top_k_weights.reshape(-1)
     expert_ids_g, perm = torch.sort(expert_ids)
-    hidden_g = hidden_states[perm // num_top_k]
+    # Each sorted assignment's TOKEN and weight. The token rows themselves
+    # are gathered per chunk, never as one [tokens*top_k, hidden] copy.
+    tok_g = perm // num_top_k
     weights_g = sample_weights[perm]
 
     # The one host read: how many assignments each expert received. Ids at or
@@ -530,33 +547,62 @@ def grouped_experts_forward(self: nn.Module, hidden_states: torch.Tensor, top_k_
 
     gate_up, down = self.gate_up_proj, self.down_proj
     chunk = _dequant_chunk(len(hit_host), max(gate_up.expert_bytes, down.expert_bytes), device)
-    outs: List[torch.Tensor] = []
-    e0 = r0 = 0
-    while e0 < len(hit_host):
-        e1 = min(len(hit_host), e0 + max(1, chunk))
-        r1 = r0 + sum(hit_counts[e0:e1])
-        try:
-            offsets = torch.cumsum(counts.index_select(0, hit[e0:e1]), dim=0, dtype=torch.int32)
-            h = _GroupedExpertLinear.apply(hidden_g[r0:r1], offsets, gate_up, hit[e0:e1])
-            h = self._apply_gate(h)
-            outs.append(_GroupedExpertLinear.apply(h, offsets, down, hit[e0:e1]))
-        except torch.cuda.OutOfMemoryError:
-            if chunk <= 1:
-                raise
-            chunk = max(1, chunk // 2)                 # memory moved under us: halve and retry
-            logger.warning("[moe-quant] dequant chunk OOM; retrying with %d expert(s) per chunk", chunk)
-            continue
-        e0, r0 = e1, r1
-    if routed < expert_ids.numel():
-        outs.append(torch.zeros(expert_ids.numel() - routed, hidden_dim, device=device,
-                                dtype=outs[0].dtype if outs else hidden_states.dtype))
-    proj_out = torch.cat(outs, dim=0) if outs else hidden_g.new_zeros(expert_ids.numel(), hidden_dim)
+    # Rows bound a chunk too. Activations, not weights, are what a long
+    # prefill fills the card with: per routed row the gathered input, the
+    # gate_up output, the gated half, the down output and its fp32
+    # contribution. Holding all T*top_k of them at once (plus a concatenated
+    # copy, a weighted copy and a re-ordered copy) is what ran the card out
+    # on the first long prompt (exclusive-20261010-055807).
+    elt = hidden_states.element_size()
+    gate_up_out = int(gate_up._shape[1])
+    row_bytes = elt * (2 * hidden_dim + gate_up_out + gate_up_out // 2) + 4 * hidden_dim
+    rows_cap = _row_chunk(row_bytes, device)
+    # The top-k reduction, in fp32 as the reference does it, accumulated in
+    # place: each chunk adds its weighted rows to their tokens and is freed.
+    out = torch.zeros(num_tokens, hidden_dim, device=device, dtype=torch.float32)
 
-    weighted = proj_out * weights_g.unsqueeze(-1)
-    inv_perm = torch.empty_like(perm)
-    inv_perm[perm] = torch.arange(perm.numel(), device=device)
-    weighted = weighted[inv_perm]
-    return weighted.view(num_tokens, num_top_k, hidden_dim).sum(dim=1).to(hidden_states.dtype)
+    def _run(ids: torch.Tensor, offsets: torch.Tensor, r0: int, r1: int) -> None:
+        h = _GroupedExpertLinear.apply(hidden_states[tok_g[r0:r1]], offsets, gate_up, ids)
+        h = self._apply_gate(h)
+        y = _GroupedExpertLinear.apply(h, offsets, down, ids)
+        out.index_add_(0, tok_g[r0:r1], y.float() * weights_g[r0:r1].float().unsqueeze(-1))
+
+    # A cursor: hit expert ``e0``, whose rows start at ``r0``, of which
+    # ``done`` are already added. Every step adds a whole chunk or nothing, so
+    # a retry after OOM resumes exactly where the last success ended.
+    e0 = r0 = done = 0
+    while e0 < len(hit_host):
+        start, left = r0 + done, hit_counts[e0] - done
+        if left > rows_cap:
+            # One hot expert with more rows than fit: the next slice of it.
+            ids, sizes, e1, r1 = hit[e0:e0 + 1], [rows_cap], e0, start + rows_cap
+        else:
+            # The rest of e0, then as many whole experts as both budgets allow.
+            sizes, e1, r1 = [left], e0 + 1, start + left
+            while (e1 < len(hit_host) and e1 - e0 < max(1, chunk)
+                   and r1 - start + hit_counts[e1] <= rows_cap):
+                sizes.append(hit_counts[e1])
+                r1 += hit_counts[e1]
+                e1 += 1
+            ids = hit[e0:e1]
+        try:
+            offsets = torch.cumsum(torch.tensor(sizes, device=device, dtype=torch.int32), dim=0,
+                                   dtype=torch.int32)
+            _run(ids, offsets, start, r1)
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= 1 and rows_cap <= 1:
+                raise
+            # Memory moved under us: halve both bounds and retry from the cursor.
+            chunk, rows_cap = max(1, chunk // 2), max(1, rows_cap // 2)
+            logger.warning("[moe-quant] grouped chunk OOM; retrying with %d expert(s) / %d row(s)",
+                           chunk, rows_cap)
+            continue
+        if e1 == e0:
+            done += rows_cap                 # a slice of the hot expert
+        else:
+            e0, r0, done = e1, r1, 0
+    # Assignments past ``routed`` are expert-parallel sentinels: they add nothing.
+    return out.to(hidden_states.dtype)
 
 
 def experts_implementation() -> str:

@@ -216,3 +216,58 @@ def test_a_dense_kernel_is_refused(monkeypatch):
     monkeypatch.setenv("REACTOR_MOE_EXPERTS_IMPL", "grouped_mm")
     with pytest.raises(ValueError, match="packed bytes|support"):
         mq.experts_implementation()
+
+
+# ---------------------------------------------------------------------------
+# Rows bound a chunk too (exclusive-20261010-055807: the first long prefill
+# OOMed holding every routed row's activations, plus three full copies)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 5])
+def test_a_row_budget_does_not_change_the_answer(monkeypatch, rows):
+    """'uneven' sends 6 rows to expert 0: a budget under that slices the hot
+    expert, and one above packs several experts per chunk."""
+    m = _experts(mq.EXPERTS_IMPL)
+    idx = torch.tensor(ROUTINGS["uneven"])
+    x = torch.randn(idx.shape[0], 128, dtype=torch.bfloat16)
+    w = torch.softmax(torch.randn(idx.shape), dim=-1)
+    with torch.no_grad():
+        whole = m(x, idx, w)
+        monkeypatch.setattr(mq, "_row_chunk", lambda row_bytes, device: rows)
+        parts = m(x, idx, w)
+    torch.testing.assert_close(parts.float(), whole.float(), atol=1e-2, rtol=1e-2)
+
+
+def test_an_oom_midway_through_a_hot_expert_adds_nothing_twice(monkeypatch):
+    """Contributions are added only when a whole chunk succeeded, and a retry
+    resumes at the cursor: the slices before the OOM are not re-added."""
+    m = _experts(mq.EXPERTS_IMPL)
+    idx = torch.tensor(ROUTINGS["uneven"])
+    x = torch.randn(idx.shape[0], 128, dtype=torch.bfloat16)
+    w = torch.softmax(torch.randn(idx.shape), dim=-1)
+    monkeypatch.setattr(mq, "_row_chunk", lambda row_bytes, device: 4)
+    with torch.no_grad():
+        want = m(x, idx, w)
+    real = mq.QuantizedExpertStack.gather
+    calls = {"n": 0}
+
+    def flaky(self, index):
+        calls["n"] += 1
+        if calls["n"] == 4:                       # the second chunk's first projection
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real(self, index)
+    monkeypatch.setattr(mq.QuantizedExpertStack, "gather", flaky)
+    with torch.no_grad():
+        got = m(x, idx, w)
+    torch.testing.assert_close(got.float(), want.float(), atol=1e-2, rtol=1e-2)
+    assert calls["n"] > 4, "the OOM was never hit"
+
+
+def test_the_reduction_never_materialises_the_routed_rows():
+    """Structural: no full [tokens*top_k, hidden] gather, concatenation or
+    inverse permutation remains in the forward."""
+    import inspect
+    src = inspect.getsource(mq.grouped_experts_forward)
+    for gone in ("torch.cat(", "inv_perm", "hidden_g = hidden_states[perm"):
+        assert gone not in src, gone
+    assert "index_add_(" in src
