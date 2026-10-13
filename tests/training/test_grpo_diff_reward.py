@@ -102,3 +102,58 @@ def test_the_group_footprint_reads_the_patched_modules() -> None:
     other = GOOD.replace("x + 2", "x + 1 + 1")
     out = gv.verify_group([_env(GOOD), _env(other)], prompt=_prompt())
     assert all("fp=" in v.reason for v in out), [v.reason for v in out]
+
+
+# --- Phase B: the hallucinated-context penalty matrix -------------------------
+#
+# Each pair below fails to apply at the same place; they differ only in WHAT
+# is wrong with the context, which is what the matrix must rank.
+
+# A real line from g(), cited inside f's hunk: displaced, not invented.
+DISPLACED = ('@@ -5,3 +5,3 @@\n def f(x: int) -> int:\n     return os.sep\n'
+             '-    return x + 1\n+    return x + 2\n')
+# The same slot holding a line that exists nowhere: fabricated.
+FABRICATED = ('@@ -5,3 +5,3 @@\n def f(x: int) -> int:\n     y = compute(x)\n'
+              '-    return x + 1\n+    return x + 2\n')
+# Fabricated as a REMOVAL instead of context: deleting code that is not there.
+FAB_REMOVAL = ('@@ -5,3 +5,3 @@\n def f(x: int) -> int:\n     """Add one."""\n'
+               '-    y = compute(x)\n+    return x + 2\n')
+
+
+def _rep(**classes):
+    return [{"classes": classes, "checkable": True, "placed": False}]
+
+
+def test_a_displaced_line_outranks_an_invented_one() -> None:
+    d, f = _score(DISPLACED), _score(FABRICATED)
+    assert d.score > f.score, (d.reason, f.reason)
+    assert "fab=0/" in d.reason and "fab=1/" in f.reason
+
+
+def test_deleting_a_phantom_line_costs_more_than_citing_one() -> None:
+    ctx = gv._context_fidelity(_rep(context={"exact": 2, "displaced": 0, "fabricated": 1},
+                                    removal={"exact": 1, "displaced": 0, "fabricated": 0}))
+    rem = gv._context_fidelity(_rep(context={"exact": 3, "displaced": 0, "fabricated": 0},
+                                    removal={"exact": 0, "displaced": 0, "fabricated": 1}))
+    assert ctx[0] > rem[0]
+
+
+def test_the_first_invented_line_costs_more_than_its_share() -> None:
+    """Concave: one fabricated line in twenty must cost clearly more than the
+    5% a linear penalty would charge."""
+    clean = gv._context_fidelity(_rep(context={"exact": 20, "displaced": 0, "fabricated": 0},
+                                      removal={"exact": 0, "displaced": 0, "fabricated": 0}))[0]
+    one = gv._context_fidelity(_rep(context={"exact": 19, "displaced": 0, "fabricated": 1},
+                                    removal={"exact": 0, "displaced": 0, "fabricated": 0}))[0]
+    assert clean == 1.0
+    assert clean - one > 0.10, one
+
+
+def test_landing_still_outranks_every_non_landing_diff() -> None:
+    worst_landing = _score(BREAKS).score
+    for d in (DISPLACED, FABRICATED, FAB_REMOVAL, HALF, INVENTED):
+        assert _score(d).score < worst_landing, d
+
+
+def test_an_applier_without_classes_keeps_the_align_grade() -> None:
+    assert gv._context_fidelity([{"present": 1.0, "in_order": 1.0}]) is None

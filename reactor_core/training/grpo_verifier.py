@@ -1112,6 +1112,72 @@ _DIFF_HEADER_W = _envf("DIFF_HEADER_WEIGHT", 0.10)
 _DIFF_HEADER_SCALE = max(1.0, _envf("DIFF_HEADER_SCALE_LINES", 10.0))
 _DIFF_ECHO_W = _envf("DIFF_ECHO_WEIGHT", 0.05)
 
+# ---------------------------------------------------------------------------
+# Phase B: the hallucinated-context penalty matrix
+# ---------------------------------------------------------------------------
+#
+# Numbered source took the held-out benchmark from 1/30 to 3/30 accepted, but
+# 21/30 still fail diff_apply_failed: context lines that are not in the file.
+# The grade above scored those with `0.5*present + 0.5*in_order`, which cannot
+# tell a FABRICATED line (exists nowhere -- the hallucination) from a DISPLACED
+# one (real, wrong place), and weighs a phantom removal like phantom context,
+# though deleting code that is not there is the stronger false claim.
+#
+# The applier (jarvis diff_apply.anchor_classes) classes every locator of a
+# hunk as exact / displaced / fabricated, for context (' ') and removal ('-')
+# lines separately. Each class costs:
+#
+#                 exact   displaced   fabricated
+#     context       0        0.50        1.00
+#     removal       0        0.75        1.50
+#
+#   hunk fidelity   f_h = 1 - sum(n * W) / (W_max * anchors_h)
+#   diff fidelity   F   = anchor-weighted mean of f_h   (a one-line slip in a
+#                         big hunk does not sink an otherwise right diff)
+#   fabrication     H   = 1 - lambda * sqrt(fabricated / anchors)
+#
+# H is concave on purpose: the FIRST invented line costs the most, which is
+# the gradient needed to remove the last stray hallucination -- a linear term
+# barely registers one bad line in twenty. A non-landing diff scores
+# 0.5 * F * H * mult, still the lower half of the syntax band, so every diff
+# that lands outranks every diff that does not. An applier too old to report
+# classes falls back to the align formula unchanged.
+
+_FAB_W = {
+    "context": {"exact": 0.0, "displaced": _envf("DIFF_CTX_DISPLACED_W", 0.50),
+                "fabricated": _envf("DIFF_CTX_FABRICATED_W", 1.00)},
+    "removal": {"exact": 0.0, "displaced": _envf("DIFF_DEL_DISPLACED_W", 0.75),
+                "fabricated": _envf("DIFF_DEL_FABRICATED_W", 1.50)},
+}
+_FAB_LAMBDA = min(1.0, max(0.0, _envf("DIFF_FABRICATION_LAMBDA", 0.50)))
+
+
+def _context_fidelity(hunks: Sequence[Dict[str, Any]]) -> Optional[Tuple[float, str]]:
+    """``(F * H, note)`` from the applier's anchor classes, or None when the
+    applier does not report them."""
+    w_max = max(max(row.values()) for row in _FAB_W.values()) or 1.0
+    anchors = fabricated = 0.0
+    weighted_f = 0.0
+    for h in hunks:
+        classes = h.get("classes")
+        if not isinstance(classes, dict):
+            return None
+        n_h = sum(int(c) for kind in classes.values() for c in kind.values())
+        if not n_h:
+            continue
+        c_h = sum(_FAB_W[kind][cls] * int(n)
+                  for kind, row in classes.items() if kind in _FAB_W
+                  for cls, n in row.items() if cls in _FAB_W[kind])
+        weighted_f += n_h * max(0.0, 1.0 - c_h / (w_max * n_h))
+        anchors += n_h
+        fabricated += sum(int(row.get("fabricated", 0)) for row in classes.values())
+    if not anchors:
+        return None
+    fidelity = weighted_f / anchors
+    share = fabricated / anchors
+    h_term = 1.0 - _FAB_LAMBDA * share ** 0.5
+    return fidelity * h_term, f"fid={fidelity:.3f},fab={int(fabricated)}/{int(anchors)}"
+
 _APPLIER: Dict[str, Any] = {}
 
 
@@ -1178,6 +1244,10 @@ def _grade_diff(file_path: str, diff: str, prompt: str) -> Tuple["SourceGrade", 
     mult, note = _diff_penalty(checkable)
     placed = sum(1 for h in checkable if h.get("placed"))
     if placed < len(checkable) or rep.get("applies") is False:
+        fid = _context_fidelity(checkable)
+        if fid is not None:
+            return SourceGrade(0.5 * fid[0] * mult, _BAND_SYNTAX,
+                               f"diff_misplaced:{placed}/{len(checkable)},{fid[1]},{note}"), None
         align = sum(0.5 * float(h.get("present") or 0.0) + 0.5 * float(h.get("in_order") or 0.0)
                     for h in checkable) / len(checkable)
         return SourceGrade(0.5 * align * mult, _BAND_SYNTAX,
